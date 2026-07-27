@@ -98,6 +98,29 @@ mcp-repl cratesio                  # a bare name works too
   `--config` file is an error. A missing file at the default location is not:
   profiles are opt-in.
 
+### Reconnecting
+
+A remote server that restarts, OOMs, or sits behind an edge returning 502/503
+loses the session, and every later request fails with a not-initialized or
+session-expired error. On an `--http` connection the REPL notices this,
+re-runs the handshake against a fresh transport, re-fetches the surface, and
+retries the command once:
+
+```text
+> search query=tower
+[reconnected]
+... results ...
+```
+
+The retry is bounded to a single attempt, so a server that is really down
+fails fast with its original error rather than hanging the prompt. Task ids
+do not survive a reconnect (they belong to the session that created them), so
+`task`, `wait`, and `cancel` never trigger one.
+
+Pass `--no-reconnect` to turn this off and see session-loss errors as they
+arrive. stdio children and `--demo` are never reconnected: there, a lost
+session means the server process itself is gone.
+
 ## Aliases
 
 Frequent commands get short names, kept in the same config file as the
