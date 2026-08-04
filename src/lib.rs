@@ -700,6 +700,51 @@ where
     retried
 }
 
+/// How many pages one surface list may follow, and how many entries it may
+/// accept. A server that returns a `next_cursor` on every page describes an
+/// infinite surface; following it is an unbounded allocation driven entirely
+/// by the other end. These caps are far above any real server (the largest
+/// published surfaces are in the hundreds) and exist so a hostile or looping
+/// one is reported rather than fatal.
+const MAX_SURFACE_PAGES: usize = 100;
+const MAX_SURFACE_ITEMS: usize = 10_000;
+
+/// Follow pagination cursors for one list, bounded.
+///
+/// Stops at the page cap, the item cap, or a repeated cursor (a server that
+/// keeps handing back the same cursor is looping), and reports which bound it
+/// hit so a truncated surface is never silently presented as complete.
+async fn collect_pages<T, F, Fut>(what: &str, mut page: F) -> Result<Vec<T>, tower_mcp::Error>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<(Vec<T>, Option<String>), tower_mcp::Error>>,
+{
+    let mut all: Vec<T> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..MAX_SURFACE_PAGES {
+        let (items, next) = page(cursor).await?;
+        all.extend(items);
+        if all.len() >= MAX_SURFACE_ITEMS {
+            all.truncate(MAX_SURFACE_ITEMS);
+            eprintln!(
+                "warning: {what} stopped at {MAX_SURFACE_ITEMS} entries; the server offered more"
+            );
+            return Ok(all);
+        }
+        match next {
+            None => return Ok(all),
+            Some(next) if !seen.insert(next.clone()) => {
+                eprintln!("warning: {what} paging stopped: the server repeated a cursor");
+                return Ok(all);
+            }
+            Some(next) => cursor = Some(next),
+        }
+    }
+    eprintln!("warning: {what} stopped after {MAX_SURFACE_PAGES} pages; the server offered more");
+    Ok(all)
+}
+
 /// Fetch the server surface once. Returns the surface plus whether any list
 /// call was rejected as not-initialized (the retryable startup condition).
 async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
@@ -726,11 +771,26 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
     // latency instead of four in series. It also bounds the cost of a slow or
     // unresponsive server: against a server that makes each list time out, the
     // surface fetch now waits one `request_timeout`, not four.
+    //
+    // Each list pages through `collect_pages` rather than the framework's
+    // `list_all_*`, which follows cursors without a bound.
     let (tools, prompts, resources, templates) = tokio::join!(
-        client.list_all_tools(),
-        client.list_all_prompts(),
-        client.list_all_resources(),
-        client.list_all_resource_templates(),
+        collect_pages("tools", |cursor| async move {
+            let page = client.list_tools_with_cursor(cursor).await?;
+            Ok((page.tools, page.next_cursor))
+        }),
+        collect_pages("prompts", |cursor| async move {
+            let page = client.list_prompts_with_cursor(cursor).await?;
+            Ok((page.prompts, page.next_cursor))
+        }),
+        collect_pages("resources", |cursor| async move {
+            let page = client.list_resources_with_cursor(cursor).await?;
+            Ok((page.resources, page.next_cursor))
+        }),
+        collect_pages("resource templates", |cursor| async move {
+            let page = client.list_resource_templates_with_cursor(cursor).await?;
+            Ok((page.resource_templates, page.next_cursor))
+        }),
     );
     let mut ni = false;
     let surface = Surface {
@@ -983,27 +1043,38 @@ fn demo_router() -> tower_mcp::McpRouter {
         )
 }
 
+/// How long the event loop waits after a `list_changed` before refetching.
+/// A server that renames a batch of tools emits one notification per change;
+/// refetching per notification would issue four list calls each time. The
+/// wait folds a burst into one refetch, and caps how much work a server can
+/// induce by spamming the notification.
+const SURFACE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Signal that the surface changed. A counter over a watch channel rather
+/// than a message per notification: only "something changed since we last
+/// looked" matters, so any number of notifications arriving before the event
+/// loop wakes collapse into a single refetch.
+type RefreshSignal = Arc<tokio::sync::watch::Sender<u64>>;
+
+fn note_surface_change(signal: &RefreshSignal) {
+    signal.send_modify(|seen| *seen = seen.wrapping_add(1));
+}
+
 /// The notification callbacks: log and progress messages print inline,
 /// `list_changed` notifications nudge the event loop to refresh the surface.
 /// Built per client, since a reconnect installs a new one.
 fn notification_handler(
-    refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    refresh: RefreshSignal,
     output: AsyncOutput,
     jobs: Arc<Jobs>,
 ) -> NotificationHandler {
-    let t = refresh_tx.clone();
-    let r = refresh_tx.clone();
-    let p = refresh_tx;
+    let t = refresh.clone();
+    let r = refresh.clone();
+    let p = refresh;
     NotificationHandler::new()
-        .on_tools_changed(move || {
-            let _ = t.send(());
-        })
-        .on_resources_changed(move || {
-            let _ = r.send(());
-        })
-        .on_prompts_changed(move || {
-            let _ = p.send(());
-        })
+        .on_tools_changed(move || note_surface_change(&t))
+        .on_resources_changed(move || note_surface_change(&r))
+        .on_prompts_changed(move || note_surface_change(&p))
         .on_task_status_changed({
             let jobs = jobs.clone();
             move |params| jobs.observe_legacy(params)
@@ -1504,7 +1575,11 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     ));
 
     // Notifications print inline and trigger surface refreshes.
-    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // The sender is held for the life of the process: `changed()` errors once
+    // every sender is gone, which in a select loop would spin rather than
+    // wait.
+    let (refresh_tx, mut refresh_rx) = tokio::sync::watch::channel(0u64);
+    let refresh_tx: RefreshSignal = Arc::new(refresh_tx);
 
     // A reconnect needs a fresh handler for the new client, so build handlers
     // through a factory rather than once.
@@ -1520,7 +1595,6 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
             )
         })
     };
-    drop(refresh_tx);
     // Sampling has no model behind it, so the operator answers. Under --exec
     // there is nobody to ask, so requests are refused unless --sampling says
     // otherwise.
@@ -1870,7 +1944,11 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
 
     loop {
         tokio::select! {
-            Some(()) = refresh_rx.recv() => {
+            Ok(()) = refresh_rx.changed() => {
+                // Let a burst land before refetching, then mark whatever
+                // arrived during the wait as covered by this refetch.
+                tokio::time::sleep(SURFACE_REFRESH_DEBOUNCE).await;
+                refresh_rx.mark_unchanged();
                 let fresh = fetch_surface(&session.client()).await;
                 async_output.line(format!("{} {} tools, {} prompts, {} resources",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),
