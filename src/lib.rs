@@ -90,7 +90,7 @@ use exit_status::ExitStatus;
 use jobs::Jobs;
 use output::AsyncOutput;
 use session::{Connector, Session, is_not_initialized, is_session_lost};
-use style::{json_pretty, paint, tag, task_status_style};
+use style::{json_pretty, paint, sanitize, tag, task_status_style};
 use wire::{TracingTransport, wire};
 
 /// Lifecycle selected for this REPL connection.
@@ -290,7 +290,9 @@ fn report_error(status: ExitStatus, message: &str) {
     if json_output() {
         print_json(&error_json(status, message));
     } else {
-        println!("{}: {message}", style::error_prefix());
+        // Server-originated errors are echoed here; keep their bytes
+        // from reprogramming the terminal.
+        println!("{}: {}", style::error_prefix(), sanitize(message));
     }
 }
 
@@ -302,7 +304,7 @@ fn exit_with_error(status: ExitStatus, message: &str) -> ! {
     if json_output() {
         print_json(&error_json(status, message));
     } else {
-        eprintln!("error: {message}");
+        eprintln!("error: {}", sanitize(message));
     }
     std::process::exit(status.code());
 }
@@ -407,7 +409,7 @@ fn render_content(content: &[Content]) {
                 if style::colors_enabled() && style::looks_like_markdown(text) {
                     println!("{}", style::render_markdown(text));
                 } else {
-                    println!("{text}");
+                    println!("{}", sanitize(text));
                 }
             }
             other => {
@@ -419,7 +421,10 @@ fn render_content(content: &[Content]) {
                         let len = v.get("data").and_then(|d| d.as_str()).map_or(0, str::len);
                         println!(
                             "{}",
-                            tag(Style::new(), &format!("{ty} {mime}, {len} base64 chars"))
+                            tag(
+                                Style::new(),
+                                &format!("{ty} {}, {len} base64 chars", sanitize(mime))
+                            )
                         );
                     }
                     _ => println!("{}", json_pretty(&v)),
@@ -432,15 +437,20 @@ fn render_content(content: &[Content]) {
 fn render_task(task: &TaskObject) {
     println!(
         "task {}  status={}  {}",
-        paint(Style::new().bold(), &task.task_id),
+        paint(Style::new().bold(), &sanitize(&task.task_id)),
         paint(task_status_style(task.status), &task.status.to_string()),
-        task.status_message.as_deref().unwrap_or("")
+        sanitize(task.status_message.as_deref().unwrap_or(""))
     );
     if let Some(result) = &task.result {
         render_content(&result.content);
     }
     if let Some(err) = &task.error {
-        println!("{} {}: {}", style::error_prefix(), err.code, err.message);
+        println!(
+            "{} {}: {}",
+            style::error_prefix(),
+            err.code,
+            sanitize(&err.message)
+        );
     }
 }
 
@@ -532,18 +542,18 @@ fn client_builder(protocol: ProtocolMode) -> Result<McpClientBuilder, ProtocolSu
 fn print_banner(info: &ConnectionInfo) {
     println!(
         "connected: {} v{} {}",
-        paint(Style::new().bold(), &info.server_info.name),
-        info.server_info.version,
+        paint(Style::new().bold(), &sanitize(&info.server_info.name)),
+        sanitize(&info.server_info.version),
         paint(
             Style::new().dimmed(),
-            &format!("(protocol {})", info.protocol_version)
+            &format!("(protocol {})", sanitize(&info.protocol_version))
         )
     );
     if let Some(instructions) = &info.instructions {
         if style::colors_enabled() && style::looks_like_markdown(instructions) {
             println!("{}", style::render_markdown(instructions));
         } else {
-            println!("{instructions}");
+            println!("{}", sanitize(instructions));
         }
     }
 }
@@ -571,8 +581,8 @@ fn print_tool_overview(surface: &Surface) {
     for t in surface.tools.iter().take(CAP) {
         println!(
             "{:24} {}",
-            paint(Style::new().fg(Color::Green), &t.name),
-            t.description.as_deref().unwrap_or("")
+            paint(Style::new().fg(Color::Green), &sanitize(&t.name)),
+            sanitize(t.description.as_deref().unwrap_or(""))
         );
     }
     if surface.tools.len() > CAP {
@@ -622,8 +632,8 @@ fn print_find(surface: &Surface, query: &str) {
         for hit in group {
             println!(
                 "  {:24} {}",
-                paint(Style::new().fg(Color::Green), &hit.name),
-                hit.description
+                paint(Style::new().fg(Color::Green), &sanitize(&hit.name)),
+                sanitize(&hit.description)
             );
         }
     }
@@ -1022,7 +1032,7 @@ fn notification_handler(
                 output.line(format!(
                     "{} {}",
                     tag(Style::new().fg(Color::Cyan), &format!("progress{pct}")),
-                    p.message.as_deref().unwrap_or("")
+                    sanitize(p.message.as_deref().unwrap_or(""))
                 ));
             }
         })
@@ -1038,8 +1048,9 @@ fn notification_handler(
                     format!(" {}", paint(Style::new().dimmed(), "(not subscribed here)"))
                 };
                 output.line(format!(
-                    "{} {uri}{known}",
-                    tag(Style::new().fg(Color::Cyan), "resource updated")
+                    "{} {}{known}",
+                    tag(Style::new().fg(Color::Cyan), "resource updated"),
+                    sanitize(&uri)
                 ));
             }
         })
@@ -1047,7 +1058,7 @@ fn notification_handler(
             output.line(format!(
                 "{} {}",
                 tag(log_level_style(m.level), &format!("log {}", m.level)),
-                m.data
+                sanitize(&m.data.to_string())
             ));
         })
 }
@@ -1058,7 +1069,9 @@ fn forward_child_stderr(stderr: tokio::process::ChildStderr, output: AsyncOutput
         let mut lines = BufReader::new(stderr).lines();
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) => output.line(line),
+                // The child is the MCP server; its stderr is as untrusted
+                // as its frames.
+                Ok(Some(line)) => output.line(sanitize(&line).into_owned()),
                 Ok(None) => break,
                 Err(error) => {
                     output.line(format!("warning: reading server stderr failed: {error}"));
@@ -2014,8 +2027,8 @@ async fn handle_line(
                 for t in &s.tools {
                     println!(
                         "  {:24} {}",
-                        paint(Style::new().fg(Color::Green), &t.name),
-                        t.description.as_deref().unwrap_or("")
+                        paint(Style::new().fg(Color::Green), &sanitize(&t.name)),
+                        sanitize(t.description.as_deref().unwrap_or(""))
                     );
                 }
             }
@@ -2038,8 +2051,8 @@ async fn handle_line(
                     for t in &s.tools {
                         println!(
                             "{:24} {}",
-                            paint(Style::new().fg(Color::Green), &t.name),
-                            t.description.as_deref().unwrap_or("")
+                            paint(Style::new().fg(Color::Green), &sanitize(&t.name)),
+                            sanitize(t.description.as_deref().unwrap_or(""))
                         );
                     }
                 }
@@ -2050,17 +2063,17 @@ async fn handle_line(
                             .iter()
                             .map(|a| {
                                 if a.required {
-                                    format!("<{}>", a.name)
+                                    format!("<{}>", sanitize(&a.name))
                                 } else {
-                                    format!("[{}]", a.name)
+                                    format!("[{}]", sanitize(&a.name))
                                 }
                             })
                             .collect();
                         println!(
                             "{:24} {} {}",
-                            paint(Style::new().fg(Color::Green), &p.name),
+                            paint(Style::new().fg(Color::Green), &sanitize(&p.name)),
                             paint(Style::new().fg(Color::Cyan), &args.join(" ")),
-                            p.description.as_deref().unwrap_or("")
+                            sanitize(p.description.as_deref().unwrap_or(""))
                         );
                     }
                 }
@@ -2068,8 +2081,8 @@ async fn handle_line(
                     for r in &s.resources {
                         println!(
                             "{:40} {}",
-                            paint(Style::new().fg(Color::Green), &r.uri),
-                            r.name
+                            paint(Style::new().fg(Color::Green), &sanitize(&r.uri)),
+                            sanitize(&r.name)
                         );
                     }
                     // Templates (parameterized URIs) are a separate MCP list
@@ -2091,8 +2104,8 @@ async fn handle_line(
                     for t in &s.templates {
                         println!(
                             "{:40} {}",
-                            paint(Style::new().fg(Color::Green), &t.uri_template),
-                            t.name
+                            paint(Style::new().fg(Color::Green), &sanitize(&t.uri_template)),
+                            sanitize(&t.name)
                         );
                     }
                     if !s.resources.is_empty() {
@@ -2249,7 +2262,7 @@ async fn handle_line(
                             if style::colors_enabled() && is_md {
                                 println!("{}", style::render_markdown(&text));
                             } else {
-                                println!("{text}");
+                                println!("{}", sanitize(&text));
                             }
                         } else if let Some(blob) = c.blob {
                             println!(
@@ -2283,7 +2296,7 @@ async fn handle_line(
                 return false;
             }
             for uri in &active {
-                println!("{}", paint(Style::new().fg(Color::Green), uri));
+                println!("{}", paint(Style::new().fg(Color::Green), &sanitize(uri)));
             }
         }
         "prompt" => {
@@ -2321,7 +2334,11 @@ async fn handle_line(
                             .unwrap_or_else(|| {
                                 v.get("content").map(|c| c.to_string()).unwrap_or_default()
                             });
-                        println!("{} {}", tag(Style::new().fg(Color::Cyan), role), text);
+                        println!(
+                            "{} {}",
+                            tag(Style::new().fg(Color::Cyan), &sanitize(role)),
+                            sanitize(&text)
+                        );
                     }
                 }
                 Err(e) => report_mcp_error(&e),
@@ -2396,14 +2413,18 @@ async fn handle_line(
                         jobs.sync(&job.task_id, task.status, task.status_message.clone());
                         println!(
                             "{}  {}  {}",
-                            job.task_id,
-                            job.tool,
+                            sanitize(&job.task_id),
+                            sanitize(&job.tool),
                             paint(task_status_style(task.status), &task.status.to_string())
                         );
                     }
                     Err(error) => {
                         note_error(ExitStatus::from_mcp_error(&error));
-                        println!("{}  {}  (gone)", job.task_id, job.tool);
+                        println!(
+                            "{}  {}  (gone)",
+                            sanitize(&job.task_id),
+                            sanitize(&job.tool)
+                        );
                     }
                 }
             }
@@ -2592,11 +2613,11 @@ async fn handle_line(
                     }
                     print_json(&value);
                 } else {
-                    let name = paint(Style::new().fg(Color::Red), tool_name);
+                    let name = paint(Style::new().fg(Color::Red), &sanitize(tool_name));
                     match suggestion {
                         Some(near) => println!(
                             "unknown command: {name}; did you mean `{}`?",
-                            paint(Style::new().fg(Color::Green), &near)
+                            paint(Style::new().fg(Color::Green), &sanitize(&near))
                         ),
                         None => println!("unknown command: {name} (try `help`)"),
                     }
@@ -2676,7 +2697,7 @@ async fn handle_bench(
         println!(
             "{} {}",
             tag(Style::new().fg(Color::Red), "first error"),
-            message
+            sanitize(message)
         );
     }
     println!("{}", timing(outcome.total));
@@ -3014,8 +3035,8 @@ fn describe(surface: &Surface, name: &str) {
     if let Some(t) = surface.tools.iter().find(|t| t.name == name) {
         println!(
             "tool {}  {}",
-            paint(Style::new().fg(Color::Green).bold(), &t.name),
-            t.description.as_deref().unwrap_or("")
+            paint(Style::new().fg(Color::Green).bold(), &sanitize(&t.name)),
+            sanitize(t.description.as_deref().unwrap_or(""))
         );
         if let Some(a) = &t.annotations {
             let mut hints = Vec::new();
@@ -3052,8 +3073,8 @@ fn describe(surface: &Surface, name: &str) {
     if let Some(p) = surface.prompts.iter().find(|p| p.name == name) {
         println!(
             "prompt {}  {}",
-            paint(Style::new().fg(Color::Green).bold(), &p.name),
-            p.description.as_deref().unwrap_or("")
+            paint(Style::new().fg(Color::Green).bold(), &sanitize(&p.name)),
+            sanitize(p.description.as_deref().unwrap_or(""))
         );
         if p.arguments.is_empty() {
             println!("  (no arguments)");
@@ -3062,9 +3083,9 @@ fn describe(surface: &Surface, name: &str) {
             for a in &p.arguments {
                 println!(
                     "  {:20} {:10} {}",
-                    paint(Style::new().fg(Color::Cyan), &a.name),
+                    paint(Style::new().fg(Color::Cyan), &sanitize(&a.name)),
                     if a.required { "required" } else { "optional" },
-                    a.description.as_deref().unwrap_or("")
+                    sanitize(a.description.as_deref().unwrap_or(""))
                 );
             }
         }
@@ -3077,17 +3098,17 @@ fn describe(surface: &Surface, name: &str) {
     {
         println!(
             "resource {}",
-            paint(Style::new().fg(Color::Green).bold(), &r.uri)
+            paint(Style::new().fg(Color::Green).bold(), &sanitize(&r.uri))
         );
-        println!("  name: {}", r.name);
+        println!("  name: {}", sanitize(&r.name));
         if let Some(t) = &r.title {
-            println!("  title: {t}");
+            println!("  title: {}", sanitize(t));
         }
         if let Some(d) = &r.description {
-            println!("  description: {d}");
+            println!("  description: {}", sanitize(d));
         }
         if let Some(m) = &r.mime_type {
-            println!("  mimeType: {m}");
+            println!("  mimeType: {}", sanitize(m));
         }
         if let Some(s) = r.size {
             println!("  size: {s} bytes");
@@ -3101,30 +3122,36 @@ fn describe(surface: &Surface, name: &str) {
     {
         println!(
             "template {}",
-            paint(Style::new().fg(Color::Green).bold(), &t.uri_template)
+            paint(
+                Style::new().fg(Color::Green).bold(),
+                &sanitize(&t.uri_template)
+            )
         );
-        println!("  name: {}", t.name);
+        println!("  name: {}", sanitize(&t.name));
         if let Some(d) = &t.description {
-            println!("  description: {d}");
+            println!("  description: {}", sanitize(d));
         }
         if let Some(m) = &t.mime_type {
-            println!("  mimeType: {m}");
+            println!("  mimeType: {}", sanitize(m));
         }
         if !t.arguments.is_empty() {
             println!("arguments:");
             for a in &t.arguments {
                 println!(
                     "  {:20} {:10} {}",
-                    paint(Style::new().fg(Color::Cyan), &a.name),
+                    paint(Style::new().fg(Color::Cyan), &sanitize(&a.name)),
                     if a.required { "required" } else { "optional" },
-                    a.description.as_deref().unwrap_or("")
+                    sanitize(a.description.as_deref().unwrap_or(""))
                 );
             }
         }
         return;
     }
     note_error(ExitStatus::NoMatch);
-    println!("nothing on the surface named `{name}` (try `tools`, `prompts`, `resources`)");
+    println!(
+        "nothing on the surface named `{}` (try `tools`, `prompts`, `resources`)",
+        sanitize(name)
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3158,7 +3185,7 @@ async fn run_tool(
                         "{} started",
                         tag(
                             Style::new().fg(Color::Yellow),
-                            &format!("task {}", created.task.task_id)
+                            &format!("task {}", sanitize(&created.task.task_id))
                         )
                     );
                 }

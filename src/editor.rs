@@ -82,11 +82,15 @@ pub struct ReplCompleter {
     runtime: tokio::runtime::Handle,
 }
 
+/// Every completion candidate is built here, including ones assembled from
+/// server-supplied names, descriptions, and `completion/complete` values, so
+/// this is where control sequences are neutralized before reedline paints
+/// them into the menu.
 fn suggestion(value: impl Into<String>, description: Option<String>, span: Span) -> Suggestion {
     Suggestion {
-        value: value.into(),
+        value: style::sanitize(&value.into()).into_owned(),
         display_override: None,
-        description,
+        description: description.map(|d| style::sanitize(&d).into_owned()),
         style: None,
         extra: None,
         span,

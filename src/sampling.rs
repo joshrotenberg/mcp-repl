@@ -19,7 +19,7 @@ use tower_mcp::protocol::{
     SamplingMessage,
 };
 
-use crate::style::{paint, tag};
+use crate::style::{paint, sanitize, tag};
 
 /// How to answer a `sampling/createMessage` request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -98,7 +98,7 @@ pub fn render_request(params: &CreateMessageParams) -> String {
         && let Some(first) = prefs.hints.first()
         && let Some(name) = &first.name
     {
-        head.push_str(&format!(", model hint {name}"));
+        head.push_str(&format!(", model hint {}", sanitize(name)));
     }
     out.push_str(&format!(
         "{} server requests a completion ({head})\n",
@@ -164,10 +164,12 @@ fn message_text(message: &SamplingMessage) -> String {
 }
 
 /// Cap a message at something a terminal can show, keeping the tail count so
-/// it is clear the model would have seen more.
+/// it is clear the model would have seen more. Every rendered sampling string
+/// passes through here, so this is also where server control sequences are
+/// neutralized.
 fn truncate(text: &str) -> String {
     const CAP: usize = 2000;
-    let flat = text.replace('\n', "\n    ");
+    let flat = sanitize(text).replace('\n', "\n    ");
     if flat.chars().count() <= CAP {
         return flat;
     }

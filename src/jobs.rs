@@ -8,7 +8,7 @@ use tower_mcp::protocol::{TaskObject, TaskStatus, TaskStatusParams};
 use tower_mcp::tasks::TaskStatusNotificationParams;
 
 use crate::output::AsyncOutput;
-use crate::style::{paint, tag, task_status_style};
+use crate::style::{paint, sanitize, tag, task_status_style};
 
 const MAX_PENDING_NOTIFICATIONS: usize = 128;
 
@@ -177,23 +177,28 @@ impl Jobs {
             return;
         };
         let status = transition.status.to_string();
+        // Task ids and status messages are server-authored and land on the
+        // terminal asynchronously, so they are sanitized like any other
+        // server string.
+        let task_id = sanitize(&transition.task_id);
         let mut line = format!(
             "{} {}",
-            tag(Style::new(), &format!("task {}", transition.task_id)),
+            tag(Style::new(), &format!("task {task_id}")),
             paint(task_status_style(transition.status), &status)
         );
         if let Some(message) = transition
             .status_message
+            .as_deref()
             .filter(|message| !message.is_empty())
         {
-            line.push_str(&format!(" — {message}"));
+            line.push_str(&format!(" — {}", sanitize(message)));
         }
         if transition.status.is_terminal() || transition.status == TaskStatus::InputRequired {
             line.push_str(&format!(
                 "  {}",
                 paint(
                     Style::new().dimmed(),
-                    &format!("run `task {}` for details", transition.task_id)
+                    &format!("run `task {task_id}` for details")
                 )
             ));
         }
