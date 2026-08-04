@@ -55,6 +55,7 @@ pub mod oauth_profile;
 mod output;
 mod sampling;
 mod schema_contract;
+mod secure_file;
 mod session;
 mod style;
 mod subscribe;

@@ -689,6 +689,12 @@ fn run_interactive(
     // commands from previous runs. Best-effort: a read-only HOME just keeps
     // history in-memory for this session.
     if persist_history && let Some(path) = history_path() {
+        // Every typed line lands here, including tool arguments carrying
+        // tokens, so the file is owner-only before reedline opens it:
+        // reedline creates it with whatever the umask allows.
+        if let Err(e) = crate::secure_file::ensure_owner_only(&path) {
+            eprintln!("warning: could not secure the history file: {e}");
+        }
         match FileBackedHistory::with_file(1000, path) {
             Ok(history) => editor = editor.with_history(Box::new(history)),
             Err(e) => eprintln!("warning: command history disabled: {e}"),
