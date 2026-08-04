@@ -21,6 +21,8 @@ pub enum ExitStatus {
     Transport = 4,
     /// Authentication or authorization failed.
     Auth = 5,
+    /// The operator interrupted a command with Ctrl-C.
+    Cancelled = 6,
 }
 
 impl ExitStatus {
@@ -36,6 +38,7 @@ impl ExitStatus {
             Self::Server => "server",
             Self::Transport => "transport",
             Self::Auth => "auth",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -69,7 +72,8 @@ pub fn current() -> ExitStatus {
         2 => ExitStatus::Usage,
         3 => ExitStatus::Server,
         4 => ExitStatus::Transport,
-        _ => ExitStatus::Auth,
+        5 => ExitStatus::Auth,
+        _ => ExitStatus::Cancelled,
     }
 }
 
