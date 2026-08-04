@@ -118,6 +118,7 @@ impl ProtocolMode {
 #[derive(Parser)]
 #[command(
     name = "mcp-repl",
+    version,
     about = "Interactive MCP client REPL",
     trailing_var_arg = true
 )]
