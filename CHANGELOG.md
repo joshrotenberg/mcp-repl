@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-08-04
+
+### Miscellaneous Tasks
+
+- Move to the standalone [mcp-repl](https://github.com/joshrotenberg/mcp-repl) repository, extracted from [tower-mcp](https://github.com/joshrotenberg/tower-mcp) with full history
+- Replace workspace-inherited manifest fields and dependencies with explicit standalone values; depend on released tower-mcp 0.18.1
+- Relocate the black-box test fixture into this repository's examples, excluded from the published package
+- Own formatting, lint, test, package, and release workflows independently; add a scheduled compatibility lane against tower-mcp git main
+
 ## [0.1.9] - 2026-08-04
 
 ### Bug Fixes

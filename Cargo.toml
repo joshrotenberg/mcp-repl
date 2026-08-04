@@ -1,14 +1,17 @@
 [package]
 name = "mcp-repl"
-version = "0.1.9"
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository = "https://github.com/joshrotenberg/tower-mcp"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joshrotenberg/mcp-repl"
 readme = "README.md"
 description = "Interactive MCP client REPL: connects to any MCP server and turns its tools, prompts, and resources into the command set"
 keywords = ["mcp", "repl", "cli", "client", "protocol"]
 categories = ["command-line-utilities", "development-tools"]
+# The black-box fixture server in examples/ is a test asset, not part of the
+# published package.
+exclude = ["/examples", "/.github"]
 
 [lib]
 name = "mcp_repl"
@@ -19,17 +22,17 @@ name = "mcp-repl"
 path = "src/main.rs"
 
 [dependencies]
-tower-mcp = { workspace = true, features = ["http-client", "oauth-client", "protocol-2026-07-28"] }
-async-trait.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-base64.workspace = true
-getrandom.workspace = true
+tower-mcp = { version = "0.18.1", features = ["http-client", "oauth-client", "protocol-2026-07-28"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.23.0"
+getrandom = "0.4"
 toml = "1"
 toml_edit = "0.25"
-clap.workspace = true
-tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reedline = { version = "0.49", features = ["external_printer"] }
 nu-ansi-term = "0.50"
 keyring = "4.1"
@@ -37,3 +40,8 @@ webbrowser = { version = "1.2", features = ["hardened"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The fixture example is an MCP server, so the dev graph adds tower-mcp's
+# server-side features and the fixture's own HTTP dependencies.
+tower-mcp = { version = "0.18.1", features = ["http", "protocol-2026-07-28"] }
+axum = { version = "0.8", features = ["json"] }
+schemars = "1.2"

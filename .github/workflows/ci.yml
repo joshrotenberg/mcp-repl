@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Daily compatibility lane against tower-mcp git main.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  quality:
+    name: Quality
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --all-features
+      - name: Documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  package:
+    name: Package
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify publishable package
+        run: cargo package
+
+  tower-mcp-main:
+    name: tower-mcp main compatibility
+    # Dogfooding lane: the default jobs test the released framework; this one
+    # patches in tower-mcp git main so upstream client-surface breaks surface
+    # here within a day instead of at the next release. A failure that only
+    # reproduces in this job means tower-mcp main moved, not that mcp-repl
+    # regressed. The patch stops applying if main's version leaves the
+    # declared semver range; that failure mode is the intended signal too.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Patch tower-mcp to git main
+        run: |
+          cat >> Cargo.toml <<'PATCH'
+
+          [patch.crates-io]
+          tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp" }
+          PATCH
+          cargo update -p tower-mcp
+      - name: Test against tower-mcp main
+        run: cargo test --all-targets --all-features

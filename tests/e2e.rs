@@ -16,11 +16,10 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(60);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 const SUITE_TIMEOUT: Duration = Duration::from_secs(600);
 
-fn workspace_root() -> PathBuf {
+fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
         .canonicalize()
-        .expect("workspace root")
+        .expect("repository root")
 }
 
 async fn run(mut command: Command, label: &str, timeout: Duration) -> Output {
@@ -104,15 +103,11 @@ fn json_lines(output: &Output, label: &str) -> Vec<serde_json::Value> {
 
 async fn build_fixture() -> PathBuf {
     let mut command = Command::new(env!("CARGO"));
-    command.current_dir(workspace_root()).args([
+    command.current_dir(repo_root()).args([
         "build",
         "--quiet",
-        "-p",
-        "tower-mcp-examples",
         "--example",
         "mcp_repl_fixture",
-        "--features",
-        "http,protocol-2026-07-28",
         "--message-format=json-render-diagnostics",
     ]);
     // Coverage and beta jobs may need to compile the repository-only fixture
@@ -145,7 +140,7 @@ async fn build_fixture() -> PathBuf {
 
 fn repl_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-repl"));
-    command.current_dir(workspace_root());
+    command.current_dir(repo_root());
     command
 }
 

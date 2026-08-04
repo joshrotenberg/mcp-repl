@@ -1,9 +1,11 @@
-//! Project lifecycle and extraction guide.
+//! Project lifecycle and release contract.
 //!
-//! `mcp-repl` is independently versioned and published even though its source
-//! currently lives in the tower-mcp workspace. This guide records the release
-//! contract and the work required before moving it to a standalone repository.
-//! It is a plan, not authorization to perform the move.
+//! `mcp-repl` began as an example in the
+//! [tower-mcp](https://github.com/joshrotenberg/tower-mcp) workspace and moved
+//! to this standalone repository at version 0.2.0 (2026-08-04). The move used
+//! `git filter-repo`, so `git log --follow` traces every source file back to
+//! its original tower-mcp commits. Versions before 0.2.0 were released from
+//! the tower-mcp repository; their tags and release notes remain there.
 //!
 //! # Supported boundaries
 //!
@@ -24,63 +26,31 @@
 //!
 //! # Compatibility and release lanes
 //!
-//! The path-scoped `mcp-repl` workflow owns the package's checks independently
-//! from the rest of the workspace:
+//! The default CI lane builds against the released `tower-mcp` declared in the
+//! manifest, which is what users install:
 //!
 //! ```text
-//! cargo fmt -p mcp-repl -- --check
-//! cargo clippy -p mcp-repl --all-targets --all-features -- -D warnings
-//! cargo test -p mcp-repl --all-targets --all-features
-//! RUSTDOCFLAGS=-Dwarnings cargo doc -p mcp-repl --no-deps --all-features
+//! cargo fmt --all -- --check
+//! cargo clippy --all-targets --all-features -- -D warnings
+//! cargo test --all-targets --all-features
+//! RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps --all-features
+//! cargo package
 //! ```
 //!
-//! Those commands test the workspace's current `tower-mcp`, which is the main
-//! compatibility lane. `cargo package -p mcp-repl` creates and verifies the
-//! normalized publishable package. In that package, Cargo replaces the
-//! workspace path dependency with the declared crates.io version, so this is
-//! also the released-framework compatibility lane. A tower-mcp version change
-//! must be published before that package lane can pass.
+//! A scheduled job additionally patches `tower-mcp` to git main and reruns the
+//! test suite. That lane preserves the early-warning role this project played
+//! inside the workspace: an upstream client-surface break shows up here within
+//! a day instead of at the next framework release. A failure that reproduces
+//! only in that job indicates tower-mcp main moved, not an mcp-repl
+//! regression.
 //!
-//! While the package remains in this workspace, the repository's release-plz
-//! workflow owns crates.io publication, tags, GitHub releases, and changelog
-//! updates. Do not publish the same version manually in parallel. Before an
-//! extraction, let the final workspace release finish and start the new
-//! repository at the next version. Copy and dry-run the release workflow before
-//! enabling its registry credential.
+//! This repository's release-plz workflow owns crates.io publication, tags,
+//! GitHub releases, and changelog updates. Do not publish a version manually
+//! in parallel with it.
 //!
-//! # Extraction checklist
+//! # Test fixture
 //!
-//! Perform history rewriting only in a disposable clone. A starting point is:
-//!
-//! ```text
-//! git filter-repo \
-//!   --path examples/mcp-repl/ \
-//!   --path LICENSE-APACHE \
-//!   --path LICENSE-MIT \
-//!   --path-rename examples/mcp-repl/:
-//! git log --follow -- src/lib.rs
-//! ```
-//!
-//! Before making the new repository authoritative:
-//!
-//! 1. Move or reproduce the black-box fixture currently located at
-//!    `examples/mcp_repl_fixture.rs`; it intentionally is not part of the
-//!    published package today.
-//! 2. Replace workspace-inherited package fields and dependencies with explicit
-//!    standalone manifest values, then run all checks and `cargo package` from
-//!    the extracted repository.
-//! 3. Carry over the licenses, contribution and security policy, code-owner and
-//!    dependency-update settings, supported Rust version, and the path-scoped
-//!    quality workflow.
-//! 4. Transfer open mcp-repl issues when possible. Otherwise recreate them with
-//!    bidirectional links, leave a migration notice in tower-mcp, and update
-//!    repository links in the README, Cargo manifest, crates.io, docs.rs, and
-//!    release notes.
-//! 5. Confirm the maintainers and crates.io owners who will handle releases and
-//!    security reports. Publish the new repository's security contact before
-//!    changing the crate's canonical repository URL.
-//! 6. Verify tags, changelog history, and `git log --follow` before archiving the
-//!    old source location or closing the extraction tracker.
-//!
-//! Until those steps are complete, source, issue triage, release notes, and
-//! security reporting remain owned by the tower-mcp repository.
+//! The black-box tests spawn `examples/mcp_repl_fixture.rs`, a deterministic
+//! MCP server built from this repository's dev-dependencies. It is excluded
+//! from the published package; the `examples/` directory here exists for the
+//! test suite, not for documentation.
