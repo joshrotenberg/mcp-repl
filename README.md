@@ -259,6 +259,42 @@ Pass `--no-reconnect` to turn this off and see session-loss errors as they
 arrive. stdio children and `--demo` are never reconnected: there, a lost
 session means the server process itself is gone.
 
+### Interrupting and timing out
+
+Ctrl-C during a running command cancels that command and returns to the
+prompt; the session, its history, and any background tasks survive. At the
+prompt it keeps its usual meaning and clears the line. In `--exec` mode an
+interrupt stops the sequence and exits 6.
+
+Cancelling stops the REPL waiting; it does not tell the server to stop. A
+tool with side effects may still be running on the other end.
+
+A server that accepts a request and never answers is a different problem,
+since a script has nobody to press Ctrl-C. `--timeout <seconds>` (default
+120) gives up and reports a transport error:
+
+```bash
+# A tighter bound for a scripted health check:
+mcp-repl --timeout 10 --http https://example/mcp -e "search query=x"
+```
+
+```bash
+# Wait indefinitely, whatever the server does:
+mcp-repl --timeout 0 -- ./my-server
+```
+
+The deadline covers tool calls, `read`, `prompt`, `bench` calls, and surface
+fetches, on both transports, and it replaces the HTTP transport's own 30s
+limit so raising it raises the real one. A tool that legitimately runs longer
+than the deadline is better run task-augmented with a trailing `&`.
+`wait <id>` is exempt, because outliving the call is what a task is for; give
+it its own bound with `wait <id> --timeout 300`.
+
+A surface list is bounded too: paging stops after 100 pages or 10000 entries,
+and says so, rather than following an endless cursor. Repeated
+`list_changed` notifications are coalesced, so a server that emits them in a
+loop causes one refresh rather than one per notification.
+
 ## Aliases
 
 Frequent commands get short names, kept in the same config file as the
@@ -675,8 +711,9 @@ keeps readable text output. Process statuses are stable:
 | 1 | no-match/check-style result (for example, `find` found nothing) |
 | 2 | local invocation or command usage error |
 | 3 | server rejection or tool error result |
-| 4 | transport or protocol connection failure |
+| 4 | transport or protocol connection failure (including a `--timeout`) |
 | 5 | authentication or authorization failure |
+| 6 | the run was interrupted with Ctrl-C |
 
 ## Capture and filtering
 
