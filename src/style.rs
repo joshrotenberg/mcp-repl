@@ -168,6 +168,30 @@ pub fn paint(style: Style, text: &str) -> String {
     }
 }
 
+/// How many terminal columns a string occupies.
+///
+/// Not its byte length and not its character count: a CJK ideograph is two
+/// columns wide, a combining mark is zero, and the escape sequences `paint`
+/// adds are not drawn at all.
+pub fn display_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// A styled left-aligned column of `width` visible columns.
+///
+/// `{:24}` cannot do this once a value is styled: Rust pads by character
+/// count, and the nine bytes of `\e[32m...\e[0m` are charged against the
+/// budget, so a colored column silently shrinks to fifteen visible columns
+/// and rows stop lining up. Pad against the unstyled text instead, and by
+/// what it actually occupies on screen.
+///
+/// The text is expected to be [`sanitize`]d already: the width of a control
+/// character is not a meaningful number.
+pub fn column(style: Style, text: &str, width: usize) -> String {
+    let padding = width.saturating_sub(display_width(text));
+    format!("{}{}", paint(style, text), " ".repeat(padding))
+}
+
 /// A `[label]` tag with dim brackets and a styled label.
 pub fn tag(style: Style, label: &str) -> String {
     format!(
@@ -394,6 +418,61 @@ fn render_inline(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drop ANSI sequences so a test can measure what a terminal draws.
+    fn visible(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_column_is_the_same_width_painted_or_not() {
+        // The bug this replaces: `{:24}` pads the *styled* string, so the
+        // escape bytes eat the budget and a colored row stops lining up
+        // with an uncolored one.
+        let plain = column(Style::new(), "add", 24);
+        let painted = column(Style::new().fg(Color::Green).bold(), "add", 24);
+        assert_eq!(display_width(&visible(&plain)), 24);
+        assert_eq!(display_width(&visible(&painted)), 24);
+    }
+
+    #[test]
+    fn a_column_is_measured_in_terminal_columns() {
+        // Two-column ideographs, and a combining mark that occupies none.
+        assert_eq!(display_width("名前"), 4);
+        assert_eq!(display_width("e\u{301}"), 1);
+        assert_eq!(
+            display_width(&visible(&column(Style::new(), "名前", 10))),
+            10
+        );
+        assert_eq!(
+            display_width(&visible(&column(Style::new(), "e\u{301}", 10))),
+            10
+        );
+    }
+
+    #[test]
+    fn an_oversized_value_is_not_truncated() {
+        // Overflowing one row is better than hiding part of a tool's name.
+        let long = "a".repeat(40);
+        let out = visible(&column(Style::new(), &long, 24));
+        assert_eq!(out, long);
+    }
 
     #[test]
     fn plain_text_passes_through_borrowed() {

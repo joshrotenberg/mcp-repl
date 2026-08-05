@@ -1540,6 +1540,7 @@ dependencies = [
  "toml_edit",
  "tower-mcp",
  "tracing-subscriber",
+ "unicode-width",
  "webbrowser",
 ]
 
