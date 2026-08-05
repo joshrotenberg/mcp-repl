@@ -358,59 +358,76 @@ fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
 /// Type label, optional detail (description or enum choices), and default
 /// value for a field schema.
 fn describe_field(schema: &PrimitiveSchemaDefinition) -> (String, Option<String>, Option<String>) {
-    match schema {
-        PrimitiveSchemaDefinition::String(s) => (
-            "string".to_string(),
-            s.description.clone(),
-            s.default.clone(),
-        ),
-        PrimitiveSchemaDefinition::Integer(s) => (
-            "integer".to_string(),
-            s.description.clone(),
-            s.default.map(|d| d.to_string()),
-        ),
-        PrimitiveSchemaDefinition::Number(s) => (
-            "number".to_string(),
-            s.description.clone(),
-            s.default.map(|d| d.to_string()),
-        ),
-        PrimitiveSchemaDefinition::Boolean(s) => (
-            "boolean".to_string(),
-            s.description.clone(),
-            s.default.map(|d| d.to_string()),
-        ),
-        PrimitiveSchemaDefinition::SingleSelectEnum(s) => (
-            format!("one of {}", s.enum_values.join("|")),
-            s.description.clone(),
-            s.default.clone(),
-        ),
-        PrimitiveSchemaDefinition::MultiSelectEnum(s) => (
-            "comma-separated list".to_string(),
-            s.description.clone(),
-            None,
-        ),
-        _ => ("value".to_string(), None, None),
+    let raw = field_json(schema);
+    let description = raw
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(str::to_string);
+    let default = raw.get("default").map(render_default);
+    // Enum choices are more useful than the word "string": they are the
+    // answer, not the shape of it.
+    if let Some(values) = raw.get("enum").and_then(|e| e.as_array()) {
+        let choices: Vec<String> = values.iter().map(render_default).collect();
+        let label = match raw.get("type").and_then(|t| t.as_str()) {
+            Some("array") => format!("any of {}, comma-separated", choices.join("|")),
+            _ => format!("one of {}", choices.join("|")),
+        };
+        return (label, description, default);
+    }
+    let label = match raw.get("type").and_then(|t| t.as_str()) {
+        Some("array") => "comma-separated list".to_string(),
+        Some(other) => other.to_string(),
+        None => "value".to_string(),
+    };
+    (label, description, default)
+}
+
+/// A field schema as plain JSON.
+///
+/// The typed `PrimitiveSchemaDefinition` cannot be matched on: it is an
+/// untagged union whose first variant is `String`, and a string schema's
+/// `type` field accepts any value, so every field deserializes as `String`
+/// no matter what the server sent. Re-reading the JSON recovers whatever
+/// survived that, which is enough to label and coerce a boolean, integer,
+/// number, or array correctly.
+///
+/// One thing does not survive: an enum field's `enum` values have nowhere to
+/// live on a string schema, so they are dropped before this sees them and
+/// the choices cannot be shown. That needs a fix in the protocol types.
+fn field_json(schema: &PrimitiveSchemaDefinition) -> serde_json::Value {
+    serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// A default or enum choice as the operator would type it: a bare string
+/// without quotes, everything else as JSON.
+fn render_default(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
 /// Coerce raw input to the field's declared type, falling back to the raw
 /// string when parsing fails (the server validates anyway).
 fn coerce_field(schema: &PrimitiveSchemaDefinition, raw: &str) -> ElicitFieldValue {
-    match schema {
-        PrimitiveSchemaDefinition::Integer(_) => raw
+    // Same reason as `describe_field`: the declared type comes from the JSON,
+    // not from which variant serde happened to pick.
+    let json = field_json(schema);
+    match json.get("type").and_then(|t| t.as_str()) {
+        Some("integer") => raw
             .parse::<i64>()
             .map(ElicitFieldValue::Integer)
             .unwrap_or_else(|_| ElicitFieldValue::String(raw.to_string())),
-        PrimitiveSchemaDefinition::Number(_) => raw
+        Some("number") => raw
             .parse::<f64>()
             .map(ElicitFieldValue::Number)
             .unwrap_or_else(|_| ElicitFieldValue::String(raw.to_string())),
-        PrimitiveSchemaDefinition::Boolean(_) => match raw.to_ascii_lowercase().as_str() {
+        Some("boolean") => match raw.to_ascii_lowercase().as_str() {
             "true" | "yes" | "y" | "1" => ElicitFieldValue::Boolean(true),
             "false" | "no" | "n" | "0" => ElicitFieldValue::Boolean(false),
             _ => ElicitFieldValue::String(raw.to_string()),
         },
-        PrimitiveSchemaDefinition::MultiSelectEnum(_) => {
+        Some("array") => {
             ElicitFieldValue::StringArray(raw.split(',').map(|s| s.trim().to_string()).collect())
         }
         _ => ElicitFieldValue::String(raw.to_string()),
@@ -420,6 +437,58 @@ fn coerce_field(schema: &PrimitiveSchemaDefinition, raw: &str) -> ElicitFieldVal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a field the way a server does: as JSON on the wire, parsed
+    /// into the protocol type. Constructing the type directly would hide
+    /// the very deserialization this guards against.
+    fn field_from_wire(json: serde_json::Value) -> PrimitiveSchemaDefinition {
+        serde_json::from_value(json).expect("field schema")
+    }
+
+    #[test]
+    fn a_declared_type_survives_the_untagged_union() {
+        // Every variant of this union deserializes as `String`, so the label
+        // has to come from the JSON rather than from the matched variant.
+        let (label, _, _) = describe_field(&field_from_wire(
+            serde_json::json!({"type": "boolean", "description": "Stay signed in"}),
+        ));
+        assert_eq!(label, "boolean");
+        let (label, description, default) = describe_field(&field_from_wire(
+            serde_json::json!({"type": "integer", "description": "How many", "default": 3}),
+        ));
+        assert_eq!(label, "integer");
+        assert_eq!(description.as_deref(), Some("How many"));
+        assert_eq!(default.as_deref(), Some("3"));
+    }
+
+    /// The value as it goes back on the wire, which is what the server
+    /// actually receives.
+    fn coerced(field: serde_json::Value, raw: &str) -> serde_json::Value {
+        serde_json::to_value(coerce_field(&field_from_wire(field), raw)).expect("field value")
+    }
+
+    #[test]
+    fn an_answer_is_coerced_to_the_declared_type() {
+        // A server asking for a number must not receive the string "5".
+        assert_eq!(coerced(serde_json::json!({"type": "integer"}), "5"), 5);
+        assert_eq!(coerced(serde_json::json!({"type": "number"}), "1.5"), 1.5);
+        assert_eq!(coerced(serde_json::json!({"type": "boolean"}), "yes"), true);
+        assert_eq!(
+            coerced(serde_json::json!({"type": "array"}), "a, b"),
+            serde_json::json!(["a", "b"])
+        );
+        // Anything that does not parse falls back to the raw text, which the
+        // server validates.
+        assert_eq!(
+            coerced(serde_json::json!({"type": "integer"}), "many"),
+            "many"
+        );
+    }
+
+    #[test]
+    fn a_string_field_stays_a_string() {
+        assert_eq!(coerced(serde_json::json!({"type": "string"}), "5"), "5");
+    }
 
     #[test]
     fn a_script_declines_elicitation_unless_it_asked_for_it() {

@@ -75,9 +75,9 @@ use nu_ansi_term::{Color, Style};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tower_mcp::client::{
-    ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder,
-    NotificationHandler, OAuthAuthorizationFlow, OAuthAuthorizationStart, OAuthClientError,
-    OAuthScopeEscalationConfig, StdioClientTransport,
+    HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder, NotificationHandler,
+    OAuthAuthorizationFlow, OAuthAuthorizationStart, OAuthClientError, OAuthScopeEscalationConfig,
+    StdioClientTransport,
 };
 use tower_mcp::protocol::{
     Content, DiscoverResult, Implementation, InitializeResult, LogLevel, PromptDefinition,
@@ -1225,8 +1225,11 @@ fn selected_oauth_profile(
 }
 
 fn demo_router() -> tower_mcp::McpRouter {
-    use tower_mcp::extract::RawArgs;
-    use tower_mcp::protocol::{CompleteResult, CompletionReference, ReadResourceResult};
+    use tower_mcp::extract::{Context, Json, RawArgs};
+    use tower_mcp::protocol::{
+        CompleteResult, CompletionReference, ElicitAction, ElicitFormParams, ElicitFormSchema,
+        ReadResourceResult,
+    };
     use tower_mcp::resource::ResourceTemplateBuilder;
     use tower_mcp::{CallToolResult, PromptBuilder, TaskSupportMode, ToolBuilder};
 
@@ -1309,23 +1312,52 @@ fn demo_router() -> tower_mcp::McpRouter {
         .tool(
             ToolBuilder::new("echo")
                 .description("Echo a message back")
-                .extractor_handler((), |RawArgs(args): RawArgs| async move {
-                    let msg = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    Ok(CallToolResult::text(msg.to_string()))
+                .read_only_safe()
+                .handler(|input: EchoInput| async move {
+                    let text = match input.repeat {
+                        1 => input.message,
+                        n => std::iter::repeat_n(input.message.as_str(), n as usize)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    };
+                    Ok(CallToolResult::text(text))
                 })
                 .build(),
         )
         .tool(
             ToolBuilder::new("about")
                 .description("Markdown-formatted notes about this demo server")
+                .read_only_safe()
                 .extractor_handler((), |RawArgs(_): RawArgs| async move {
                     Ok(CallToolResult::text(
                         "# mcp-repl demo\n\n\
                          A tiny in-process router for exploring the REPL.\n\n\
-                         - `echo message=hi` echoes back\n\
+                         - `echo message=hi` echoes back, and `echo <Tab>` completes its arguments\n\
+                         - `convert value=100 to=<Tab>` completes the enum values\n\
                          - `slow_add a=2 b=3 &` runs **task-augmented**\n\
+                         - `scan steps=5` reports **progress** while it runs\n\
+                         - `sign_in` asks *you* for the answers (elicitation)\n\
                          - `describe slow_add` shows the tool's schemas\n",
                     ))
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("convert")
+                .description("Convert a temperature between scales")
+                .read_only_safe()
+                .handler(|input: ConvertInput| async move {
+                    let celsius = match input.from {
+                        Scale::Celsius => input.value,
+                        Scale::Fahrenheit => (input.value - 32.0) * 5.0 / 9.0,
+                        Scale::Kelvin => input.value - 273.15,
+                    };
+                    let out = match input.to {
+                        Scale::Celsius => celsius,
+                        Scale::Fahrenheit => celsius * 9.0 / 5.0 + 32.0,
+                        Scale::Kelvin => celsius + 273.15,
+                    };
+                    Ok(CallToolResult::text(format!("{out:.2}")))
                 })
                 .build(),
         )
@@ -1333,14 +1365,229 @@ fn demo_router() -> tower_mcp::McpRouter {
             ToolBuilder::new("slow_add")
                 .description("Add two numbers, slowly (try running with a trailing &)")
                 .task_support(TaskSupportMode::Optional)
-                .extractor_handler((), |RawArgs(args): RawArgs| async move {
-                    let a = args.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let b = args.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
+                .read_only_safe()
+                .handler(|input: AddInput| async move {
                     tokio::time::sleep(Duration::from_secs(3)).await;
-                    Ok(CallToolResult::text(format!("{}", a + b)))
+                    Ok(CallToolResult::text((input.a + input.b).to_string()))
                 })
                 .build(),
         )
+        // Progress notifications need the request context, so this one takes
+        // the typed input through an extractor rather than the plain handler.
+        .tool(
+            ToolBuilder::new("scan")
+                .description("Pretend to scan something, reporting progress as it goes")
+                .read_only_safe()
+                .extractor_handler(
+                    (),
+                    |ctx: Context, Json(input): Json<ScanInput>| async move {
+                        let steps = input.steps.clamp(1, 20);
+                        for step in 1..=steps {
+                            ctx.report_progress(
+                                f64::from(step),
+                                Some(f64::from(steps)),
+                                Some(&format!("scanned {step} of {steps}")),
+                            )
+                            .await;
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                        }
+                        Ok(CallToolResult::text(format!("scanned {steps} items")))
+                    },
+                )
+                .build(),
+        )
+        // Elicitation: the server asks the operator for the values instead of
+        // taking them as arguments.
+        .tool(
+            ToolBuilder::new("sign_in")
+                .description("Ask you for credentials at the terminal (elicitation demo)")
+                .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                    let form = ElicitFormParams {
+                        mode: None,
+                        message: "The demo server would like to know who you are.".to_string(),
+                        requested_schema: ElicitFormSchema::new()
+                            .string_field("username", Some("Any name will do"), true)
+                            // The choices are repeated in the description
+                            // because a client cannot currently see them: the
+                            // protocol types drop an enum field's values on
+                            // the way in (see the elicitation note in
+                            // src/elicit.rs).
+                            .enum_field(
+                                "environment",
+                                Some("Which environment: staging or production"),
+                                vec!["staging".to_string(), "production".to_string()],
+                                false,
+                            )
+                            .boolean_field("remember_me", Some("Stay signed in"), false),
+                        meta: None,
+                    };
+                    let answer = ctx.elicit_form(form).await?;
+                    let text = match answer.action {
+                        ElicitAction::Accept => {
+                            let content = answer.content.unwrap_or_default();
+                            let username = content
+                                .get("username")
+                                .map(|v| format!("{v:?}"))
+                                .unwrap_or_else(|| "(none)".to_string());
+                            format!("signed in as {username}")
+                        }
+                        ElicitAction::Decline => "declined".to_string(),
+                        _ => "cancelled".to_string(),
+                    };
+                    Ok(CallToolResult::text(text))
+                })
+                .build(),
+        )
+}
+
+// Every field's doc comment below becomes the description the completion
+// menu shows, and a field without a serde default becomes `required`, so a
+// missing `message` is refused by the server instead of echoing nothing.
+/// Arguments for echoing a message back.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct EchoInput {
+    /// The text to echo back.
+    message: String,
+    /// How many times to repeat it.
+    #[serde(default = "one")]
+    repeat: u8,
+}
+
+fn one() -> u8 {
+    1
+}
+
+/// Two numbers to add.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AddInput {
+    /// The first number.
+    a: i64,
+    /// The second number.
+    b: i64,
+}
+
+/// How much scanning to pretend to do.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ScanInput {
+    /// How many steps to take, 1 to 20.
+    #[serde(default = "five")]
+    steps: u32,
+}
+
+fn five() -> u32 {
+    5
+}
+
+// A unit-only enum becomes a JSON Schema `enum` in `$defs`, referenced from
+// each field. That is what a real schema generator emits, and what the
+// REPL's completion resolves through.
+/// A temperature scale.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum Scale {
+    Celsius,
+    Fahrenheit,
+    Kelvin,
+}
+
+/// A temperature and the scales to convert between.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ConvertInput {
+    /// The number to convert.
+    value: f64,
+    /// The scale it is currently in.
+    from: Scale,
+    /// The scale to convert it to.
+    to: Scale,
+}
+
+/// Serve the demo router in this process, over a pair of in-memory pipes.
+///
+/// The obvious choice, `ChannelTransport`, delivers requests to the router
+/// but wires no client requester, so a tool cannot call back to ask the
+/// operator anything: elicitation and sampling fail with "no client
+/// requester configured". Running the bidirectional stdio transport over
+/// `tokio::io::duplex` instead gives the demo the same full-duplex framing a
+/// spawned server gets, without a child process, a socket, or a firewall
+/// prompt.
+fn demo_transport(protocol: ProtocolMode) -> Result<DemoTransport, ProtocolSupportError> {
+    // One buffer per direction. Large enough that neither side blocks on a
+    // surface listing, small enough to stay a rounding error.
+    let (server_side, client_side) = tokio::io::duplex(256 * 1024);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let support = protocol.support()?;
+    tokio::spawn(async move {
+        let mut transport = tower_mcp::transport::BidirectionalStdioTransport::new(demo_router())
+            .protocol_support(support);
+        // Ends when the REPL drops its half of the pipe, which is exactly
+        // when the session is over.
+        let _ = transport.run_with_streams(server_read, server_write).await;
+    });
+    Ok(DemoTransport::new(client_side))
+}
+
+/// The client half of [`demo_transport`]: newline-delimited JSON over an
+/// in-memory pipe, which is the same wire format a stdio child speaks.
+struct DemoTransport {
+    reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    open: bool,
+}
+
+impl DemoTransport {
+    fn new(stream: tokio::io::DuplexStream) -> Self {
+        let (read, write) = tokio::io::split(stream);
+        Self {
+            reader: BufReader::new(read),
+            writer: write,
+            open: true,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl tower_mcp::client::ClientTransport for DemoTransport {
+    async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.writer
+            .write_all(message.as_bytes())
+            .await
+            .map_err(|e| tower_mcp::Error::Transport(e.to_string()))?;
+        self.writer
+            .write_all(b"\n")
+            .await
+            .map_err(|e| tower_mcp::Error::Transport(e.to_string()))?;
+        self.writer
+            .flush()
+            .await
+            .map_err(|e| tower_mcp::Error::Transport(e.to_string()))
+    }
+
+    async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line).await {
+            Ok(0) => {
+                self.open = false;
+                Ok(None)
+            }
+            Ok(_) => Ok(Some(line.trim_end().to_string())),
+            Err(e) => {
+                self.open = false;
+                Err(tower_mcp::Error::Transport(e.to_string()))
+            }
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.open
+    }
+
+    async fn close(&mut self) -> tower_mcp::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.open = false;
+        let _ = self.writer.shutdown().await;
+        Ok(())
+    }
 }
 
 /// How long the event loop waits after a `list_changed` before refetching.
@@ -2029,7 +2276,10 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     let client = if args.demo {
         builder
             .connect(
-                TracingTransport::new(ChannelTransport::new(demo_router())),
+                TracingTransport::new(
+                    demo_transport(args.protocol)
+                        .map_err(|e| tower_mcp::Error::Transport(e.to_string()))?,
+                ),
                 make_handler(),
             )
             .await?
@@ -4272,7 +4522,7 @@ mod tests {
     async fn stable_selection_uses_initialize() {
         let client = client_builder(ProtocolMode::Stable)
             .unwrap()
-            .connect_simple(ChannelTransport::new(demo_router()))
+            .connect_simple(tower_mcp::client::ChannelTransport::new(demo_router()))
             .await
             .unwrap();
         let info = establish_connection(&client, ProtocolMode::Stable)
@@ -4752,7 +5002,7 @@ mod tests {
     /// the reconnect path can be exercised without a socket.
     async fn demo_client() -> McpClient {
         let client = McpClient::builder()
-            .connect_simple(ChannelTransport::new(demo_router()))
+            .connect_simple(tower_mcp::client::ChannelTransport::new(demo_router()))
             .await
             .unwrap();
         client.initialize("mcp-repl-test", "0").await.unwrap();

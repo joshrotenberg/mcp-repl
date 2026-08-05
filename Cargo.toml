@@ -39,6 +39,7 @@ keyring = "4.1"
 webbrowser = { version = "1.2", features = ["hardened"] }
 tempfile = "3"
 unicode-width = "0.2"
+schemars = "1.2"
 
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's

@@ -105,6 +105,39 @@ pub struct ReplCompleter {
 /// server-supplied names, descriptions, and `completion/complete` values, so
 /// this is where control sequences are neutralized before reedline paints
 /// them into the menu.
+/// Follow a local `$ref` to the definition it names.
+///
+/// Schema generators split named types out into `$defs` and leave a `$ref`
+/// behind, so a Rust or Python server describing an enum argument sends
+/// `{"$ref": "#/$defs/Scale"}` rather than the values inline. Without this,
+/// completion works only for servers that happen to inline everything.
+///
+/// Only same-document refs are followed: this runs while the user is typing,
+/// and fetching a remote schema is neither fast nor safe. A ref that does not
+/// resolve yields the original schema, so an unusual shape degrades to no
+/// completion rather than a wrong one.
+fn resolve_ref<'a>(
+    root: &'a serde_json::Value,
+    schema: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    let Some(reference) = schema.get("$ref").and_then(|r| r.as_str()) else {
+        return schema;
+    };
+    let Some(path) = reference.strip_prefix("#/") else {
+        return schema;
+    };
+    let mut current = root;
+    for segment in path.split('/') {
+        // JSON Pointer escapes, in the order the spec requires.
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        match current.get(&segment) {
+            Some(next) => current = next,
+            None => return schema,
+        }
+    }
+    current
+}
+
 fn suggestion(value: impl Into<String>, description: Option<String>, span: Span) -> Suggestion {
     Suggestion {
         value: style::sanitize(&value.into()).into_owned(),
@@ -263,7 +296,9 @@ impl ReplCompleter {
             // Enum values from the property schema, when declared.
             if let Some(values) = props
                 .get(arg_name)
-                .and_then(|s| s.get("enum"))
+                .map(|schema| resolve_ref(&tool.input_schema, schema))
+                .and_then(|s| s.get("enum").cloned())
+                .as_ref()
                 .and_then(|e| e.as_array())
             {
                 for v in values {
@@ -286,7 +321,10 @@ impl ReplCompleter {
             if !key.starts_with(word) {
                 continue;
             }
-            let ty = prop.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            // The description stays on the property (a `$ref` sibling keeps
+            // it), but the type lives in the definition it points at.
+            let target = resolve_ref(&tool.input_schema, prop);
+            let ty = target.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let desc = prop
                 .get("description")
                 .and_then(|d| d.as_str())
@@ -759,5 +797,63 @@ fn run_interactive(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A schema shaped the way a generator emits one: named types hoisted
+    /// into `$defs`, referenced from each property.
+    fn schema_with_defs() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "to": {"$ref": "#/$defs/Scale", "description": "Target scale"},
+                "value": {"type": "number"},
+            },
+            "$defs": {
+                "Scale": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+            },
+        })
+    }
+
+    #[test]
+    fn a_local_ref_resolves_to_its_definition() {
+        let root = schema_with_defs();
+        let property = &root["properties"]["to"];
+        let resolved = resolve_ref(&root, property);
+        assert_eq!(resolved["type"], "string");
+        assert_eq!(resolved["enum"][0], "celsius");
+    }
+
+    #[test]
+    fn a_schema_without_a_ref_is_returned_unchanged() {
+        let root = schema_with_defs();
+        let property = &root["properties"]["value"];
+        assert_eq!(resolve_ref(&root, property)["type"], "number");
+    }
+
+    #[test]
+    fn an_unresolvable_ref_degrades_to_the_property_itself() {
+        // Better to offer no completion than to follow a ref somewhere
+        // unexpected, and a remote ref is never fetched while typing.
+        let root = schema_with_defs();
+        for reference in [
+            serde_json::json!({"$ref": "#/$defs/Missing"}),
+            serde_json::json!({"$ref": "https://example.com/schema.json"}),
+        ] {
+            assert_eq!(resolve_ref(&root, &reference), &reference);
+        }
+    }
+
+    #[test]
+    fn json_pointer_escapes_are_decoded() {
+        let root = serde_json::json!({
+            "$defs": {"a/b~c": {"type": "integer"}},
+        });
+        let reference = serde_json::json!({"$ref": "#/$defs/a~1b~0c"});
+        assert_eq!(resolve_ref(&root, &reference)["type"], "integer");
     }
 }
