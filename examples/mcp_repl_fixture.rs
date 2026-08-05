@@ -72,6 +72,22 @@ fn fixture_router() -> McpRouter {
                 })
                 .build(),
         )
+        // Task-capable and always fails, so `wait` has something whose
+        // terminal state must reach the process exit status.
+        .tool(
+            ToolBuilder::new("fail_slowly")
+                .description("Fail from inside a task")
+                .task_support(TaskSupportMode::Optional)
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Err(tower_mcp::Error::Tool(tower_mcp::error::ToolError {
+                        tool: Some("fail_slowly".to_string()),
+                        message: "fixture task failure".to_string(),
+                        source: None,
+                    }))
+                })
+                .build(),
+        )
         .tool(
             ToolBuilder::new("process_info")
                 .description("Report deterministic process environment for import tests")

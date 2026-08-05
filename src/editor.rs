@@ -482,12 +482,21 @@ impl Completer for ReplCompleter {
                 }
             }
             // `task <id> respond` is the only subcommand, and it is easy to
-            // miss: offer it once the task is named.
-            "task" if head.split_whitespace().count() >= 2 => {
+            // miss: offer it once the task is named. Before that, and for the
+            // other task commands, offer `last`.
+            "task" | "wait" | "cancel" if head.split_whitespace().count() >= 2 => {
                 let naming_task = head.split_whitespace().count() == 2
                     && !head.ends_with(' ')
                     && !word.is_empty();
-                if !naming_task && "respond".starts_with(word) {
+                if naming_task || head.split_whitespace().count() == 1 {
+                    if "last".starts_with(word) {
+                        out.push(word_suggestion(
+                            "last",
+                            Some("the most recently started task".to_string()),
+                            span,
+                        ));
+                    }
+                } else if first == "task" && "respond".starts_with(word) {
                     out.push(word_suggestion(
                         "respond",
                         Some("answer what the task is waiting for".to_string()),
