@@ -54,6 +54,18 @@ pub struct Config {
     /// Command aliases in effect against every server.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// Settings for the REPL itself rather than for any one server.
+    #[serde(default)]
+    pub repl: Repl,
+}
+
+/// The `[repl]` table: knobs that are not about a connection.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Repl {
+    /// How many lines of command history to keep. `0` disables persistence
+    /// as surely as `--no-history` does.
+    pub history_capacity: Option<usize>,
 }
 
 /// One `[servers.<name>]` table.

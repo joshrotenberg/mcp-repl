@@ -403,6 +403,14 @@ impl Completer for ReplCompleter {
                     ));
                 }
             }
+            // The listings take one flag; offer it once the user types a dash.
+            if word.starts_with('-') && "--full".starts_with(word) {
+                out.push(word_suggestion(
+                    "--full",
+                    Some("print every row, ignoring the window height".to_string()),
+                    span,
+                ));
+            }
             for t in &surface.tools {
                 if t.name.starts_with(word) {
                     // The menu is where an unfamiliar tool is picked, so the
@@ -657,6 +665,7 @@ pub fn spawn_readline_thread(
     at_prompt: Arc<AtomicBool>,
     external_printer: ExternalPrinter<String>,
     persist_history: bool,
+    history_capacity: usize,
 ) {
     std::thread::spawn(move || {
         if !std::io::stdin().is_terminal() {
@@ -674,16 +683,101 @@ pub fn spawn_readline_thread(
             at_prompt,
             external_printer,
             persist_history,
+            history_capacity,
         );
     });
 }
 
-/// The command-history file: `~/.mcp-repl_history`, shared across sessions.
-/// `None` when `$HOME` is unset (history stays in-memory).
-fn history_path() -> Option<std::path::PathBuf> {
-    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".mcp-repl_history");
-    Some(p)
+/// Entries kept when the config does not say otherwise.
+pub const DEFAULT_HISTORY_CAPACITY: usize = 1000;
+
+/// The command-history file, shared across sessions.
+///
+/// `$XDG_STATE_HOME/mcp-repl/history`, falling back to
+/// `~/.local/state/mcp-repl/history`: history is state, not configuration,
+/// and the config file already follows the XDG layout. `None` when neither
+/// variable is set, which keeps history in memory for the session.
+pub fn history_path() -> Option<std::path::PathBuf> {
+    let base = match std::env::var_os("XDG_STATE_HOME") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => {
+            let mut home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+            home.push(".local");
+            home.push("state");
+            home
+        }
+    };
+    Some(base.join("mcp-repl").join("history"))
+}
+
+/// The most recent history entries, newest last, for the `history` command.
+///
+/// Read from the file rather than from the editor: the editor lives on the
+/// readline thread and the command runs on the async side, and a history
+/// listing is not worth a channel round trip.
+pub fn recent_history(limit: usize) -> Vec<String> {
+    let Some(path) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines
+        .iter()
+        .rev()
+        .take(limit)
+        .rev()
+        .map(|line| (*line).to_string())
+        .collect()
+}
+
+/// Where history used to live, for one-time migration.
+fn legacy_history_path() -> Option<std::path::PathBuf> {
+    let mut path = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    path.push(".mcp-repl_history");
+    Some(path)
+}
+
+/// Move a pre-XDG history file to the new location, once.
+///
+/// Only when the new path does not exist: a user who has already built up
+/// history at the new location keeps it, and the old file is left alone
+/// rather than silently deleted.
+fn migrate_legacy_history(destination: &std::path::Path) {
+    if destination.exists() {
+        return;
+    }
+    let Some(legacy) = legacy_history_path() else {
+        return;
+    };
+    if !legacy.is_file() {
+        return;
+    }
+    if let Err(e) = crate::secure_file::create_parent_dir(destination) {
+        eprintln!("warning: could not create the history directory: {e}");
+        return;
+    }
+    match std::fs::rename(&legacy, destination) {
+        Ok(()) => eprintln!(
+            "note: moved command history to {} (it now follows the XDG state layout)",
+            destination.display()
+        ),
+        // Crossing a filesystem boundary, most likely. Copying leaves the
+        // original in place, which is the safe direction for a file the
+        // user may care about.
+        Err(_) => match std::fs::copy(&legacy, destination) {
+            Ok(_) => eprintln!(
+                "note: copied command history to {}; the old {} can be deleted",
+                destination.display(),
+                legacy.display()
+            ),
+            Err(e) => eprintln!("warning: could not migrate command history: {e}"),
+        },
+    }
 }
 
 fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mpsc::Receiver<()>) {
@@ -728,6 +822,7 @@ fn run_interactive(
     at_prompt: Arc<AtomicBool>,
     external_printer: ExternalPrinter<String>,
     persist_history: bool,
+    history_capacity: usize,
 ) {
     let completer = ReplCompleter::new(surface.clone(), session, aliases.clone(), runtime);
     let highlighter = ReplHighlighter::new(surface, aliases);
@@ -759,13 +854,14 @@ fn run_interactive(
     // commands from previous runs. Best-effort: a read-only HOME just keeps
     // history in-memory for this session.
     if persist_history && let Some(path) = history_path() {
+        migrate_legacy_history(&path);
         // Every typed line lands here, including tool arguments carrying
         // tokens, so the file is owner-only before reedline opens it:
         // reedline creates it with whatever the umask allows.
         if let Err(e) = crate::secure_file::ensure_owner_only(&path) {
             eprintln!("warning: could not secure the history file: {e}");
         }
-        match FileBackedHistory::with_file(1000, path) {
+        match FileBackedHistory::with_file(history_capacity, path) {
             Ok(history) => editor = editor.with_history(Box::new(history)),
             Err(e) => eprintln!("warning: command history disabled: {e}"),
         }
@@ -817,6 +913,83 @@ mod tests {
                 "Scale": {"type": "string", "enum": ["celsius", "fahrenheit"]},
             },
         })
+    }
+
+    /// `history_path` and `recent_history` read process environment, so a
+    /// test that sets it must not run beside another that reads it.
+    fn with_state_home<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: serialized by GUARD, and restored before the lock drops.
+        unsafe { std::env::set_var("XDG_STATE_HOME", dir) };
+        let out = body();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        out
+    }
+
+    #[test]
+    fn history_follows_the_xdg_state_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = with_state_home(dir.path(), history_path).expect("a path");
+        assert_eq!(path, dir.path().join("mcp-repl").join("history"));
+        // Not the old dotfile, and not under the config directory: history
+        // is state.
+        assert!(!path.to_string_lossy().contains(".mcp-repl_history"));
+    }
+
+    #[test]
+    fn recent_history_returns_the_newest_entries_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp-repl").join("history");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "first
+second
+
+third
+fourth
+",
+        )
+        .unwrap();
+
+        let all = with_state_home(dir.path(), || recent_history(10));
+        // Blank lines are not commands.
+        assert_eq!(all, vec!["first", "second", "third", "fourth"]);
+
+        // A limit takes the newest, still oldest-first on screen.
+        let tail = with_state_home(dir.path(), || recent_history(2));
+        assert_eq!(tail, vec!["third", "fourth"]);
+    }
+
+    #[test]
+    fn no_history_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(with_state_home(dir.path(), || recent_history(10)).is_empty());
+    }
+
+    #[test]
+    fn migration_does_not_overwrite_an_existing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("history");
+        std::fs::write(
+            &destination,
+            "already here
+",
+        )
+        .unwrap();
+        // Whatever the legacy path holds, a populated destination wins:
+        // losing accumulated history to a migration would be worse than
+        // leaving an old file behind.
+        migrate_legacy_history(&destination);
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "already here\n"
+        );
     }
 
     #[test]

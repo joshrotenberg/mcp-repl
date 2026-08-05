@@ -1548,6 +1548,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "crossterm",
  "getrandom 0.4.3",
  "keyring",
  "nu-ansi-term",
