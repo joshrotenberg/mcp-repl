@@ -461,6 +461,45 @@ async fn exercise_imported_stdio_config(fixture: &Path, temp: &TempDir) {
             .expect("canonical process cwd"),
         cwd.canonicalize().expect("canonical expected cwd")
     );
+
+    // The same selector under `RUST_LOG`. Which file and entry a selector
+    // resolved to, and which approval let the spawn happen, are decisions
+    // that never become a frame, so `wire on` cannot answer them.
+    let mut logged = repl_command();
+    logged
+        .args([
+            "--json",
+            "--trust-import",
+            "--exec",
+            "process_info",
+            &selector,
+        ])
+        .env("MCP_REPL_HOST_VALUE", "from-host")
+        .env("RUST_LOG", "mcp_repl=debug")
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let logged = run(logged, "imported stdio config with logging", CASE_TIMEOUT).await;
+    assert_success(&logged, "imported stdio config with logging");
+    let records = String::from_utf8_lossy(&logged.stderr);
+    assert!(
+        records.contains("resolved a client config entry") && records.contains("entry=fixture"),
+        "the records name the entry a selector resolved to:\n{records}"
+    );
+    assert!(
+        records.contains("spawn approved by --trust-import"),
+        "and which approval let the spawn happen:\n{records}"
+    );
+
+    // stdout is the data stream either way: records go to stderr, so the
+    // NDJSON contract survives having logging on.
+    let values = json_lines(&logged, "imported stdio config with logging");
+    assert_eq!(values.len(), 1, "one value per command, with logging on");
+
+    // And none of it appears without being asked for.
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("resolved a client config entry"),
+        "the default level stays quiet:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 async fn exercise_schema_contracts(fixture: &Path, temp: &TempDir) {

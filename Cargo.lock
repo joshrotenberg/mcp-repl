@@ -1563,6 +1563,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tower-mcp",
+ "tracing",
  "tracing-subscriber",
  "unicode-width",
  "webbrowser",

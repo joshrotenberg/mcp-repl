@@ -156,12 +156,25 @@ pub fn authorize(
     interactive: bool,
 ) -> Decision {
     if trusted {
+        tracing::debug!(source = %plan.source, entry = %plan.entry, "spawn approved by --trust-import");
         return Decision::Approved;
     }
     let store = approvals_path(config_path);
     if is_approved(store.as_deref(), plan) {
+        tracing::debug!(
+            source = %plan.source,
+            entry = %plan.entry,
+            store = ?store.as_deref().map(|p| p.display().to_string()),
+            "spawn approved by a recorded approval"
+        );
         return Decision::Approved;
     }
+    tracing::debug!(
+        source = %plan.source,
+        entry = %plan.entry,
+        interactive,
+        "spawn has no recorded approval"
+    );
     if !interactive {
         return Decision::Refused(format!(
             "refusing to spawn the server imported from {}:{} without approval.\n\

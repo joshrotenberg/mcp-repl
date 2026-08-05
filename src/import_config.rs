@@ -68,6 +68,11 @@ pub fn load_with(
     let path = std::fs::canonicalize(&selector.path)
         .map_err(|error| format!("{}: {error}", selector.path.display()))?;
     let connection = parse_document(&source, &path, &selector.entry, &lookup)?;
+    tracing::debug!(
+        path = %path.display(),
+        entry = %selector.entry,
+        "resolved a client config entry"
+    );
     Ok(ImportedConnection {
         selector: Selector {
             path,
@@ -132,6 +137,7 @@ pub struct ScannedFile {
 /// Files that are absent are skipped; files that exist but cannot be parsed
 /// are included with their error.
 pub fn scan(paths: &[PathBuf]) -> Vec<ScannedFile> {
+    tracing::debug!(candidates = paths.len(), "scanning for client configs");
     paths
         .iter()
         .filter(|path| path.is_file())
