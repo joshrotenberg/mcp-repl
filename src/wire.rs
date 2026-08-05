@@ -261,6 +261,33 @@ fn is_secret_key(key: &str) -> bool {
     SECRET_KEYS.contains(&normalized.as_str())
 }
 
+/// Substrings that make a name look like it carries a credential.
+const CREDENTIAL_SHAPES: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "passphrase",
+    "credential",
+    "apikey",
+    "privatekey",
+    "authorization",
+];
+
+/// Whether a field or variable name looks like it carries a credential.
+///
+/// Deliberately broader than [`is_secret_key`], which drives redaction and
+/// matches exactly so an innocent `taskToken` is not blanked out. This one
+/// drives warnings, where the costs run the other way: flagging `taskToken`
+/// is a shrug, missing `github_token` is the failure. It matches on
+/// substrings, so `api_token` and `awsSecretAccessKey` are caught too.
+pub(crate) fn looks_like_credential(name: &str) -> bool {
+    let normalized = normalize_key(name);
+    CREDENTIAL_SHAPES
+        .iter()
+        .any(|shape| normalized.contains(shape))
+}
+
 /// Mask secrets before a frame goes anywhere. Recursive: a token nested in a
 /// tool's arguments is as sensitive as one in a header map.
 fn redact(value: &Value) -> Value {

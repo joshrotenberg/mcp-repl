@@ -468,8 +468,12 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use tower_mcp::client::{ChannelTransport, NotificationHandler};
 
-        let handler =
-            ReplClientHandler::new(NotificationHandler::new(), Arc::new(AtomicBool::new(false)));
+        let handler = ReplClientHandler::new(
+            NotificationHandler::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::RwLock::new("bench".to_string())),
+            crate::output::AsyncOutput::new(Arc::new(AtomicBool::new(false)), false),
+        );
         let client = McpClient::builder()
             .connect(ChannelTransport::new(crate::demo_router()), handler)
             .await

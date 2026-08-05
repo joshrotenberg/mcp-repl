@@ -400,10 +400,39 @@ async fn exercise_imported_stdio_config(fixture: &Path, temp: &TempDir) {
     .expect("write imported stdio config");
     let exit_file = temp.path().join("import-stdio.exit");
     let selector = format!("{}:fixture", config.display());
+
+    // An imported entry names a command to execute, so a session with nobody
+    // to ask refuses instead of spawning it.
+    let mut unapproved = repl_command();
+    unapproved
+        .args(["--json", "--exec", "process_info", &selector])
+        .env("MCP_REPL_HOST_VALUE", "from-host");
+    let refused = run(unapproved, "unapproved imported stdio config", CASE_TIMEOUT).await;
+    assert_status(&refused, 2, "unapproved imported stdio config");
+    let refusal = json_lines(&refused, "unapproved imported stdio config");
+    assert_eq!(refusal.len(), 1);
+    assert_eq!(refusal[0]["kind"], "usage");
+    let message = refusal[0]["error"]
+        .as_str()
+        .expect("refusal carries a message");
+    assert!(
+        message.contains("--trust-import"),
+        "the refusal must say how to proceed, got: {message}"
+    );
+
     let mut command = repl_command();
     command
-        .args(["--json", "--exec", "process_info", &selector])
+        .args([
+            "--json",
+            "--trust-import",
+            "--exec",
+            "process_info",
+            &selector,
+        ])
         .env("MCP_REPL_HOST_VALUE", "from-host")
+        // An HTTP credential in the environment must not be handed to a
+        // spawned child.
+        .env("MCP_BEARER", "http-only-secret")
         .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
     let output = run(command, "imported stdio config", CASE_TIMEOUT).await;
     assert_success(&output, "imported stdio config");
@@ -421,6 +450,11 @@ async fn exercise_imported_stdio_config(fixture: &Path, temp: &TempDir) {
     )
     .expect("process_info JSON");
     assert_eq!(process["imported"], "from-host");
+    assert_eq!(
+        process["bearer"],
+        serde_json::Value::Null,
+        "MCP_BEARER must not reach a spawned stdio child"
+    );
     assert_eq!(
         PathBuf::from(process["cwd"].as_str().expect("process cwd"))
             .canonicalize()

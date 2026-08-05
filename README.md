@@ -226,15 +226,48 @@ mcp-repl --server "$HOME/Library/Application Support/Claude/claude_desktop_confi
 - Unknown entries list available names in sorted order. Entries with both a
   command and URL, conflicting transport declarations, missing required
   fields, or transport-specific fields on the wrong transport are refused.
-- **Trust boundary:** selecting an imported `stdio` entry executes its command
-  directly with the declared arguments, environment, and working directory.
-  Treat the JSON file as executable code and review files from repositories or
-  people you do not trust. mcp-repl never invokes a shell for the entry and
-  does not print imported environment or header values, but literal secrets in
-  the source file are still secrets at rest.
 - Native global aliases remain available for imported connections. Imported
   files do not define mcp-repl aliases, so aliases created while using one are
   global.
+
+#### Approving an imported command
+
+Selecting an imported `stdio` entry runs its command, and the same file
+chooses which of your environment variables that command receives. It is
+executable code that arrived with a repository, so the first time an entry
+is used the REPL shows what it resolved to and asks:
+
+```text
+[import] /work/api/.mcp.json:local wants to start a server process on this machine:
+  command: node /work/api/mcp-server.js --stdio
+  cwd:     /work/api
+  env:     GITHUB_TOKEN, REGION
+  warning: GITHUB_TOKEN looks like a credential, and its value goes to this program
+The imported file chooses the program and which of your environment variables
+it receives. Approve it only if you trust that file.
+  start it? [y/N]>
+```
+
+Approving records the entry in `approved-imports.toml` beside the config
+file, so the question is asked once. The record holds the command, working
+directory, and variable *names* (never their values), and it is matched
+exactly: if the entry later runs a different command, moves, or asks for
+more variables, it does not match and you are asked again. Delete a block
+to be asked about that entry again, or delete the file to forget every
+approval.
+
+A session with nobody to ask (`--exec`, `--json`, or a non-terminal stdin)
+refuses rather than prompting, and exits 2 with the entry named. Pass
+`--trust-import` to skip the check in automation, which approves without
+recording anything.
+
+Native profiles in your own config file are not gated: you wrote them.
+mcp-repl never invokes a shell for an entry and never prints imported
+environment or header values, but literal secrets in the source file are
+still secrets at rest.
+
+`MCP_BEARER` is removed from every spawned stdio child's environment. It
+is an HTTP credential, and nothing reached over stdio has a use for it.
 
 ### Reconnecting
 
@@ -654,6 +687,24 @@ and description are shown, empty input accepts the default, and EOF
 cancels. Try `test_elicitation` against the conformance server. If a
 background task elicits while the editor owns the terminal, the request is
 declined rather than fighting the editor for stdin.
+
+Everything in a form comes from the server: the message, the field names,
+and their descriptions. The REPL is only the terminal it arrives at, so:
+
+- every request leads with a line naming the server that sent it, keeping
+  server-authored text distinct from the REPL's own
+- a field whose name looks like a credential (`api_key`, `github_token`,
+  `password`) is flagged before the value is typed
+- answers are read straight from stdin rather than through the editor, so
+  they never enter the command history
+- `--elicitation decline` refuses every request. `--exec` defaults to
+  `decline`, since a script has nobody to answer a form; pass
+  `--elicitation prompt` to answer one anyway
+
+A server can also elicit by asking the operator to visit a URL. Only
+`http` and `https` links are shown, and accepting is an explicit `y`:
+answering yes tells the server an out-of-band flow was completed, which
+is a claim only the operator can make.
 
 ## One-shot / scripting
 
