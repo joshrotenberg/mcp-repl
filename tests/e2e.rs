@@ -803,6 +803,67 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
+/// A server that serves only tools must not be greeted with warnings.
+///
+/// Real servers declare exactly this: GitMCP's `initialize` result is
+/// `{"tools":{"listChanged":true}}`. The REPL used to ask for prompts and
+/// resources anyway, and report the correct "Method not found" it got back as
+/// a failure, so connecting to a healthy server opened with two warnings
+/// about nothing.
+async fn exercise_tools_only_server(fixture: &Path, temp: &TempDir) {
+    let exit_file = temp.path().join("tools-only.exit");
+    let mut command = repl_command();
+    command
+        .args(["--no-history", "--color", "never", "--exec", "tools"])
+        .arg(fixture)
+        .arg("--tools-only")
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let output = run(command, "tools only", CASE_TIMEOUT).await;
+    assert_success(&output, "tools only");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("add"), "the tools still list:\n{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("warning:"),
+        "a server that declares only tools is not broken:\n{stderr}"
+    );
+}
+
+/// A listing that could not be read must not be reported as an empty one.
+///
+/// The same raw server, plus the `_meta._fastmcp` key FastMCP emits, which
+/// tower-mcp#1212 refuses to deserialize. Whatever happens to the response,
+/// the REPL must not answer `tools` with silence and success: a pipeline
+/// running `--json -e tools | jq length` would read 0 for a server that has
+/// tools, which is how this was found against DeepWiki.
+async fn exercise_unreadable_listing(fixture: &Path, temp: &TempDir) {
+    let exit_file = temp.path().join("bad-meta.exit");
+    let mut command = repl_command();
+    command
+        .args(["--no-history", "--color", "never", "--exec", "tools"])
+        .arg(fixture)
+        .args(["--tools-only", "--bad-meta"])
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let output = run(command, "unreadable listing", CASE_TIMEOUT).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a listing that failed to load is not a success:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout is the data stream, and there is no data:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("unavailable"),
+        "the operator is told the listing failed, not shown an empty one:\n{stderr}"
+    );
+}
+
 /// An unreachable server is the first failure most people meet, so what it
 /// prints is worth pinning.
 ///
@@ -1189,6 +1250,8 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_cancellation().await;
         exercise_json_contract(&fixture, &temp).await;
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
+        exercise_tools_only_server(&fixture, &temp).await;
+        exercise_unreadable_listing(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;

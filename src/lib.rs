@@ -506,6 +506,20 @@ pub(crate) struct Surface {
     pub prompts: Vec<PromptDefinition>,
     pub resources: Vec<ResourceDefinition>,
     pub templates: Vec<ResourceTemplateDefinition>,
+    /// Parts whose listing failed, by the name the commands use.
+    ///
+    /// An empty vector is not the same fact as a failed read, and without
+    /// this the two are indistinguishable: a server whose `tools/list` could
+    /// not be parsed looked exactly like a server with no tools, so `tools`
+    /// printed nothing and the run reported success.
+    pub unavailable: Vec<&'static str>,
+}
+
+impl Surface {
+    /// Whether a named part failed to load rather than coming back empty.
+    pub fn is_unavailable(&self, what: &str) -> bool {
+        self.unavailable.contains(&what)
+    }
 }
 
 /// Built-in commands with the short descriptions shown in the completion
@@ -1403,23 +1417,53 @@ where
 /// Fetch the server surface once. Returns the surface plus whether any list
 /// call was rejected as not-initialized (the retryable startup condition).
 async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
+    struct Outcome {
+        not_initialized: bool,
+        unavailable: Vec<&'static str>,
+    }
+
     fn take<T>(
-        what: &str,
-        r: Result<Vec<T>, tower_mcp::Error>,
-        not_initialized: &mut bool,
+        what: &'static str,
+        r: Option<Result<Vec<T>, tower_mcp::Error>>,
+        at: &mut Outcome,
     ) -> Vec<T> {
         match r {
-            Ok(v) => v,
-            Err(e) => {
+            // Not declared by the server, so never asked for. An absent
+            // capability is a definite empty, not a failure.
+            None => Vec::new(),
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
                 if is_not_initialized(&e) {
-                    *not_initialized = true;
+                    at.not_initialized = true;
                 } else {
-                    eprintln!("warning: fetching {what} failed: {e}");
+                    eprintln!(
+                        "warning: fetching {what} failed: {}",
+                        collapse_repeated_label(&e.to_string())
+                    );
+                    // A part the REPL could not read is a failure of the run,
+                    // not an empty result: without this an --exec script that
+                    // asked for the tools of an unreadable server exits 0
+                    // having printed nothing.
+                    note_error(ExitStatus::Transport);
+                    at.unavailable.push(what);
                 }
                 Vec::new()
             }
         }
     }
+
+    // Ask only for what the server said it has. A server that declares tools
+    // and nothing else answers `prompts/list` with "Method not found", which
+    // is correct of it, and warning about that made a healthy connection look
+    // broken. Capabilities we cannot read at all leave every list enabled, so
+    // an unreadable capability set hides nothing.
+    let declared = connection_info(client).await.map(|info| info.capabilities);
+    let has = |pick: fn(&ServerCapabilities) -> bool| declared.as_ref().is_none_or(pick);
+    let (want_tools, want_prompts, want_resources) = (
+        has(|c| c.tools.is_some()),
+        has(|c| c.prompts.is_some()),
+        has(|c| c.resources.is_some()),
+    );
     // The four list calls are independent reads, so run them concurrently.
     // The McpClient message loop multiplexes requests by id, so this is safe
     // on a single connection, and it means startup costs one round-trip's
@@ -1433,31 +1477,54 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
     // server that answers every page slowly cannot stretch the fetch by
     // adding pages.
     let (tools, prompts, resources, templates) = tokio::join!(
-        with_deadline(collect_pages("tools", |cursor| async move {
-            let page = client.list_tools_with_cursor(cursor).await?;
-            Ok((page.tools, page.next_cursor))
-        })),
-        with_deadline(collect_pages("prompts", |cursor| async move {
-            let page = client.list_prompts_with_cursor(cursor).await?;
-            Ok((page.prompts, page.next_cursor))
-        })),
-        with_deadline(collect_pages("resources", |cursor| async move {
-            let page = client.list_resources_with_cursor(cursor).await?;
-            Ok((page.resources, page.next_cursor))
-        })),
-        with_deadline(collect_pages("resource templates", |cursor| async move {
-            let page = client.list_resource_templates_with_cursor(cursor).await?;
-            Ok((page.resource_templates, page.next_cursor))
-        })),
+        maybe(want_tools, async {
+            with_deadline(collect_pages("tools", |cursor| async move {
+                let page = client.list_tools_with_cursor(cursor).await?;
+                Ok((page.tools, page.next_cursor))
+            }))
+            .await
+        }),
+        maybe(want_prompts, async {
+            with_deadline(collect_pages("prompts", |cursor| async move {
+                let page = client.list_prompts_with_cursor(cursor).await?;
+                Ok((page.prompts, page.next_cursor))
+            }))
+            .await
+        }),
+        maybe(want_resources, async {
+            with_deadline(collect_pages("resources", |cursor| async move {
+                let page = client.list_resources_with_cursor(cursor).await?;
+                Ok((page.resources, page.next_cursor))
+            }))
+            .await
+        }),
+        // Templates ride on the resources capability: a server that serves
+        // neither declares neither, and there is no separate flag for them.
+        maybe(want_resources, async {
+            with_deadline(collect_pages("resource templates", |cursor| async move {
+                let page = client.list_resource_templates_with_cursor(cursor).await?;
+                Ok((page.resource_templates, page.next_cursor))
+            }))
+            .await
+        }),
     );
-    let mut ni = false;
-    let surface = Surface {
-        tools: take("tools", tools, &mut ni),
-        prompts: take("prompts", prompts, &mut ni),
-        resources: take("resources", resources, &mut ni),
-        templates: take("resource templates", templates, &mut ni),
+    let mut at = Outcome {
+        not_initialized: false,
+        unavailable: Vec::new(),
     };
-    (surface, ni)
+    let surface = Surface {
+        tools: take("tools", tools, &mut at),
+        prompts: take("prompts", prompts, &mut at),
+        resources: take("resources", resources, &mut at),
+        templates: take("resource templates", templates, &mut at),
+        unavailable: std::mem::take(&mut at.unavailable),
+    };
+    (surface, at.not_initialized)
+}
+
+/// Run `work` only when the server declared the capability it needs.
+async fn maybe<T, F: Future<Output = T>>(wanted: bool, work: F) -> Option<T> {
+    if wanted { Some(work.await) } else { None }
 }
 
 async fn fetch_surface(client: &McpClient) -> Surface {
@@ -3357,6 +3424,24 @@ async fn handle_line(
         }
         "tools" | "prompts" | "resources" | "templates" => {
             let s = surface.read().unwrap();
+            // Printing an empty list here would state something the REPL does
+            // not know. Say the listing failed instead, and keep the status
+            // non-zero so a pipeline cannot read it as "this server has none".
+            let what = if cmd == "templates" {
+                "resource templates"
+            } else {
+                cmd
+            };
+            if s.is_unavailable(what) {
+                report_error(
+                    ExitStatus::Transport,
+                    &format!(
+                        "the {what} listing is unavailable: it could not be read from this \
+                         server (try `refresh`)"
+                    ),
+                );
+                return false;
+            }
             if !output.is_plain() || json_output() {
                 let v = match cmd {
                     "tools" => serde_json::to_value(&s.tools),

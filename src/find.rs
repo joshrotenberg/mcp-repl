@@ -381,6 +381,7 @@ mod tests {
                 }))
                 .unwrap(),
             ],
+            unavailable: Vec::new(),
         }
     }
 
