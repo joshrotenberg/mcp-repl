@@ -832,18 +832,21 @@ async fn exercise_tools_only_server(fixture: &Path, temp: &TempDir) {
 
 /// A listing that could not be read must not be reported as an empty one.
 ///
-/// The same raw server, plus the `_meta._fastmcp` key FastMCP emits, which
-/// tower-mcp#1212 refuses to deserialize. Whatever happens to the response,
-/// the REPL must not answer `tools` with silence and success: a pipeline
-/// running `--json -e tools | jq length` would read 0 for a server that has
-/// tools, which is how this was found against DeepWiki.
+/// The same raw server, now declaring the tools capability and then failing
+/// to serve it. Found against DeepWiki, where the listing failed to
+/// deserialize and `--json -e tools | jq length` read 0 for a server with 18
+/// tools. The original fixture reproduced that exact cause, a `_meta`
+/// key tower-mcp refused; upstream now drops such keys instead, so the cause
+/// had to become one that does not depend on someone else's bug. What is
+/// being pinned is the REPL's response to an unreadable listing, not the
+/// reason it was unreadable.
 async fn exercise_unreadable_listing(fixture: &Path, temp: &TempDir) {
-    let exit_file = temp.path().join("bad-meta.exit");
+    let exit_file = temp.path().join("failing-list.exit");
     let mut command = repl_command();
     command
         .args(["--no-history", "--color", "never", "--exec", "tools"])
         .arg(fixture)
-        .args(["--tools-only", "--bad-meta"])
+        .args(["--tools-only", "--failing-list"])
         .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
     let output = run(command, "unreadable listing", CASE_TIMEOUT).await;
 
