@@ -426,7 +426,67 @@ fn report_error_with_hint(status: ExitStatus, message: &str, hint: Option<&str>)
 }
 
 fn report_mcp_error(error: &tower_mcp::Error) {
-    report_error(ExitStatus::from_mcp_error(error), &error.to_string());
+    report_error(
+        ExitStatus::from_mcp_error(error),
+        collapse_repeated_label(&error.to_string()),
+    );
+}
+
+/// Build the log subscriber once the CLI's own settings are known.
+fn init_tracing(args: &Args) {
+    // These records go to stderr, so `auto` follows stderr rather than
+    // stdout: piping results to a file should not strip color from messages
+    // still headed for a terminal, and redirecting stderr should.
+    let ansi = match args.color {
+        style::ColorMode::Always => true,
+        style::ColorMode::Never => false,
+        style::ColorMode::Auto => {
+            std::env::var_os("NO_COLOR").is_none()
+                && std::io::IsTerminal::is_terminal(&std::io::stderr())
+        }
+    };
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(ansi)
+        .with_env_filter(
+            // `tower_mcp::client` narrates failures this REPL already reports
+            // in its own words, and warns about responses to requests the
+            // REPL cancelled deliberately. Both arrive mid-session at a
+            // prompt that owns its rendering, and neither tells the operator
+            // anything they are not already being told. `RUST_LOG` replaces
+            // this wholesale, so nothing is unreachable.
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,tower_mcp::client=off".into()),
+        )
+        .init();
+}
+
+/// Drop a label the message already carries.
+///
+/// Every layer that wraps a failure prepends its own label to a string that
+/// usually starts with one, so an unreachable server arrives as
+/// `Transport error: Transport error: Transport error: HTTP request failed:
+/// ...`. Only the innermost sentence is information, and the repetition
+/// pushes it off the visible part of the line. One label is kept, so the kind
+/// of failure is still named.
+fn collapse_repeated_label(message: &str) -> &str {
+    let Some((label, _)) = message.split_once(": ") else {
+        return message;
+    };
+    // A label with no text after it is not a label worth collapsing, and
+    // stripping on an empty prefix would not terminate.
+    if label.is_empty() {
+        return message;
+    }
+    let prefix = format!("{label}: ");
+    let mut collapsed = message;
+    while let Some(rest) = collapsed.strip_prefix(&prefix) {
+        if !rest.starts_with(&prefix) {
+            break;
+        }
+        collapsed = rest;
+    }
+    collapsed
 }
 
 fn exit_with_error(status: ExitStatus, message: &str) -> ! {
@@ -2520,13 +2580,11 @@ fn log_level_style(level: LogLevel) -> Style {
 /// its implementation back into a monolithic executable.
 #[tokio::main]
 pub async fn run_cli() {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
-        .init();
+    // Parsed first: the subscriber has to know what --color decided, and
+    // building it beforehand meant `--color never` still emitted escape
+    // sequences into a stderr a script was told would be plain.
     let args = Args::parse();
+    init_tracing(&args);
 
     // Generators write to stdout and exit. They are checked before anything
     // else so a packaging script never needs a config file, a server, or a
@@ -2546,7 +2604,10 @@ pub async fn run_cli() {
     REQUEST_TIMEOUT_SECS.store(args.timeout, Ordering::Relaxed);
 
     if let Err(error) = run(args).await {
-        exit_with_error(ExitStatus::from_mcp_error(&error), &error.to_string());
+        exit_with_error(
+            ExitStatus::from_mcp_error(&error),
+            collapse_repeated_label(&error.to_string()),
+        );
     }
 }
 
@@ -5051,6 +5112,47 @@ mod tests {
 
     use async_trait::async_trait;
     use tower_mcp::client::ClientTransport;
+
+    #[test]
+    fn a_repeated_error_label_is_collapsed_to_one() {
+        // The reported shape: an unreachable server, one label per wrapping
+        // layer, and the only informative sentence pushed to the end.
+        assert_eq!(
+            collapse_repeated_label(
+                "Transport error: Transport error: Transport error: HTTP request failed: refused"
+            ),
+            "Transport error: HTTP request failed: refused"
+        );
+        // One label is kept, so the kind of failure is still named.
+        assert_eq!(
+            collapse_repeated_label("Transport error: HTTP request failed: refused"),
+            "Transport error: HTTP request failed: refused"
+        );
+    }
+
+    #[test]
+    fn collapsing_leaves_ordinary_messages_alone() {
+        // Nothing repeats, so nothing is dropped, including messages whose
+        // later segments look like labels.
+        for message in [
+            "unknown command: nope",
+            "Server error: tool `x` failed: bad input",
+            "no colon here",
+            "",
+            ": leading colon",
+        ] {
+            assert_eq!(collapse_repeated_label(message), message, "{message:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_identical_label_collapses() {
+        // A different label is a different layer saying a different thing.
+        assert_eq!(
+            collapse_repeated_label("Transport error: Server error: refused"),
+            "Transport error: Server error: refused"
+        );
+    }
 
     /// A single-response transport for pinning the final discovery wire shape.
     struct DiscoveryTransport {
