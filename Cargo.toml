@@ -43,6 +43,7 @@ unicode-width = "0.2"
 schemars = "1.2"
 clap_complete = "4"
 clap_mangen = "0.2"
+crossterm = { version = "0.29", default-features = false }
 
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's

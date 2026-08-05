@@ -470,6 +470,7 @@ pub(crate) const BUILTINS: &[(&str, &str)] = &[
     ("info", "replay the connection banner plus capabilities"),
     ("wire", "toggle raw JSON-RPC frame tracing (on|off)"),
     ("last", "reprint the previous request and response"),
+    ("history", "list recent command history"),
     ("vars", "list captured variables"),
     ("unset", "clear a captured variable"),
     ("quit", "exit"),
@@ -487,18 +488,19 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "tools",
-        "tools",
-        "List the server's tools. Every tool is also a command: `<tool> [k=v...]`.",
+        "tools [--full]",
+        "List the server's tools. Every tool is also a command: `<tool> [k=v...]`. \
+         A long list is trimmed to the window; `--full` prints all of it.",
     ),
-    ("prompts", "prompts", "List the server's prompts."),
+    ("prompts", "prompts [--full]", "List the server's prompts."),
     (
         "resources",
-        "resources",
+        "resources [--full]",
         "List concrete resources. Parameterized ones are under `templates`.",
     ),
     (
         "templates",
-        "templates",
+        "templates [--full]",
         "List resource templates: URIs with `{variable}` parts, completed by the server.",
     ),
     (
@@ -610,6 +612,11 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
         "last",
         "last",
         "Reprint the previous request and response. Frames are recorded whether or not tracing is on.",
+    ),
+    (
+        "history",
+        "history [count]",
+        "List recent commands from previous sessions. Ctrl-R searches them interactively.",
     ),
     (
         "vars",
@@ -849,15 +856,59 @@ pub(crate) fn timing(elapsed: Duration) -> String {
     paint(Style::new().dimmed(), &body)
 }
 
+/// How many rows a listing may print before it truncates, and the tail line
+/// to print when it does.
+///
+/// Sized to the terminal so a listing leaves the command that produced it,
+/// and the next prompt, on screen instead of scrolling them away. `None`
+/// means print everything: under `--json` or when stdout is not a terminal
+/// the output is a data stream, and truncating it would corrupt whatever
+/// reads it.
+fn listing_limit() -> Option<usize> {
+    if json_output() || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return None;
+    }
+    // Room for the command line, the truncation notice, and the next prompt.
+    const RESERVED: usize = 4;
+    const FALLBACK_ROWS: usize = 24;
+    let rows = crossterm::terminal::size()
+        .map(|(_, rows)| rows as usize)
+        .unwrap_or(FALLBACK_ROWS);
+    // Never so small that the listing is useless on a short window.
+    Some(rows.saturating_sub(RESERVED).max(5))
+}
+
+/// Print at most `limit` of `total` rows, and say what was held back.
+///
+/// `full` is the flag the user passes to see the rest, named in the notice
+/// so the way forward is on screen rather than in the docs.
+fn note_truncation(shown: usize, total: usize, full: &str) {
+    if shown >= total {
+        return;
+    }
+    println!(
+        "{}",
+        paint(
+            Style::new().dimmed(),
+            &format!(
+                "... {} more of {total}; `{full}` shows everything",
+                total - shown
+            )
+        )
+    );
+}
+
 /// A compact tool listing for the startup banner: name and description, capped
 /// so a large surface does not flood the screen. The full list is always
 /// available via `tools`.
 fn print_tool_overview(surface: &Surface) {
-    const CAP: usize = 30;
     if surface.tools.is_empty() {
         return;
     }
-    for t in surface.tools.iter().take(CAP) {
+    // Half the window: the banner shares the first screen with the counts,
+    // the hint line, and the prompt.
+    let cap = listing_limit().map_or(surface.tools.len(), |rows| (rows / 2).max(5));
+    for t in surface.tools.iter().take(cap) {
         println!(
             "{} {}{}",
             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
@@ -865,12 +916,12 @@ fn print_tool_overview(surface: &Surface) {
             tool_tag_suffix(t)
         );
     }
-    if surface.tools.len() > CAP {
+    if surface.tools.len() > cap {
         println!(
             "{}",
             paint(
                 Style::new().dimmed(),
-                &format!("... +{} more, type `tools`", surface.tools.len() - CAP)
+                &format!("... +{} more, type `tools`", surface.tools.len() - cap)
             )
         );
     }
@@ -2535,6 +2586,13 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         surface_subscription::SurfaceSubscription::start(session.clone(), async_output.clone())
     });
 
+    // History size is a REPL setting, not a per-server one, so it comes from
+    // the config's `[repl]` table rather than a flag.
+    let history_capacity = profiles
+        .repl
+        .history_capacity
+        .unwrap_or(editor::DEFAULT_HISTORY_CAPACITY);
+
     // Readline runs on its own thread; lines cross into async via channels.
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);
     let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
@@ -2550,7 +2608,8 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         async_output
             .external_printer()
             .expect("interactive sessions have an external printer"),
-        !args.no_history,
+        !args.no_history && history_capacity > 0,
+        history_capacity,
     );
 
     loop {
@@ -2820,9 +2879,15 @@ async fn handle_line(
                 emit_value(v, &output, || unreachable!("plain output handled below"));
                 return false;
             }
+            // `<list> --full` prints everything; otherwise a long surface is
+            // trimmed to the window so the prompt stays in view.
+            let full = rest.contains(&"--full");
+            let limit = if full { None } else { listing_limit() };
             match cmd {
                 "tools" => {
-                    for t in &s.tools {
+                    let total = s.tools.len();
+                    let shown = limit.unwrap_or(total).min(total);
+                    for t in s.tools.iter().take(shown) {
                         println!(
                             "{} {}{}",
                             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
@@ -2830,9 +2895,12 @@ async fn handle_line(
                             tool_tag_suffix(t)
                         );
                     }
+                    note_truncation(shown, total, "tools --full");
                 }
                 "prompts" => {
-                    for p in &s.prompts {
+                    let total = s.prompts.len();
+                    let shown = limit.unwrap_or(total).min(total);
+                    for p in s.prompts.iter().take(shown) {
                         let args: Vec<String> = p
                             .arguments
                             .iter()
@@ -2851,15 +2919,19 @@ async fn handle_line(
                             sanitize(p.description.as_deref().unwrap_or(""))
                         );
                     }
+                    note_truncation(shown, total, "prompts --full");
                 }
                 "resources" => {
-                    for r in &s.resources {
+                    let total = s.resources.len();
+                    let shown = limit.unwrap_or(total).min(total);
+                    for r in s.resources.iter().take(shown) {
                         println!(
                             "{} {}",
                             style::column(Style::new().fg(Color::Green), &sanitize(&r.uri), 40),
                             sanitize(&r.name)
                         );
                     }
+                    note_truncation(shown, total, "resources --full");
                     // Templates (parameterized URIs) are a separate MCP list
                     // and easy to miss; point at them.
                     if !s.templates.is_empty() {
@@ -2876,7 +2948,9 @@ async fn handle_line(
                     }
                 }
                 _ => {
-                    for t in &s.templates {
+                    let total = s.templates.len();
+                    let shown = limit.unwrap_or(total).min(total);
+                    for t in s.templates.iter().take(shown) {
                         println!(
                             "{} {}",
                             style::column(
@@ -2887,6 +2961,7 @@ async fn handle_line(
                             sanitize(&t.name)
                         );
                     }
+                    note_truncation(shown, total, "templates --full");
                     if !s.resources.is_empty() {
                         println!(
                             "{}",
@@ -3446,6 +3521,42 @@ async fn handle_line(
             }
             None => report_error(ExitStatus::Transport, "not initialized"),
         },
+        "history" => {
+            const DEFAULT_SHOWN: usize = 20;
+            let limit = match rest.first() {
+                None => DEFAULT_SHOWN,
+                Some(raw) => match raw.parse::<usize>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        command_error(&format!("usage: history [count] (got `{raw}`)"));
+                        return false;
+                    }
+                },
+            };
+            let entries = editor::recent_history(limit);
+            if json_output() {
+                print_json(&serde_json::json!(entries));
+            } else if entries.is_empty() {
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        "no history yet (it persists across sessions unless --no-history)"
+                    )
+                );
+            } else {
+                for line in &entries {
+                    println!("{}", sanitize(line));
+                }
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        "Ctrl-R searches history interactively"
+                    )
+                );
+            }
+        }
         "vars" => {
             let all = vars::list();
             if json_output() {
@@ -4322,6 +4433,7 @@ const ROUTABLE_BUILTINS: &[&str] = &[
     "read",
     "find",
     "info",
+    "history",
 ];
 
 /// Emit a built-in's canonical value: routed when the line asked for a

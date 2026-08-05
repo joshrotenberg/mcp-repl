@@ -70,6 +70,25 @@ check for a script:
 mcp-repl --http https://example/mcp -e ping
 ```
 
+A long surface is trimmed to the terminal window rather than scrolling the
+prompt away, with the escape hatch named on the last line:
+
+```text
+cratesio> tools
+...
+... 80 more of 100; `tools --full` shows everything
+```
+
+`--full` prints every row. Truncation is interactive-only: `--exec` and
+`--json` output is a data stream and is never trimmed.
+
+`history` lists recent commands from previous sessions, and Ctrl-R searches
+them. History lives at `$XDG_STATE_HOME/mcp-repl/history` (falling back to
+`~/.local/state/mcp-repl/history`), owner-readable only, holding the last
+1000 lines. Set `[repl] history_capacity` in the config file to change that,
+or `--no-history` to keep it in memory. A pre-0.3 `~/.mcp-repl_history` is
+moved to the new location once, automatically.
+
 `resources` lists concrete resources and `templates` lists parameterized
 (`{variable}`) ones; each points at the other so a server that splits its
 resources across the two MCP lists is not confusing.

@@ -144,6 +144,9 @@ url = "https://cratesio-mcp.fly.dev/"
 bearer_env = "CRATESIO_TOKEN"      # read the token from the environment
 headers = { "X-Api-Key" = "abc" }
 
+[repl]
+history_capacity = 5000            # lines of command history to keep
+
 [oauth.work]
 url = "https://mcp.example.com/mcp"
 scopes = ["openid", "offline_access"]
