@@ -235,21 +235,21 @@ pub fn canned(params: &CreateMessageParams) -> CreateMessageResult {
 /// The `prompt` answer: show the request, read a message, wrap it. Blocking
 /// stdin reads, so callers run this off the async runtime.
 pub fn prompt(params: &CreateMessageParams) -> Result<CreateMessageResult, JsonRpcError> {
-    print!("{}", render_request(params));
-    println!(
+    eprint!("{}", render_request(params));
+    eprintln!(
         "{}",
         paint(
             Style::new().dimmed(),
             "  type the assistant message; `.` on its own line submits, Ctrl-D declines"
         )
     );
-    print!("  reply> ");
+    eprint!("  reply> ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let mut stdin = std::io::stdin().lock();
     match read_reply(&mut stdin) {
         Some(text) => Ok(reply(&text, OPERATOR_MODEL, params.max_tokens)),
         None => {
-            println!("  (declined)");
+            eprintln!("  (declined)");
             Err(declined("no reply given"))
         }
     }

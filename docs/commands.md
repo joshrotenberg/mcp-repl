@@ -379,6 +379,17 @@ and their descriptions. The REPL is only the terminal it arrives at, so:
   `decline`, since a script has nobody to answer a form; pass
   `--elicitation prompt` to answer one anyway
 
+How a server reaches the operator depends on the lifecycle, and mcp-repl
+answers both the same way. On the stable lifecycle the server sends
+`elicitation/create` directly. The 2026-07-28 lifecycle has no
+server-initiated requests at all: the server returns an input-required
+result carrying the question, mcp-repl answers it, and the call is retried
+automatically (SEP-2322). Either way the prompt looks the same, and
+`--elicitation decline` refuses both.
+
+Prompts and their echoes go to stderr, so `--json` stdout stays one value
+per command even while you are answering one.
+
 A server can also elicit by asking the operator to visit a URL. Only
 `http` and `https` links are shown, and accepting is an explicit `y`:
 answering yes tells the server an out-of-band flow was completed, which
