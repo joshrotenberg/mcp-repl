@@ -42,10 +42,19 @@ Frames print to stderr, so `--json` output on stdout stays pipeable with
 tracing on.
 
 Secrets are masked before a frame is stored, so nothing unmasked reaches the
-trace or `last`: values under `authorization`, `token`, `apiKey`, `secret`,
-`password` and similar keys (separators and case ignored), and anything
-following `Bearer ` inside a string. The HTTP `Authorization` header itself
-never appears here, since it is not part of a JSON-RPC frame.
+trace or `last`. Masking is by key name, normalized so `X-Api-Key`,
+`x_api_key`, and `apiKey` all match: the enumerated names (authorization,
+cookie, password, client secret, and the rest), plus anything ending in
+`token`, `secret`, `password`, `passphrase`, or `credential`, plus `*key`
+next to a qualifier like `api`, `access`, or `private`. A credential inside
+a string is masked by its scheme, covering `Bearer`, `Basic`, `Digest`, and
+`token`.
+
+Names that only look like credentials stay readable, because a trace with
+its correlation ids blanked is hard to follow: `taskToken`,
+`progressToken`, `nextToken`, `pageToken`, `publicKey`, and ordinary data
+keys like `sortKey` are left alone. The bias runs the other way for anything
+unrecognized, since a trace usually ends up pasted into an issue.
 
 ## bench
 
