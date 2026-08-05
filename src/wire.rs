@@ -229,6 +229,7 @@ const REDACTED: &str = "<redacted>";
 const SECRET_KEYS: &[&str] = &[
     "authorization",
     "proxyauthorization",
+    "wwwauthenticate",
     "bearer",
     "bearertoken",
     "token",
@@ -236,15 +237,27 @@ const SECRET_KEYS: &[&str] = &[
     "refreshtoken",
     "idtoken",
     "sessiontoken",
+    "apitoken",
+    "authtoken",
     "apikey",
     "xapikey",
+    "apisecret",
+    "accesskey",
+    "accesskeyid",
+    "secretaccesskey",
+    "privatekey",
     "secret",
     "clientsecret",
+    "clientassertion",
+    "assertion",
     "password",
     "passwd",
     "passphrase",
     "credential",
     "credentials",
+    "cookie",
+    "setcookie",
+    "signature",
 ];
 
 /// Lowercase and drop separators, so `X-Api-Key`, `x_api_key`, and `apiKey`
@@ -256,9 +269,67 @@ fn normalize_key(key: &str) -> String {
         .collect()
 }
 
+/// Names that end like a credential but are not one, so the exact list and
+/// the suffix rule below both have to let them through. A tool argument
+/// called `taskToken` is an identifier, and blanking it would make a trace
+/// harder to read for no gain.
+const NOT_SECRETS: &[&str] = &[
+    "tasktoken",
+    "progresstoken",
+    "requesttoken",
+    "continuationtoken",
+    "pagetoken",
+    "nexttoken",
+    "publickey",
+    "keys",
+    "key",
+];
+
+/// Endings that mean a credential on their own. `githubToken` and
+/// `stripeSecret` are not enumerable, so anything ending this way is masked
+/// unless [`NOT_SECRETS`] says otherwise. The asymmetry is deliberate: a
+/// masked correlation id costs a little readability in a trace, a leaked
+/// token costs the credential, and traces get pasted into issues.
+const STRONG_ENDINGS: &[&str] = &["token", "secret", "password", "passphrase", "credential"];
+
+/// `key` is too common a suffix to mask on its own: `sortKey`,
+/// `partitionKey`, and `idempotencyKey` are all ordinary data. It counts
+/// only next to a qualifier.
+const QUALIFIED_ENDINGS: &[&str] = &["key"];
+
+/// Qualifiers that turn `key` into a credential.
+const SECRET_QUALIFIERS: &[&str] = &[
+    "api",
+    "auth",
+    "access",
+    "private",
+    "client",
+    "session",
+    "signing",
+    "encryption",
+    "secret",
+];
+
 fn is_secret_key(key: &str) -> bool {
     let normalized = normalize_key(key);
-    SECRET_KEYS.contains(&normalized.as_str())
+    if NOT_SECRETS.contains(&normalized.as_str()) {
+        return false;
+    }
+    if SECRET_KEYS.contains(&normalized.as_str()) {
+        return true;
+    }
+    if STRONG_ENDINGS
+        .iter()
+        .any(|ending| normalized.ends_with(ending))
+    {
+        return true;
+    }
+    QUALIFIED_ENDINGS.iter().any(|ending| {
+        normalized.ends_with(ending)
+            && SECRET_QUALIFIERS
+                .iter()
+                .any(|qualifier| normalized.contains(qualifier))
+    })
 }
 
 /// Substrings that make a name look like it carries a credential.
@@ -312,11 +383,26 @@ fn redact(value: &Value) -> Value {
 /// A header line echoed inside a string value (`"Authorization: Bearer abc"`
 /// in an error message, say) carries a live token where the key-name rule
 /// cannot see it. Everything after the scheme goes.
+/// HTTP authentication schemes whose credential follows the scheme name.
+/// `Basic` carries `user:password`, and `token` is what several APIs use
+/// where others say `Bearer`.
+const AUTH_SCHEMES: &[&str] = &["bearer ", "basic ", "digest ", "token "];
+
+/// Mask a credential embedded in a string value.
+///
+/// A key-based rule cannot catch `"Authorization: Bearer abc"` arriving as
+/// one string, so the scheme name is found inside the value and everything
+/// after it is dropped. The earliest scheme wins, so a value carrying two
+/// cannot leak the second.
 fn mask_bearer(s: &str) -> String {
     // ASCII-only lowercasing leaves byte offsets aligned with the original.
     let lowered = s.to_ascii_lowercase();
-    match lowered.find("bearer ") {
-        Some(at) => format!("{}{REDACTED}", &s[..at + "bearer ".len()]),
+    let earliest = AUTH_SCHEMES
+        .iter()
+        .filter_map(|scheme| lowered.find(scheme).map(|at| at + scheme.len()))
+        .min();
+    match earliest {
+        Some(end) => format!("{}{REDACTED}", &s[..end]),
         None => s.to_string(),
     }
 }
@@ -526,6 +612,89 @@ mod tests {
             "flags": [true, null, 1.5],
         });
         assert_eq!(redact(&original), original);
+    }
+
+    #[test]
+    fn credential_headers_and_fields_are_masked() {
+        // Every name here has shown up in a real MCP server's traffic. A
+        // trace is printed and often pasted into an issue, so a miss is a
+        // leak.
+        for key in [
+            "Cookie",
+            "Set-Cookie",
+            "api_token",
+            "auth_token",
+            "x-api-token",
+            "accessKey",
+            "secretAccessKey",
+            "AWS_SECRET_ACCESS_KEY",
+            "private_key",
+            "client_assertion",
+            "signature",
+            "githubToken",
+            "session_key",
+            "signingSecret",
+            "WWW-Authenticate",
+        ] {
+            let frame = serde_json::json!({ key.to_string(): "s3cret" });
+            let redacted = redact(&frame);
+            assert_eq!(redacted[key], REDACTED, "{key} leaked: {redacted}");
+        }
+    }
+
+    #[test]
+    fn identifiers_that_merely_end_like_secrets_stay_readable() {
+        // Over-redaction makes a trace useless in its own way: these are
+        // correlation ids and pagination cursors, not credentials.
+        for key in [
+            "taskToken",
+            "progressToken",
+            "nextToken",
+            "continuationToken",
+            "pageToken",
+            "publicKey",
+            "sortKey",
+            "partitionKey",
+            "idempotencyKey",
+            "name",
+            "uri",
+        ] {
+            let frame = serde_json::json!({ key.to_string(): "visible" });
+            assert_eq!(redact(&frame)[key], "visible", "{key} was over-redacted");
+        }
+    }
+
+    #[test]
+    fn every_auth_scheme_is_masked_inside_a_string() {
+        // A header arriving as one string cannot be caught by key, so the
+        // scheme is found in the value.
+        for (value, kept) in [
+            ("Bearer abc.def.ghi", "Bearer "),
+            ("bearer abc", "bearer "),
+            ("Basic dXNlcjpwYXNz", "Basic "),
+            ("Digest username=\"u\", response=\"r\"", "Digest "),
+            ("token ghp_xxx", "token "),
+            ("Authorization: Bearer abc", "Authorization: Bearer "),
+        ] {
+            let masked = mask_bearer(value);
+            assert_eq!(masked, format!("{kept}{REDACTED}"), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_earliest_scheme_wins_so_nothing_trails_it() {
+        // Two credentials in one string: masking only the first would leave
+        // the second in the clear.
+        let masked = mask_bearer("Bearer aaa and Basic bbb");
+        assert!(!masked.contains("aaa"), "{masked}");
+        assert!(!masked.contains("bbb"), "{masked}");
+    }
+
+    #[test]
+    fn a_value_without_a_scheme_is_untouched() {
+        assert_eq!(mask_bearer("just a sentence"), "just a sentence");
+        // The word alone, with no credential after it, is not a match.
+        assert_eq!(mask_bearer("bearer"), "bearer");
     }
 
     // -- the transport wrapper ------------------------------------------------
