@@ -251,6 +251,14 @@ struct Args {
     #[arg(long)]
     trace: bool,
 
+    /// Give up on a request that has produced no response after this many
+    /// seconds, and report a transport error. Applies to tool calls, `read`,
+    /// `prompt`, `bench` calls, and surface fetches, over both transports.
+    /// `0` waits indefinitely. `wait <id>` is exempt, since outliving the
+    /// call is what a task is for; give it its own `--timeout`.
+    #[arg(long, value_name = "SECONDS", default_value_t = 120)]
+    timeout: u64,
+
     /// Command (and arguments) of a stdio MCP server to spawn.
     command: Vec<String>,
 }
@@ -260,6 +268,38 @@ static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 fn json_output() -> bool {
     JSON_OUTPUT.load(Ordering::Relaxed)
+}
+
+/// `--timeout` in seconds; 0 means wait indefinitely.
+static REQUEST_TIMEOUT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn request_timeout() -> Option<Duration> {
+    match REQUEST_TIMEOUT_SECS.load(Ordering::Relaxed) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
+/// Run a request under the configured deadline.
+///
+/// A stdio child that accepts a request and never answers would otherwise
+/// hang the REPL forever: unlike HTTP, the framework applies no deadline
+/// there. The timeout is reported as a transport error so it classifies and
+/// renders like any other failure to get an answer.
+async fn with_deadline<T, Fut>(fut: Fut) -> Result<T, tower_mcp::Error>
+where
+    Fut: Future<Output = Result<T, tower_mcp::Error>>,
+{
+    let Some(limit) = request_timeout() else {
+        return fut.await;
+    };
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(tower_mcp::Error::Transport(format!(
+            "no response after {}s (--timeout); the request may still be running on the server",
+            limit.as_secs()
+        ))),
+    }
 }
 
 fn note_error(status: ExitStatus) {
@@ -679,7 +719,9 @@ where
     Fut: Future<Output = Result<T, tower_mcp::Error>>,
 {
     let seen = session.generation();
-    let err = match op(session.client()).await {
+    // Each attempt gets its own deadline: the retry only happens after a
+    // reconnect, so it is a fresh request rather than a continuation.
+    let err = match with_deadline(op(session.client())).await {
         Ok(value) => return Ok(value),
         Err(e) => e,
     };
@@ -699,7 +741,7 @@ where
     // being piped somewhere.
     eprintln!("{}", paint(Style::new().dimmed(), "[reconnected]"));
 
-    let retried = op(session.client()).await;
+    let retried = with_deadline(op(session.client())).await;
     if let Err(e) = &retried
         && is_session_lost(e)
     {
@@ -710,6 +752,51 @@ where
         );
     }
     retried
+}
+
+/// How many pages one surface list may follow, and how many entries it may
+/// accept. A server that returns a `next_cursor` on every page describes an
+/// infinite surface; following it is an unbounded allocation driven entirely
+/// by the other end. These caps are far above any real server (the largest
+/// published surfaces are in the hundreds) and exist so a hostile or looping
+/// one is reported rather than fatal.
+const MAX_SURFACE_PAGES: usize = 100;
+const MAX_SURFACE_ITEMS: usize = 10_000;
+
+/// Follow pagination cursors for one list, bounded.
+///
+/// Stops at the page cap, the item cap, or a repeated cursor (a server that
+/// keeps handing back the same cursor is looping), and reports which bound it
+/// hit so a truncated surface is never silently presented as complete.
+async fn collect_pages<T, F, Fut>(what: &str, mut page: F) -> Result<Vec<T>, tower_mcp::Error>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<(Vec<T>, Option<String>), tower_mcp::Error>>,
+{
+    let mut all: Vec<T> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..MAX_SURFACE_PAGES {
+        let (items, next) = page(cursor).await?;
+        all.extend(items);
+        if all.len() >= MAX_SURFACE_ITEMS {
+            all.truncate(MAX_SURFACE_ITEMS);
+            eprintln!(
+                "warning: {what} stopped at {MAX_SURFACE_ITEMS} entries; the server offered more"
+            );
+            return Ok(all);
+        }
+        match next {
+            None => return Ok(all),
+            Some(next) if !seen.insert(next.clone()) => {
+                eprintln!("warning: {what} paging stopped: the server repeated a cursor");
+                return Ok(all);
+            }
+            Some(next) => cursor = Some(next),
+        }
+    }
+    eprintln!("warning: {what} stopped after {MAX_SURFACE_PAGES} pages; the server offered more");
+    Ok(all)
 }
 
 /// Fetch the server surface once. Returns the surface plus whether any list
@@ -738,11 +825,29 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
     // latency instead of four in series. It also bounds the cost of a slow or
     // unresponsive server: against a server that makes each list time out, the
     // surface fetch now waits one `request_timeout`, not four.
+    //
+    // Each list pages through `collect_pages` rather than the framework's
+    // `list_all_*`, which follows cursors without a bound.
+    // The deadline covers each list as a whole, pagination included, so a
+    // server that answers every page slowly cannot stretch the fetch by
+    // adding pages.
     let (tools, prompts, resources, templates) = tokio::join!(
-        client.list_all_tools(),
-        client.list_all_prompts(),
-        client.list_all_resources(),
-        client.list_all_resource_templates(),
+        with_deadline(collect_pages("tools", |cursor| async move {
+            let page = client.list_tools_with_cursor(cursor).await?;
+            Ok((page.tools, page.next_cursor))
+        })),
+        with_deadline(collect_pages("prompts", |cursor| async move {
+            let page = client.list_prompts_with_cursor(cursor).await?;
+            Ok((page.prompts, page.next_cursor))
+        })),
+        with_deadline(collect_pages("resources", |cursor| async move {
+            let page = client.list_resources_with_cursor(cursor).await?;
+            Ok((page.resources, page.next_cursor))
+        })),
+        with_deadline(collect_pages("resource templates", |cursor| async move {
+            let page = client.list_resource_templates_with_cursor(cursor).await?;
+            Ok((page.resource_templates, page.next_cursor))
+        })),
     );
     let mut ni = false;
     let surface = Surface {
@@ -856,6 +961,12 @@ fn build_http_config_with_env(
             .ok_or_else(|| format!("invalid --header {raw:?}: expected `Name: Value`"))?;
         config = config.header(name.trim(), value.trim());
     }
+    // The framework applies its own 30s HTTP request timeout. Leaving it in
+    // place would make `--timeout 300` a lie on HTTP and `--timeout 0` still
+    // give up at 30s, so the transport is told the same deadline the REPL is
+    // using. "Indefinitely" becomes a year, which no interactive session
+    // outlives, because the transport requires some duration.
+    config.request_timeout = request_timeout().unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
     Ok(config)
 }
 
@@ -995,27 +1106,38 @@ fn demo_router() -> tower_mcp::McpRouter {
         )
 }
 
+/// How long the event loop waits after a `list_changed` before refetching.
+/// A server that renames a batch of tools emits one notification per change;
+/// refetching per notification would issue four list calls each time. The
+/// wait folds a burst into one refetch, and caps how much work a server can
+/// induce by spamming the notification.
+const SURFACE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Signal that the surface changed. A counter over a watch channel rather
+/// than a message per notification: only "something changed since we last
+/// looked" matters, so any number of notifications arriving before the event
+/// loop wakes collapse into a single refetch.
+type RefreshSignal = Arc<tokio::sync::watch::Sender<u64>>;
+
+fn note_surface_change(signal: &RefreshSignal) {
+    signal.send_modify(|seen| *seen = seen.wrapping_add(1));
+}
+
 /// The notification callbacks: log and progress messages print inline,
 /// `list_changed` notifications nudge the event loop to refresh the surface.
 /// Built per client, since a reconnect installs a new one.
 fn notification_handler(
-    refresh_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    refresh: RefreshSignal,
     output: AsyncOutput,
     jobs: Arc<Jobs>,
 ) -> NotificationHandler {
-    let t = refresh_tx.clone();
-    let r = refresh_tx.clone();
-    let p = refresh_tx;
+    let t = refresh.clone();
+    let r = refresh.clone();
+    let p = refresh;
     NotificationHandler::new()
-        .on_tools_changed(move || {
-            let _ = t.send(());
-        })
-        .on_resources_changed(move || {
-            let _ = r.send(());
-        })
-        .on_prompts_changed(move || {
-            let _ = p.send(());
-        })
+        .on_tools_changed(move || note_surface_change(&t))
+        .on_resources_changed(move || note_surface_change(&r))
+        .on_prompts_changed(move || note_surface_change(&p))
         .on_task_status_changed({
             let jobs = jobs.clone();
             move |params| jobs.observe_legacy(params)
@@ -1461,6 +1583,7 @@ pub async fn run_cli() {
     style::init(args.color);
     wire::init(args.trace);
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
+    REQUEST_TIMEOUT_SECS.store(args.timeout, Ordering::Relaxed);
 
     if let Err(error) = run(args).await {
         exit_with_error(ExitStatus::from_mcp_error(&error), &error.to_string());
@@ -1519,7 +1642,11 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     ));
 
     // Notifications print inline and trigger surface refreshes.
-    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // The sender is held for the life of the process: `changed()` errors once
+    // every sender is gone, which in a select loop would spin rather than
+    // wait.
+    let (refresh_tx, mut refresh_rx) = tokio::sync::watch::channel(0u64);
+    let refresh_tx: RefreshSignal = Arc::new(refresh_tx);
 
     // A reconnect needs a fresh handler for the new client, so build handlers
     // through a factory rather than once.
@@ -1535,7 +1662,6 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
             )
         })
     };
-    drop(refresh_tx);
     // Sampling has no model behind it, so the operator answers. Under --exec
     // there is nobody to ask, so requests are refused unless --sampling says
     // otherwise.
@@ -1835,7 +1961,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     // errored. No editor, no event loop.
     if one_shot {
         for cmd in &args.exec {
-            if handle_line(
+            match run_cancellable(
                 &session,
                 &surface,
                 &aliases,
@@ -1845,7 +1971,10 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
             )
             .await
             {
-                break;
+                Ran::Completed(false) => {}
+                // A quit command, or an interrupt: either way the rest of
+                // the sequence does not run.
+                Ran::Completed(true) | Ran::Cancelled => break,
             }
         }
         let status = exit_status::current().code();
@@ -1885,7 +2014,11 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
 
     loop {
         tokio::select! {
-            Some(()) = refresh_rx.recv() => {
+            Ok(()) = refresh_rx.changed() => {
+                // Let a burst land before refetching, then mark whatever
+                // arrived during the wait as covered by this refetch.
+                tokio::time::sleep(SURFACE_REFRESH_DEBOUNCE).await;
+                refresh_rx.mark_unchanged();
                 let fresh = fetch_surface(&session.client()).await;
                 async_output.line(format!("{} {} tools, {} prompts, {} resources",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),
@@ -1894,7 +2027,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
             }
             maybe_line = line_rx.recv() => {
                 let Some(line) = maybe_line else { break };
-                let quit = handle_line(
+                let ran = run_cancellable(
                     &session,
                     &surface,
                     &aliases,
@@ -1903,14 +2036,64 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                     line.trim(),
                 )
                 .await;
+                // The editor is parked on this ack, so it has to be sent
+                // whether the command finished or was interrupted, or the
+                // prompt never comes back.
                 let _ = ack_tx.send(());
-                if quit {
+                if matches!(ran, Ran::Completed(true)) {
                     break;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// What ended a command.
+enum Ran {
+    /// It finished on its own. The flag is `handle_line`'s quit signal.
+    Completed(bool),
+    /// The operator pressed Ctrl-C.
+    Cancelled,
+}
+
+/// Run one command, abandoning it if the operator interrupts.
+///
+/// Ctrl-C at the prompt never reaches here: reedline holds the terminal in
+/// raw mode and takes the keypress itself. It only arrives while a command
+/// owns the terminal, which is exactly when there is something to abandon.
+/// Installing a handler at all is what keeps SIGINT from killing the process
+/// and skipping session shutdown.
+///
+/// Dropping the command future is the cancellation: the request is no longer
+/// awaited and the REPL takes the next line. The server is not told to stop
+/// (see the note in the module docs), so a tool with side effects may still
+/// be running on the other end.
+async fn run_cancellable(
+    session: &Arc<Session>,
+    surface: &Arc<RwLock<Surface>>,
+    aliases: &Arc<RwLock<Aliases>>,
+    jobs: &Arc<Jobs>,
+    schema_contracts: &schema_contract::ContractSet,
+    line: &str,
+) -> Ran {
+    tokio::select! {
+        biased;
+        quit = handle_line(session, surface, aliases, jobs, schema_contracts, line) => {
+            Ran::Completed(quit)
+        }
+        _ = tokio::signal::ctrl_c() => {
+            note_error(ExitStatus::Cancelled);
+            if json_output() {
+                print_json(&error_json(ExitStatus::Cancelled, "cancelled"));
+            } else {
+                // stderr: an interrupted command produced no result, and in
+                // human --exec mode stdout is the data stream.
+                eprintln!("{} cancelled", paint(Style::new().dimmed(), "^C"));
+            }
+            Ran::Cancelled
+        }
+    }
 }
 
 async fn handle_line(
@@ -2434,13 +2617,33 @@ async fn handle_line(
         // that created it, so a fresh session would only report it missing.
         // "(gone)" from `jobs` is the honest answer there.
         "task" | "wait" | "cancel" => {
+            // `wait` takes an optional deadline of its own. The global
+            // --timeout deliberately does not apply: a task exists precisely
+            // to outlive the call that created it, so the useful default is
+            // to keep waiting, interruptible with Ctrl-C.
+            let (wait_limit, rest) = match parse_wait_timeout(cmd, rest) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    command_error(&message);
+                    return false;
+                }
+            };
             let Some(id) = rest.first() else {
                 command_error(&format!("usage: {cmd} <task-id>"));
                 return false;
             };
             let outcome = match cmd {
                 "task" => client.task_get(id).await,
-                "wait" => client.task_wait(id).await,
+                "wait" => match wait_limit {
+                    None => client.task_wait(id).await,
+                    Some(limit) => match tokio::time::timeout(limit, client.task_wait(id)).await {
+                        Ok(result) => result,
+                        Err(_) => Err(tower_mcp::Error::Transport(format!(
+                            "task {id} was still running after {}s (--timeout)",
+                            limit.as_secs()
+                        ))),
+                    },
+                },
                 _ => match client.task_cancel(id, None).await {
                     Ok(()) => {
                         if !json_output() {
@@ -3028,6 +3231,43 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
                     })
                 })
         })
+}
+
+/// Pull an optional `--timeout <secs>` out of a task command's arguments,
+/// returning the deadline and the remaining arguments. Only `wait` accepts
+/// it; `task` and `cancel` are single round-trips already covered by the
+/// global deadline.
+fn parse_wait_timeout<'a>(
+    cmd: &str,
+    rest: &[&'a str],
+) -> Result<(Option<Duration>, Vec<&'a str>), String> {
+    let mut limit = None;
+    let mut remaining = Vec::new();
+    let mut tokens = rest.iter().copied();
+    while let Some(token) = tokens.next() {
+        let value = match token.strip_prefix("--timeout") {
+            None => {
+                remaining.push(token);
+                continue;
+            }
+            Some("") => tokens
+                .next()
+                .ok_or_else(|| format!("usage: {cmd} <task-id> [--timeout <seconds>]"))?,
+            Some(rest) => rest
+                .strip_prefix('=')
+                .ok_or_else(|| format!("unknown flag `{token}` for {cmd}"))?,
+        };
+        if cmd != "wait" {
+            return Err(format!(
+                "--timeout applies to `wait`, not `{cmd}` (it is a single request, bounded by the global --timeout)"
+            ));
+        }
+        let secs: u64 = value
+            .parse()
+            .map_err(|_| format!("--timeout expects seconds, got `{value}`"))?;
+        limit = (secs > 0).then(|| Duration::from_secs(secs));
+    }
+    Ok((limit, remaining))
 }
 
 /// The `describe` built-in: schemas for a tool, the argument table for a
@@ -3678,6 +3918,91 @@ mod tests {
         assert_eq!(v["error"], "boom: it broke");
         assert_eq!(v["kind"], "usage");
         assert_eq!(v["exitStatus"], 2);
+    }
+
+    /// A server that always hands back a fresh cursor describes an endless
+    /// surface. The fetch has to end anyway.
+    #[tokio::test]
+    async fn pagination_stops_at_the_page_cap() {
+        let mut pages = 0usize;
+        let items: Vec<u32> = collect_pages("tools", |cursor| {
+            pages += 1;
+            let next = cursor.map_or(0u32, |c| c.parse::<u32>().unwrap_or(0) + 1);
+            async move { Ok((vec![next], Some((next + 1).to_string()))) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pages, MAX_SURFACE_PAGES);
+        assert_eq!(items.len(), MAX_SURFACE_PAGES);
+    }
+
+    #[tokio::test]
+    async fn pagination_stops_at_the_item_cap() {
+        // 500 entries a page: the item cap is reached well before the page
+        // cap would apply.
+        let items: Vec<u32> = collect_pages("tools", |cursor| {
+            let n = cursor.map_or(0u32, |c| c.parse::<u32>().unwrap_or(0) + 1);
+            async move { Ok((vec![n; 500], Some((n + 1).to_string()))) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(items.len(), MAX_SURFACE_ITEMS);
+    }
+
+    #[tokio::test]
+    async fn pagination_stops_when_a_cursor_repeats() {
+        let mut pages = 0usize;
+        let items: Vec<u32> = collect_pages("prompts", |_cursor| {
+            pages += 1;
+            async move { Ok((vec![1], Some("same".to_string()))) }
+        })
+        .await
+        .unwrap();
+        // First page sets the cursor, second sees it again and stops.
+        assert_eq!(pages, 2);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pagination_follows_an_ordinary_multi_page_surface() {
+        let items: Vec<u32> = collect_pages("tools", |cursor| async move {
+            match cursor.as_deref() {
+                None => Ok((vec![1, 2], Some("page2".to_string()))),
+                Some("page2") => Ok((vec![3], None)),
+                other => panic!("unexpected cursor {other:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn wait_accepts_an_explicit_deadline() {
+        let (limit, rest) = parse_wait_timeout("wait", &["task-1", "--timeout", "30"]).unwrap();
+        assert_eq!(limit, Some(Duration::from_secs(30)));
+        assert_eq!(rest, vec!["task-1"]);
+
+        let (limit, rest) = parse_wait_timeout("wait", &["--timeout=5", "task-1"]).unwrap();
+        assert_eq!(limit, Some(Duration::from_secs(5)));
+        assert_eq!(rest, vec!["task-1"]);
+
+        // Zero is the documented way to ask for no deadline at all.
+        let (limit, _) = parse_wait_timeout("wait", &["task-1", "--timeout", "0"]).unwrap();
+        assert_eq!(limit, None);
+
+        let (limit, rest) = parse_wait_timeout("wait", &["task-1"]).unwrap();
+        assert_eq!(limit, None);
+        assert_eq!(rest, vec!["task-1"]);
+    }
+
+    #[test]
+    fn wait_deadline_errors_are_explained() {
+        assert!(parse_wait_timeout("wait", &["t", "--timeout"]).is_err());
+        assert!(parse_wait_timeout("wait", &["t", "--timeout", "soon"]).is_err());
+        // The flag is meaningless on a single round-trip, so say so rather
+        // than accepting it silently.
+        assert!(parse_wait_timeout("task", &["t", "--timeout", "5"]).is_err());
     }
 
     #[test]

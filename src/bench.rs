@@ -181,7 +181,9 @@ enum Call {
 /// not do the work, so its latency does not describe the work.
 async fn call_once(client: &McpClient, tool: &str, arguments: serde_json::Value) -> Call {
     let started = Instant::now();
-    match client.call_tool(tool, arguments).await {
+    // Each call carries the same deadline a direct invocation would, so one
+    // stalled call cannot hold a whole run open.
+    match crate::with_deadline(client.call_tool(tool, arguments)).await {
         Ok(result) if result.is_error => Call::Err(error_text(&result)),
         Ok(_) => Call::Ok(started.elapsed()),
         Err(e) => Call::Err(e.to_string()),
