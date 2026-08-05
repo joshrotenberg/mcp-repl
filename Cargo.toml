@@ -12,7 +12,9 @@ categories = ["command-line-utilities", "development-tools"]
 # The black-box fixture server in examples/ is a test asset, and docs/ holds
 # the prose and the recordings behind the README's images. Neither belongs in
 # the published package: the recordings alone are most of a megabyte.
-exclude = ["/examples", "/.github", "/docs"]
+# `deny.toml` configures a CI check and means nothing to a consumer of the
+# published crate.
+exclude = ["/examples", "/.github", "/docs", "/deny.toml"]
 
 [lib]
 name = "mcp_repl"

@@ -50,6 +50,18 @@ jobs:
       - name: Verify publishable package
         run: cargo package
 
+  deny:
+    name: Dependencies
+    # Runs on the schedule too, unlike the other default jobs: an advisory is
+    # published against a dependency that did not change, so waiting for the
+    # next commit to hear about it defeats the point.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
   tower-mcp-main:
     name: tower-mcp main compatibility
     # Dogfooding lane: the default jobs test the released framework; this one
