@@ -4017,15 +4017,19 @@ fn example_invocation(name: &str, schema: &serde_json::Value) -> String {
         return sanitize(name).into_owned();
     };
     let placeholder = |key: &str| -> String {
-        let ty = properties
+        // A generated schema hoists a named type into `$defs` and leaves a
+        // `$ref` on the property, so the type and any enum values live one
+        // hop away.
+        let target = properties
             .get(key)
-            .and_then(|p| p.get("type"))
+            .map(|property| editor::resolve_ref(schema, property));
+        let ty = target
+            .and_then(|t| t.get("type"))
             .and_then(|t| t.as_str())
             .unwrap_or("value");
         // An enum tells the user the actual choices, which beats the type.
-        let sample = properties
-            .get(key)
-            .and_then(|p| p.get("enum"))
+        let sample = target
+            .and_then(|t| t.get("enum"))
             .and_then(|e| e.as_array())
             .and_then(|values| values.first())
             .and_then(|v| {
@@ -4798,6 +4802,26 @@ mod tests {
             "{example}"
         );
         assert!(example.contains("[note=<string>]"), "{example}");
+    }
+
+    #[test]
+    fn an_example_invocation_follows_a_ref_into_defs() {
+        // What a schema generator actually emits: the named type is hoisted
+        // into `$defs` and the property only points at it.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "to": {"$ref": "#/$defs/Scale"},
+                "value": {"type": "number"},
+            },
+            "required": ["value", "to"],
+            "$defs": {
+                "Scale": {"type": "string", "enum": ["celsius", "kelvin"]},
+            },
+        });
+        let example = example_invocation("convert", &schema);
+        assert!(example.contains("to=celsius"), "{example}");
+        assert!(example.contains("value=<number>"), "{example}");
     }
 
     #[test]

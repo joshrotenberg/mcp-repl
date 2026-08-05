@@ -116,7 +116,7 @@ pub struct ReplCompleter {
 /// and fetching a remote schema is neither fast nor safe. A ref that does not
 /// resolve yields the original schema, so an unusual shape degrades to no
 /// completion rather than a wrong one.
-fn resolve_ref<'a>(
+pub(crate) fn resolve_ref<'a>(
     root: &'a serde_json::Value,
     schema: &'a serde_json::Value,
 ) -> &'a serde_json::Value {
