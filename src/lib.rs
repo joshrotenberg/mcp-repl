@@ -576,8 +576,10 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "task",
-        "task <task>",
-        "Show one background task. Takes the short number from `jobs` or the server's id.",
+        "task <task> [respond]",
+        "Show one background task. Takes the short number from `jobs` or the server's id. \
+         `respond` answers what an `input_required` task is waiting for and lets its handler \
+         resume; it needs --protocol 2026-07-28.",
     ),
     (
         "wait",
@@ -744,6 +746,120 @@ fn render_task(task: &TaskObject, label: &str) {
             err.code,
             sanitize(&err.message)
         );
+    }
+}
+
+/// Answer the questions an `input_required` task is parked on, then hand the
+/// answers back with `tasks/update` so its handler resumes.
+///
+/// Only the 2026-07-28 lifecycle reports outstanding requests: on the stable
+/// lifecycle a server asks by sending `elicitation/create` itself, so there
+/// is nothing parked to look up. Answering is a foreground read of stdin,
+/// which is safe here because the editor is waiting on this command.
+async fn respond_to_task(client: &McpClient, id: &str, label: &str) {
+    use tower_mcp::protocol::{InputRequest, InputResponse, InputResponses};
+
+    // Checked here so the refusal explains the protocol rather than surfacing
+    // the framework's "task_get_detailed requires ..." transport error, which
+    // reads like a bug in the connection.
+    if client.selected_protocol_version().await.as_deref()
+        != Some(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
+    {
+        report_error(
+            ExitStatus::Usage,
+            "`respond` needs --protocol 2026-07-28: only that lifecycle reports what a task is \
+             waiting for. On the stable lifecycle a server asks by sending `elicitation/create` \
+             itself, which is declined while the editor holds the terminal, so run the tool in \
+             the foreground instead of as a task",
+        );
+        return;
+    }
+    let detailed = match client.task_get_detailed(id).await {
+        Ok(detailed) => detailed,
+        Err(e) => {
+            report_mcp_error(&e);
+            return;
+        }
+    };
+    let Some(outstanding) = detailed.task.input_requests().filter(|r| !r.is_empty()) else {
+        report_error(
+            ExitStatus::NoMatch,
+            &format!(
+                "task {label} is not waiting for input (status: {})",
+                detailed.task.status()
+            ),
+        );
+        return;
+    };
+
+    let server = connection_info(client)
+        .await
+        .map(|info| info.server_info.name)
+        .unwrap_or_default();
+    let mut responses = InputResponses::new();
+    for (key, request) in outstanding.clone() {
+        match request {
+            InputRequest::Elicit(params) => {
+                let answer = elicit::answer_in_foreground(&server, params).await;
+                responses.insert(key, InputResponse::Elicit(answer));
+            }
+            InputRequest::CreateMessage(params) => {
+                match tokio::task::spawn_blocking(move || sampling::prompt(&params)).await {
+                    Ok(Ok(result)) => {
+                        responses.insert(key, InputResponse::CreateMessage(result));
+                    }
+                    // Declining is an answer the server can act on; failing
+                    // to ask is not, and leaving the key out keeps it
+                    // outstanding for another try.
+                    Ok(Err(e)) => command_error(&format!(
+                        "could not answer `{}`: {}",
+                        sanitize(&key),
+                        sanitize(&e.message)
+                    )),
+                    Err(e) => command_error(&format!("could not answer `{}`: {e}", sanitize(&key))),
+                }
+            }
+            // Nothing in this REPL declares roots, so the honest answer is an
+            // empty list rather than silence that leaves the task parked.
+            InputRequest::ListRoots(_) => {
+                println!(
+                    "{} answered `{}` with no roots (mcp-repl declares none)",
+                    tag(Style::new().fg(Color::Purple), "elicit"),
+                    sanitize(&key)
+                );
+                responses.insert(
+                    key,
+                    InputResponse::ListRoots(tower_mcp::protocol::ListRootsResult {
+                        roots: Vec::new(),
+                        meta: None,
+                    }),
+                );
+            }
+            other => command_error(&format!(
+                "cannot answer `{}`: unsupported request {}",
+                sanitize(&key),
+                sanitize(other.method_name())
+            )),
+        }
+    }
+
+    if responses.is_empty() {
+        report_error(
+            ExitStatus::Usage,
+            &format!("nothing was answered, so task {label} is still waiting"),
+        );
+        return;
+    }
+    if let Err(e) = client.task_update(id, responses).await {
+        report_mcp_error(&e);
+        return;
+    }
+    // The handler resumes asynchronously, so report what the task says now
+    // rather than claiming it finished.
+    match client.task_get(id).await {
+        Ok(task) if json_output() => print_json(&serde_json::to_value(&task).unwrap_or_default()),
+        Ok(task) => render_task(&task, label),
+        Err(e) => report_mcp_error(&e),
     }
 }
 
@@ -1532,6 +1648,11 @@ fn demo_router() -> tower_mcp::McpRouter {
         .tool(
             ToolBuilder::new("sign_in")
                 .description("Ask you for credentials (elicitation demo)")
+                // Task-capable so `sign_in &` parks in `input_required` and
+                // `task <id> respond` has something to answer. A task runs
+                // detached from the call that started it, so the handler
+                // cannot ask the operator directly either way.
+                .task_support(TaskSupportMode::Optional)
                 // An MRTR handler, because the two lifecycles route a
                 // server's question to the operator differently and this
                 // tool has to work on both. See `sign_in_form`.
@@ -1547,11 +1668,13 @@ fn demo_router() -> tower_mcp::McpRouter {
                             describe_sign_in(answer.as_ref()),
                         )));
                     }
-                    if uses_final_lifecycle(&ctx) {
-                        // 2026-07-28 has no server-initiated requests: the
-                        // question travels as an input request in the result,
-                        // and the client fulfils it and calls again
-                        // (SEP-2322).
+                    if !ctx.can_elicit() {
+                        // Two ways to get here, and the answer is the same:
+                        // 2026-07-28 has no server-initiated requests at all,
+                        // and a task on either lifecycle runs detached from
+                        // the call that could have carried one. Either way the
+                        // question travels as an input request the client
+                        // fulfils before the handler resumes (SEP-2322).
                         let mut requests = InputRequests::new();
                         requests.insert(
                             "credentials".to_string(),
@@ -1591,15 +1714,6 @@ fn sign_in_form() -> tower_mcp::protocol::ElicitFormParams {
             .boolean_field("remember_me", Some("Stay signed in"), false),
         meta: None,
     }
-}
-
-/// Whether this request is on the 2026-07-28 lifecycle, which is what
-/// decides between returning an input request and asking directly.
-fn uses_final_lifecycle(ctx: &tower_mcp::context::RequestContext) -> bool {
-    ctx.extensions()
-        .get::<tower_mcp::stateless::StatelessRequestMeta>()
-        .and_then(|meta| meta.protocol_version.as_deref())
-        .is_some_and(|version| version == tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
 }
 
 /// Render an elicitation answer the way the operator gave it.
@@ -3572,6 +3686,17 @@ async fn handle_line(
                 return false;
             };
             let id = &resolved.as_str();
+            // `task <id> respond` answers what the task is parked on, which
+            // is the only way to move an `input_required` task forward: the
+            // question was asked while the editor held the terminal, so
+            // nothing could answer it at the time.
+            if cmd == "task" && rest.get(1).is_some_and(|word| *word == "respond") {
+                respond_to_task(&client, id, &jobs.label_for(id)).await;
+                if !json_output() {
+                    println!("{}", timing(started.elapsed()));
+                }
+                return false;
+            }
             let outcome = match cmd {
                 "task" => client.task_get(id).await,
                 "wait" => match wait_limit {

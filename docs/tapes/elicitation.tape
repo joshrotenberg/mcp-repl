@@ -27,15 +27,17 @@ Type "sign_in"
 Sleep 400ms
 Enter
 Sleep 1.5s
+# Declared order: username, environment, remember_me. The schema's order is
+# protocol-significant, so these answers are positional.
+Type "ada"
+Sleep 500ms
+Enter
+Sleep 700ms
 Type "staging"
 Sleep 500ms
 Enter
 Sleep 700ms
 Type "yes"
-Sleep 500ms
-Enter
-Sleep 700ms
-Type "ada"
 Sleep 500ms
 Enter
 Sleep 1.5s
