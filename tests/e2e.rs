@@ -803,6 +803,53 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
+/// An unreachable server is the first failure most people meet, so what it
+/// prints is worth pinning.
+///
+/// It used to arrive twice: once as a framework log record and once as the
+/// REPL's own error, with `Transport error:` repeated for each wrapping layer
+/// and ANSI escapes that `--color never` was supposed to have turned off.
+async fn exercise_connection_failure_output() {
+    let mut command = repl_command();
+    // Port 9 is discard: reserved, and nothing listens on it.
+    command.args([
+        "--http",
+        "http://127.0.0.1:9/",
+        "--no-history",
+        "--color",
+        "never",
+        "--timeout",
+        "5",
+        "--exec",
+        "tools",
+    ]);
+    let output = run(command, "connection failure", CASE_TIMEOUT).await;
+    assert_status(&output, 4, "connection failure");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "--color never must reach the log subscriber too:\n{stderr:?}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+        1,
+        "one failure is reported once:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Transport error:").count(),
+        1,
+        "the kind of failure is named once, not once per layer:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HTTP request failed"),
+        "and the informative part survives:\n{stderr}"
+    );
+}
+
 /// Run the demo server, answering elicitation prompts from `stdin`.
 async fn run_demo_answering(answers: &str, case: &str, repl_args: &[&str]) -> Output {
     let mut command = repl_command();
@@ -1135,6 +1182,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_generators().await;
+        exercise_connection_failure_output().await;
         exercise_elicitation_field_order().await;
         exercise_respond_needs_the_final_lifecycle().await;
         #[cfg(unix)]
