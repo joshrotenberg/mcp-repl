@@ -193,6 +193,28 @@ mcp-repl cratesio                  # a bare name works too
 
 ### Importing standard MCP configs
 
+`--scan` prints what other MCP clients already have configured, so you do not
+have to remember where a config lives:
+
+```text
+$ mcp-repl --scan
+/work/api/.mcp.json
+  local     stdio node server.js --stdio
+  registry   http https://registry.example.com/mcp
+/Users/you/.claude.json
+  github    stdio npx -y @modelcontextprotocol/server-github
+3 servers in 2 files. Connect with `mcp-repl <path>:<entry>`.
+```
+
+It reads `.mcp.json`, `.vscode/mcp.json`, and `.cursor/mcp.json` in the
+current directory, plus `~/.claude.json` and the Claude Desktop config for
+your platform. It connects to nothing and runs nothing: the selectors are
+printed for you to pass back. Entries are described as written, so an entry
+using `${env:TOKEN}` is listed even when the variable is not set. A file that
+exists but cannot be parsed is reported rather than skipped, and the command
+exits non-zero when nothing was found. `--json` gives one object per file,
+each entry carrying a ready-made `selector`.
+
 An explicit `PATH:ENTRY` selector imports a named server from the common JSON
 format used by repository `.mcp.json` files, VS Code, Claude, Cursor, and other
 MCP clients. Both `mcpServers` and `servers` roots are accepted; automatic
