@@ -122,17 +122,28 @@ impl ProtocolMode {
     name = "mcp-repl",
     version,
     about = "Interactive MCP client REPL",
+    long_about = "\
+An interactive terminal REPL for any MCP server. The server's surface is the \
+command set: every tool becomes a top-level command with schema-coerced \
+key=value arguments, prompts and resources get built-ins, tab completion is \
+powered by the server itself where the protocol allows, and the command table \
+refreshes when the server's surface changes.
+
+Connects over stdio or streamable HTTP, reads the JSON config files other MCP \
+clients use, and keeps named profiles of its own.",
     trailing_var_arg = true,
+    // Kept narrow enough that `man` can indent it without reflowing the
+    // columns into each other.
     after_help = "\
 EXAMPLES:
-  mcp-repl --demo                             the bundled demo server, no setup
-  mcp-repl --http https://example.com/mcp     a streamable HTTP server
-  mcp-repl -- ./my-server --stdio             spawn a stdio server
-  mcp-repl .mcp.json:local                    one entry from a client config
-  mcp-repl --server prod                      a profile from the config file
+  mcp-repl --demo                        the bundled demo server
+  mcp-repl --http https://example/mcp    a streamable HTTP server
+  mcp-repl -- ./my-server --stdio        spawn a stdio server
+  mcp-repl .mcp.json:local               an entry from a client config
+  mcp-repl --server prod                 a saved profile
 
-  mcp-repl --demo -e 'echo message=hi'        run one command and exit
-  mcp-repl --demo --json -e tools | jq .      machine-readable NDJSON
+  mcp-repl --demo -e 'echo message=hi'   run one command and exit
+  mcp-repl --demo --json -e tools | jq   NDJSON for scripts
 
 Inside the REPL, `help` lists the built-ins and `help <command>` explains one."
 )]
@@ -165,6 +176,19 @@ struct Args {
     /// Print the configured server profiles and exit.
     #[arg(long)]
     list_servers: bool,
+
+    /// Print a shell completion script for mcp-repl's own flags and exit.
+    ///
+    /// The REPL completes a server's surface from the moment it connects;
+    /// this is the other half, for the invocation that gets you there.
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<clap_complete::Shell>,
+
+    /// Print this program's man page, in roff, and exit.
+    ///
+    /// Packagers redirect it: `mcp-repl --man > mcp-repl.1`.
+    #[arg(long)]
+    man: bool,
 
     /// When to emit ANSI colors (auto detects tty and NO_COLOR).
     #[arg(long, value_enum, default_value = "auto")]
@@ -1988,6 +2012,41 @@ async fn handle_oauth_profile_action(
     true
 }
 
+/// The binary name a generated script or man page refers to. Taken from the
+/// clap command rather than `argv[0]`, so a script generated through
+/// `cargo run` still names the installed binary.
+fn program_name() -> String {
+    <Args as clap::CommandFactory>::command()
+        .get_name()
+        .to_string()
+}
+
+/// `--completions <shell>`: a completion script on stdout.
+fn print_completions(shell: clap_complete::Shell) {
+    let mut command = <Args as clap::CommandFactory>::command();
+    let name = program_name();
+    clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
+}
+
+/// `--man`: the man page, in roff, on stdout.
+fn print_man() {
+    let command = <Args as clap::CommandFactory>::command();
+    let mut page = Vec::new();
+    if let Err(error) = clap_mangen::Man::new(command).render(&mut page) {
+        exit_with_error(
+            ExitStatus::Usage,
+            &format!("could not render the man page: {error}"),
+        );
+    }
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().write_all(&page) {
+        exit_with_error(
+            ExitStatus::Usage,
+            &format!("could not write the man page: {error}"),
+        );
+    }
+}
+
 /// `--list-servers`: the configured profiles, one per line.
 fn print_servers(config: &config::Config) {
     if config.servers.is_empty() {
@@ -2082,6 +2141,19 @@ pub async fn run_cli() {
         )
         .init();
     let args = Args::parse();
+
+    // Generators write to stdout and exit. They are checked before anything
+    // else so a packaging script never needs a config file, a server, or a
+    // terminal to produce them.
+    if let Some(shell) = args.completions {
+        print_completions(shell);
+        return;
+    }
+    if args.man {
+        print_man();
+        return;
+    }
+
     style::init(args.color);
     wire::init(args.trace);
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
@@ -4782,6 +4854,73 @@ mod tests {
     #[test]
     fn find_is_a_completable_builtin() {
         assert!(BUILTINS.iter().any(|(name, _)| *name == "find"));
+    }
+
+    /// Generate into a buffer the way the flag generates onto stdout.
+    fn completion_script(shell: clap_complete::Shell) -> String {
+        let mut command = <Args as clap::CommandFactory>::command();
+        let mut out = Vec::new();
+        clap_complete::generate(shell, &mut command, "mcp-repl", &mut out);
+        String::from_utf8(out).expect("completion scripts are UTF-8")
+    }
+
+    #[test]
+    fn every_shell_gets_a_script_naming_the_binary() {
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::PowerShell,
+            clap_complete::Shell::Elvish,
+        ] {
+            let script = completion_script(shell);
+            assert!(!script.is_empty(), "{shell} produced nothing");
+            assert!(
+                script.contains("mcp-repl"),
+                "{shell} does not name the binary"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_covers_flags_and_their_values() {
+        let bash = completion_script(clap_complete::Shell::Bash);
+        // A flag the user reaches for, and one added late: if the generator
+        // is wired to a stale command, these are what go missing.
+        for flag in [
+            "--protocol",
+            "--http",
+            "--elicitation",
+            "--timeout",
+            "--man",
+        ] {
+            assert!(bash.contains(flag), "bash completion is missing {flag}");
+        }
+        // Enum values matter more than the flag names: they are what a user
+        // cannot guess.
+        for value in ["stable", "2026-07-28", "decline", "compatible"] {
+            assert!(
+                bash.contains(value),
+                "bash completion is missing value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_man_page_renders_with_the_real_sections() {
+        let command = <Args as clap::CommandFactory>::command();
+        let mut page = Vec::new();
+        clap_mangen::Man::new(command)
+            .render(&mut page)
+            .expect("man page renders");
+        let roff = String::from_utf8(page).expect("roff is UTF-8");
+        assert!(roff.contains("mcp-repl"));
+        for section in [".SH NAME", ".SH SYNOPSIS", ".SH DESCRIPTION", ".SH OPTIONS"] {
+            assert!(roff.contains(section), "man page has no {section}");
+        }
+        // The description is the long one, not the one-liner. The apostrophe
+        // arrives as the roff escape clap_mangen emits for it.
+        assert!(roff.contains("surface is the command set"));
     }
 
     #[test]

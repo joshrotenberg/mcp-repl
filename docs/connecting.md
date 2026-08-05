@@ -5,6 +5,27 @@
 
 Every way to reach a server, and how credentials are handled.
 
+## Shell completions and the man page
+
+mcp-repl generates both from its own command definition, so they never drift
+from the flags the binary actually accepts:
+
+```bash
+mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
+mcp-repl --completions bash > /etc/bash_completion.d/mcp-repl
+mcp-repl --completions fish > ~/.config/fish/completions/mcp-repl.fish
+mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
+```
+
+`bash`, `zsh`, `fish`, `powershell`, and `elvish` are supported. Completion
+covers the flags and their accepted values, so `--protocol <Tab>` offers
+`stable` and `2026-07-28`, and `--elicitation <Tab>` offers `prompt` and
+`decline`.
+
+Both generators run before anything connects: they need no config file, no
+server, and no terminal, which is what lets a packaging script call the
+binary it just built.
+
 ## Run
 
 ```bash
