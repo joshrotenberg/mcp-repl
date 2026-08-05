@@ -49,6 +49,7 @@ mod elicit;
 mod exit_status;
 mod find;
 pub mod import_config;
+mod import_trust;
 mod jobs;
 pub mod lifecycle;
 pub mod oauth_profile;
@@ -235,6 +236,20 @@ struct Args {
     /// interactively and `decline` under --exec.
     #[arg(long, value_enum, value_name = "STRATEGY")]
     sampling: Option<sampling::SamplingMode>,
+
+    /// How to answer a server's `elicitation/create` request: `prompt` shows
+    /// what the server is asking and reads the answers on stdin, `decline`
+    /// refuses every request. Defaults to `prompt` interactively and
+    /// `decline` under --exec.
+    #[arg(long, value_enum, value_name = "STRATEGY")]
+    elicitation: Option<elicit::ElicitationMode>,
+
+    /// Spawn a server named by an imported client config without asking
+    /// first. The imported file chooses the program, its arguments, and
+    /// which of your environment variables it receives, so approval is
+    /// interactive by default and remembered per entry.
+    #[arg(long)]
+    trust_import: bool,
 
     /// Do not persist command history to ~/.mcp-repl_history.
     #[arg(long)]
@@ -1648,6 +1663,11 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     let (refresh_tx, mut refresh_rx) = tokio::sync::watch::channel(0u64);
     let refresh_tx: RefreshSignal = Arc::new(refresh_tx);
 
+    // Filled in once the handshake reports who answered, so an elicitation
+    // can say which server is asking. Shared with every handler the factory
+    // builds, including the ones a reconnect installs.
+    let server_label: elicit::ServerLabel = Arc::new(RwLock::new(String::new()));
+
     // A reconnect needs a fresh handler for the new client, so build handlers
     // through a factory rather than once.
     let make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync> = {
@@ -1655,10 +1675,13 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         let at_prompt = at_prompt.clone();
         let async_output = async_output.clone();
         let jobs = jobs.clone();
+        let server_label = server_label.clone();
         Arc::new(move || {
             ReplClientHandler::new(
                 notification_handler(refresh_tx.clone(), async_output.clone(), jobs.clone()),
                 at_prompt.clone(),
+                server_label.clone(),
+                async_output.clone(),
             )
         })
     };
@@ -1666,15 +1689,26 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     // there is nobody to ask, so requests are refused unless --sampling says
     // otherwise.
     sampling::init(sampling::resolve(args.sampling, one_shot));
+    // Elicitation is the same bargain: a form needs someone at the keyboard,
+    // so a script refuses rather than blocking on a read nobody will answer.
+    elicit::init(elicit::resolve(args.elicitation, one_shot));
 
     // Explicit flags override imported or native profile fields: --http
     // retargets the URL while keeping HTTP auth, and --bearer/--header are
     // layered on in build_http_config.
-    let (profile_name, import_label, connection) = match (imported, profile) {
-        (Some(imported), _) => (None, Some(imported.label()), Some(imported.connection)),
-        (None, Some((name, connection))) => (Some(name), None, Some(connection)),
-        (None, None) => (None, None, None),
+    let (profile_name, import_label, import_selector, connection) = match (imported, profile) {
+        (Some(imported), _) => (
+            None,
+            Some(imported.label()),
+            Some(imported.selector),
+            Some(imported.connection),
+        ),
+        (None, Some((name, connection))) => (Some(name), None, None, Some(connection)),
+        (None, None) => (None, None, None, None),
     };
+    // Spawning an imported entry needs the config location for the approval
+    // store, and the alias table takes ownership of it below.
+    let trust_store_config = config_file.clone();
 
     // Aliases come from the same file as the profiles: the global table plus
     // the connected profile's own, which shadows it.
@@ -1908,9 +1942,39 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                     .await?
             }
             Some(config::Connection::Stdio { command, env, cwd }) => {
+                // An imported entry is code from somewhere else: show what it
+                // resolved to and get approval before running it. A native
+                // profile is the user's own config file, so it is not gated.
+                if let Some(selector) = &import_selector {
+                    let plan = import_trust::SpawnPlan::new(
+                        &selector.path,
+                        &selector.entry,
+                        &command,
+                        cwd.as_deref(),
+                        &env,
+                    );
+                    let interactive =
+                        !one_shot && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                    match import_trust::authorize(
+                        &plan,
+                        trust_store_config.as_deref(),
+                        args.trust_import,
+                        interactive,
+                    ) {
+                        import_trust::Decision::Approved => {}
+                        import_trust::Decision::Refused(reason) => {
+                            exit_with_error(ExitStatus::Usage, &reason);
+                        }
+                    }
+                }
                 let mut cmd = tokio::process::Command::new(&command[0]);
                 cmd.args(&command[1..]);
                 cmd.envs(env);
+                // The child inherits this process's environment, which is
+                // usually what a stdio server wants. MCP_BEARER is the
+                // exception: it is an HTTP credential by construction, and
+                // nothing reached over stdio has any use for it.
+                cmd.env_remove("MCP_BEARER");
                 if let Some(cwd) = cwd {
                     cmd.current_dir(cwd);
                 }
@@ -1935,6 +1999,9 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
 
     let info = establish_connection(&client, args.protocol).await?;
     let server_name = info.server_info.name.clone();
+    if let Ok(mut label) = server_label.write() {
+        label.clone_from(&server_name);
+    }
     if !quiet {
         print_banner(&info);
     }
@@ -2748,6 +2815,7 @@ async fn handle_line(
                         "capabilities": info.capabilities,
                         "instructions": info.instructions,
                         "sampling": sampling::mode().as_str(),
+                        "elicitation": elicit::mode().as_str(),
                     }));
                     return false;
                 }
@@ -2761,7 +2829,11 @@ async fn handle_line(
                     "{}",
                     paint(
                         Style::new().dimmed(),
-                        &format!("sampling: {}", sampling::mode().as_str())
+                        &format!(
+                            "sampling: {}, elicitation: {}",
+                            sampling::mode().as_str(),
+                            elicit::mode().as_str()
+                        )
                     )
                 );
             }

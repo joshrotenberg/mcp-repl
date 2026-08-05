@@ -81,8 +81,16 @@ fn fixture_router() -> McpRouter {
                         .to_string_lossy()
                         .into_owned();
                     let imported = std::env::var("MCP_REPL_IMPORTED_VALUE").ok();
+                    // The REPL strips this before spawning: it is an HTTP
+                    // credential, and a stdio child has no use for it.
+                    let bearer = std::env::var("MCP_BEARER").ok();
                     Ok(CallToolResult::text(
-                        serde_json::json!({ "cwd": cwd, "imported": imported }).to_string(),
+                        serde_json::json!({
+                            "cwd": cwd,
+                            "imported": imported,
+                            "bearer": bearer,
+                        })
+                        .to_string(),
                     ))
                 })
                 .build(),
