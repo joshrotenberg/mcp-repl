@@ -162,21 +162,110 @@ async fn observe_subscription(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// A hand-rolled stdio server that serves tools and rejects everything else.
+///
+/// Deliberately not built on `McpRouter`. A tower-mcp router answers
+/// `prompts/list` with an empty list even when it serves no prompts, so it
+/// cannot reproduce what other SDKs do, and a fixture built from the same
+/// types as the client under test agrees with our assumptions by
+/// construction. GitMCP declares exactly `{"tools":{"listChanged":true}}` and
+/// answers `prompts/list` with `-32601 Method not found`, which is correct of
+/// it; the REPL used to report that as a failure, so connecting to a healthy
+/// server opened with two warnings about nothing.
+///
+/// Speaking JSON-RPC directly is the point: this is the shape of a server we
+/// did not write.
+fn serve_raw_tools_only(bad_meta: bool) -> Result<(), tower_mcp::BoxError> {
+    use std::io::{BufRead, Write};
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: serde_json::Value = serde_json::from_str(&line)?;
+        let method = request["method"].as_str().unwrap_or_default();
+        // A notification carries no id and takes no response.
+        let Some(id) = request.get("id").filter(|id| !id.is_null()).cloned() else {
+            continue;
+        };
+        let response = match method {
+            "initialize" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": request["params"]["protocolVersion"],
+                    "capabilities": { "tools": { "listChanged": true } },
+                    "serverInfo": { "name": "raw-tools-only", "version": "1.0.0" },
+                },
+            }),
+            "tools/list" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    // FastMCP emits this. The name starts with an underscore,
+                    // which the `_meta` grammar forbids, and a client that
+                    // validates on the way in throws away the whole listing
+                    // over it (tower-mcp#1212). What the REPL must not do is
+                    // then report the missing listing as an empty one.
+                    "_meta": if bad_meta {
+                        serde_json::json!({ "_fastmcp": { "version": "2.0" } })
+                    } else {
+                        serde_json::json!({})
+                    },
+                    "tools": [{
+                        "name": "add",
+                        "description": "Add two integers",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "a": { "type": "integer" },
+                                "b": { "type": "integer" },
+                            },
+                            "required": ["a", "b"],
+                        },
+                    }],
+                },
+            }),
+            // Everything the capabilities did not promise, including the
+            // listings the REPL must now know better than to ask for.
+            _ => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "Method not found" },
+            }),
+        };
+        writeln!(stdout, "{response}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {
     eprintln!("mcp-repl fixture ready");
+    // Not a router: this mode speaks JSON-RPC by hand so it can reject the
+    // methods it never advertised, the way a server from another SDK does.
+    if std::env::args().any(|arg| arg == "--tools-only") {
+        serve_raw_tools_only(std::env::args().any(|arg| arg == "--bad-meta"))?;
+        write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
+        return Ok(());
+    }
+    let router = fixture_router();
     if std::env::args().any(|arg| arg == "--http") {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/", listener.local_addr()?);
         write_marker("MCP_REPL_FIXTURE_READY_FILE", &url);
-        let app = HttpTransport::new(fixture_router())
+        let app = HttpTransport::new(router)
             .protocol_support(protocol_support())
             .disable_origin_validation()
             .into_router()
             .layer(axum::middleware::from_fn(observe_subscription));
         axum::serve(listener, app).await?;
     } else {
-        StdioTransport::new(fixture_router())
+        StdioTransport::new(router)
             .protocol_support(protocol_support())
             .run()
             .await?;
