@@ -830,6 +830,41 @@ async fn exercise_tools_only_server(fixture: &Path, temp: &TempDir) {
     );
 }
 
+/// The protocol version reported is the one the server returned.
+///
+/// A server may answer `initialize` with a version other than the one asked
+/// for, and real ones do. Echoing the request back would be the easy mistake
+/// and would tell the operator something false: the banner is the only place
+/// the negotiated version appears, so it has to be the negotiated one.
+async fn exercise_downgraded_protocol(fixture: &Path, temp: &TempDir) {
+    let exit_file = temp.path().join("downgrade.exit");
+    let mut command = repl_command();
+    command
+        .args([
+            "--no-history",
+            "--color",
+            "never",
+            "--verbose",
+            "--exec",
+            "quit",
+        ])
+        .arg(fixture)
+        .args(["--tools-only", "--downgrade-protocol"])
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let output = run(command, "downgraded protocol", CASE_TIMEOUT).await;
+    assert_success(&output, "downgraded protocol");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("protocol 2025-06-18"),
+        "the version the server chose is the one reported:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("2025-11-25"),
+        "and the version mcp-repl asked for is not:\n{stdout}"
+    );
+}
+
 /// A listing that could not be read must not be reported as an empty one.
 ///
 /// The same raw server, now declaring the tools capability and then failing
@@ -1255,6 +1290,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
         exercise_tools_only_server(&fixture, &temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
+        exercise_downgraded_protocol(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;

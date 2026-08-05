@@ -175,7 +175,7 @@ async fn observe_subscription(request: Request, next: Next) -> Response {
 ///
 /// Speaking JSON-RPC directly is the point: this is the shape of a server we
 /// did not write.
-fn serve_raw_tools_only(failing_list: bool) -> Result<(), tower_mcp::BoxError> {
+fn serve_raw_tools_only(failing_list: bool, downgrade: bool) -> Result<(), tower_mcp::BoxError> {
     use std::io::{BufRead, Write};
 
     let stdin = std::io::stdin();
@@ -196,7 +196,15 @@ fn serve_raw_tools_only(failing_list: bool) -> Result<(), tower_mcp::BoxError> {
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "protocolVersion": request["params"]["protocolVersion"],
+                    // A server is allowed to answer with a version other than
+                    // the one asked for, and real ones do: the client either
+                    // speaks it or gives up, but must not carry on believing
+                    // it got what it requested.
+                    "protocolVersion": if downgrade {
+                        serde_json::json!("2025-06-18")
+                    } else {
+                        request["params"]["protocolVersion"].clone()
+                    },
                     "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": { "name": "raw-tools-only", "version": "1.0.0" },
                 },
@@ -248,7 +256,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Not a router: this mode speaks JSON-RPC by hand so it can reject the
     // methods it never advertised, the way a server from another SDK does.
     if std::env::args().any(|arg| arg == "--tools-only") {
-        serve_raw_tools_only(std::env::args().any(|arg| arg == "--failing-list"))?;
+        serve_raw_tools_only(
+            std::env::args().any(|arg| arg == "--failing-list"),
+            std::env::args().any(|arg| arg == "--downgrade-protocol"),
+        )?;
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
         return Ok(());
     }
