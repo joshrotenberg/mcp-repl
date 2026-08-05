@@ -12,7 +12,7 @@ resources get built-ins, tab completion is powered by the server itself where
 the protocol allows, and the command table refreshes live when the server's
 surface changes.
 
-![mcp-repl completing arguments from a tool's schema, converting a value through an enum argument, and running a tool as a background task](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/hero.gif)
+![mcp-repl completing arguments from a tool's schema, converting a value through an enum argument, reporting progress from a slow tool, and running a tool as a background task](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/hero.gif)
 
 ## Install
 
