@@ -779,11 +779,59 @@ async fn exercise_http(fixture: &Path, temp: &TempDir) {
     http.shutdown().await;
 }
 
+/// The generators run before anything connects, so they need no server, no
+/// config file, and no terminal. That is the property a packaging script
+/// depends on, and it only holds at the process boundary.
+async fn exercise_generators() {
+    // Each shell spells a long option its own way: bash and zsh emit
+    // `--protocol`, fish emits `-l protocol`.
+    for (shell, marker, protocol_flag, demo_flag) in [
+        ("bash", "complete -F _mcp-repl", "--protocol", "--demo"),
+        ("zsh", "#compdef mcp-repl", "--protocol", "--demo"),
+        ("fish", "complete -c mcp-repl", "-l protocol", "-l demo"),
+    ] {
+        let mut command = repl_command();
+        command.args(["--completions", shell]);
+        let output = run(command, &format!("completions {shell}"), CASE_TIMEOUT).await;
+        assert_success(&output, &format!("completions {shell}"));
+        let script = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            script.contains(marker),
+            "{shell} completion does not look like a {shell} script:\n{script}"
+        );
+        // The flags a user actually reaches for, from the live command
+        // definition rather than a snapshot that could drift.
+        assert!(
+            script.contains(protocol_flag),
+            "{shell} completion lost {protocol_flag}"
+        );
+        assert!(
+            script.contains(demo_flag),
+            "{shell} completion lost {demo_flag}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).is_empty(),
+            "a generator must leave stdout clean and say nothing on stderr"
+        );
+    }
+
+    let mut command = repl_command();
+    command.arg("--man");
+    let output = run(command, "man page", CASE_TIMEOUT).await;
+    assert_success(&output, "man page");
+    let roff = String::from_utf8_lossy(&output.stdout);
+    for section in [".SH NAME", ".SH SYNOPSIS", ".SH DESCRIPTION", ".SH OPTIONS"] {
+        assert!(roff.contains(section), "man page has no {section}");
+    }
+    assert!(roff.contains("mcp-repl"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
+        exercise_generators().await;
         exercise_json_contract(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;

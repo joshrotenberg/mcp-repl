@@ -20,6 +20,13 @@ surface changes.
 cargo install mcp-repl
 ```
 
+Completions and a man page come from the binary itself:
+
+```bash
+mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
+mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
+```
+
 ## Start here
 
 No server needed: `--demo` runs one in this process.
