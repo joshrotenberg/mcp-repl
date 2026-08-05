@@ -920,8 +920,8 @@ fn print_first_run_hint() {
         "{}",
         paint(
             Style::new().dimmed(),
-            "Tab completes commands and arguments  ·  `find <word>` searches  ·  \
-             `describe <name>` shows schemas  ·  trailing `&` runs a tool as a task"
+            "Tab completes  ·  `find <word>` searches  ·  `describe <name>` shows \
+             schemas  ·  `&` runs a tool as a task"
         )
     );
 }
@@ -1226,12 +1226,27 @@ fn selected_oauth_profile(
 
 fn demo_router() -> tower_mcp::McpRouter {
     use tower_mcp::extract::{Context, Json, RawArgs};
+    use tower_mcp::protocol::ToolAnnotations;
     use tower_mcp::protocol::{
         CompleteResult, CompletionReference, ElicitAction, ElicitFormParams, ElicitFormSchema,
         ReadResourceResult,
     };
     use tower_mcp::resource::ResourceTemplateBuilder;
     use tower_mcp::{CallToolResult, PromptBuilder, TaskSupportMode, ToolBuilder};
+
+    /// Reads nothing outside this process and changes nothing: true of every
+    /// tool here except `sign_in`. Spelled out rather than using
+    /// `read_only_safe()`, which leaves `open_world_hint` at the spec default
+    /// of true and would tag all six tools identically.
+    fn local_read_only() -> ToolAnnotations {
+        ToolAnnotations {
+            read_only_hint: true,
+            idempotent_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
+            ..Default::default()
+        }
+    }
 
     const NOTES: &[(&str, &str)] = &[
         ("groceries", "- eggs\n- coffee"),
@@ -1312,7 +1327,7 @@ fn demo_router() -> tower_mcp::McpRouter {
         .tool(
             ToolBuilder::new("echo")
                 .description("Echo a message back")
-                .read_only_safe()
+                .annotations(local_read_only())
                 .handler(|input: EchoInput| async move {
                     let text = match input.repeat {
                         1 => input.message,
@@ -1326,8 +1341,8 @@ fn demo_router() -> tower_mcp::McpRouter {
         )
         .tool(
             ToolBuilder::new("about")
-                .description("Markdown-formatted notes about this demo server")
-                .read_only_safe()
+                .description("Notes about this demo server, in markdown")
+                .annotations(local_read_only())
                 .extractor_handler((), |RawArgs(_): RawArgs| async move {
                     Ok(CallToolResult::text(
                         "# mcp-repl demo\n\n\
@@ -1345,7 +1360,7 @@ fn demo_router() -> tower_mcp::McpRouter {
         .tool(
             ToolBuilder::new("convert")
                 .description("Convert a temperature between scales")
-                .read_only_safe()
+                .annotations(local_read_only())
                 .handler(|input: ConvertInput| async move {
                     let celsius = match input.from {
                         Scale::Celsius => input.value,
@@ -1363,9 +1378,9 @@ fn demo_router() -> tower_mcp::McpRouter {
         )
         .tool(
             ToolBuilder::new("slow_add")
-                .description("Add two numbers, slowly (try running with a trailing &)")
+                .description("Add two numbers, slowly")
                 .task_support(TaskSupportMode::Optional)
-                .read_only_safe()
+                .annotations(local_read_only())
                 .handler(|input: AddInput| async move {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     Ok(CallToolResult::text((input.a + input.b).to_string()))
@@ -1376,8 +1391,8 @@ fn demo_router() -> tower_mcp::McpRouter {
         // the typed input through an extractor rather than the plain handler.
         .tool(
             ToolBuilder::new("scan")
-                .description("Pretend to scan something, reporting progress as it goes")
-                .read_only_safe()
+                .description("Scan slowly, reporting progress")
+                .annotations(local_read_only())
                 .extractor_handler(
                     (),
                     |ctx: Context, Json(input): Json<ScanInput>| async move {
@@ -1400,7 +1415,7 @@ fn demo_router() -> tower_mcp::McpRouter {
         // taking them as arguments.
         .tool(
             ToolBuilder::new("sign_in")
-                .description("Ask you for credentials at the terminal (elicitation demo)")
+                .description("Ask you for credentials (elicitation demo)")
                 .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
                     let form = ElicitFormParams {
                         mode: None,
@@ -1425,10 +1440,13 @@ fn demo_router() -> tower_mcp::McpRouter {
                     let text = match answer.action {
                         ElicitAction::Accept => {
                             let content = answer.content.unwrap_or_default();
+                            // Render the answer as the operator typed it,
+                            // not as Rust's Debug shows it.
                             let username = content
                                 .get("username")
-                                .map(|v| format!("{v:?}"))
-                                .unwrap_or_else(|| "(none)".to_string());
+                                .and_then(|v| serde_json::to_value(v).ok())
+                                .and_then(|v| v.as_str().map(str::to_string))
+                                .unwrap_or_else(|| "(nobody)".to_string());
                             format!("signed in as {username}")
                         }
                         ElicitAction::Decline => "declined".to_string(),

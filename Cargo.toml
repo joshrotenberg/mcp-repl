@@ -9,9 +9,10 @@ readme = "README.md"
 description = "Interactive MCP client REPL: connects to any MCP server and turns its tools, prompts, and resources into the command set"
 keywords = ["mcp", "repl", "cli", "client", "protocol"]
 categories = ["command-line-utilities", "development-tools"]
-# The black-box fixture server in examples/ is a test asset, not part of the
-# published package.
-exclude = ["/examples", "/.github"]
+# The black-box fixture server in examples/ is a test asset, and docs/ holds
+# the prose and the recordings behind the README's images. Neither belongs in
+# the published package: the recordings alone are most of a megabyte.
+exclude = ["/examples", "/.github", "/docs"]
 
 [lib]
 name = "mcp_repl"
