@@ -378,17 +378,29 @@ still work for the session and the REPL says they were not saved.
 
 ## What to try
 
+`--demo` needs no server at all, and its tools are typed so the features
+that depend on a schema are all reachable:
+
 ```text
-getting-started> help                      # built-ins plus the server's tools
-getting-started> help wait                 # what one built-in does
-getting-started> add a=2 b=3               # tools are commands; args coerced by inputSchema
-getting-started> echo message="hi there"   # tab-completes argument names
-getting-started> find note                 # keyword search across the surface
-getting-started> describe add              # input/output schemas, colored
-getting-started> read source://getting_started.rs
-getting-started> prompt greet name=World   # prompt args tab-complete via completion/complete
-getting-started> info                      # replay the startup banner (identity, instructions, counts) + capabilities
+mcp-repl-demo> help                        # built-ins plus the server's tools
+mcp-repl-demo> help wait                   # what one built-in does
+mcp-repl-demo> echo <Tab>                  # completes `message=` and `repeat=`, with types
+mcp-repl-demo> echo message="hi there"     # args coerced by inputSchema
+mcp-repl-demo> echo msg=hi                 # refused: `message` is required
+mcp-repl-demo> convert value=100 from=celsius to=<Tab>  # completes the enum values
+mcp-repl-demo> slow_add a=2 b=3 &          # runs task-augmented; `jobs`, `wait 1`
+mcp-repl-demo> sign_in                     # the server asks *you* (elicitation)
+mcp-repl-demo> find note                   # keyword search across the surface
+mcp-repl-demo> describe convert            # input/output schemas, colored
+mcp-repl-demo> read note://ideas           # a resource template, completed by the server
+mcp-repl-demo> prompt greet name=<Tab>     # prompt args complete via completion/complete
+mcp-repl-demo> info                        # identity, instructions, counts, capabilities
 ```
+
+The demo runs the server in this process over an in-memory pipe rather than
+a socket or a child process, so it starts instantly and opens nothing. It
+speaks the same full-duplex framing a spawned stdio server does, which is
+what lets a demo tool call back to ask you a question.
 
 Single or double quotes group whitespace into one argument, and the REPL
 removes those grouping quotes before schema coercion. A backslash escapes the
@@ -717,7 +729,7 @@ a terminal. `--color always|never|auto` overrides the detection.
 Tools that request user input via `elicitation/create` prompt for each
 field at the terminal during a foreground call: the field's type, default,
 and description are shown, empty input accepts the default, and EOF
-cancels. Try `test_elicitation` against the conformance server. If a
+cancels. Try `sign_in` in `--demo`. If a
 background task elicits while the editor owns the terminal, the request is
 declined rather than fighting the editor for stdin.
 
