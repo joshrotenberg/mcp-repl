@@ -15,10 +15,32 @@ const MAX_PENDING_NOTIFICATIONS: usize = 128;
 /// A task started by this REPL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
+    /// The server's id, which is authoritative and goes on the wire.
     pub task_id: String,
+    /// A small number assigned by this session, so the task can be named
+    /// at the prompt without copying 32 hex characters.
+    pub number: usize,
     pub tool: String,
     pub status: TaskStatus,
     pub status_message: Option<String>,
+}
+
+impl Job {
+    /// How the task is shown: the short number, with enough of the real id
+    /// to recognize it in a server log.
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.number, abbreviate(&self.task_id))
+    }
+}
+
+/// Server task ids are opaque and often long. Show enough to match against
+/// a log line without filling the terminal.
+pub fn abbreviate(task_id: &str) -> String {
+    const KEEP: usize = 8;
+    match task_id.char_indices().nth(KEEP) {
+        Some((cut, _)) if task_id.len() > KEEP + 3 => format!("{}...", &task_id[..cut]),
+        _ => task_id.to_string(),
+    }
 }
 
 #[derive(Clone)]
@@ -31,6 +53,9 @@ struct PendingStatus {
 struct State {
     jobs: Vec<Job>,
     pending: HashMap<String, PendingStatus>,
+    /// Monotonic within the session, so a number is never reused even
+    /// after a task settles.
+    next_number: usize,
 }
 
 struct Transition {
@@ -67,8 +92,11 @@ impl Jobs {
         let transition = {
             let mut state = self.state.lock().unwrap();
             let pending = state.pending.remove(&task_id);
+            state.next_number += 1;
+            let number = state.next_number;
             state.jobs.push(Job {
                 task_id: task_id.clone(),
+                number,
                 tool,
                 status,
                 status_message,
@@ -120,6 +148,44 @@ impl Jobs {
 
     pub fn list(&self) -> Vec<Job> {
         self.state.lock().unwrap().jobs.clone()
+    }
+
+    /// Resolve what the user typed to a server task id.
+    ///
+    /// Accepts the short session number, the full id, or an unambiguous
+    /// prefix of one. Returns `None` when nothing matches, so the caller
+    /// can report it rather than sending a made-up id to the server.
+    pub fn resolve(&self, typed: &str) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        if let Ok(number) = typed.parse::<usize>()
+            && let Some(job) = state.jobs.iter().find(|job| job.number == number)
+        {
+            return Some(job.task_id.clone());
+        }
+        if state.jobs.iter().any(|job| job.task_id == typed) {
+            return Some(typed.to_string());
+        }
+        let mut matches = state
+            .jobs
+            .iter()
+            .filter(|job| job.task_id.starts_with(typed));
+        match (matches.next(), matches.next()) {
+            (Some(job), None) => Some(job.task_id.clone()),
+            // Ambiguous or absent: the caller says so.
+            _ => None,
+        }
+    }
+
+    /// The short label for a task id, for rendering a command's own output.
+    pub fn label_for(&self, task_id: &str) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .find(|job| job.task_id == task_id)
+            .map(Job::label)
+            .unwrap_or_else(|| abbreviate(task_id))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -181,9 +247,10 @@ impl Jobs {
         // terminal asynchronously, so they are sanitized like any other
         // server string.
         let task_id = sanitize(&transition.task_id);
+        let label = self.label_for(&transition.task_id);
         let mut line = format!(
             "{} {}",
-            tag(Style::new(), &format!("task {task_id}")),
+            tag(Style::new(), &format!("task {}", sanitize(&label))),
             paint(task_status_style(transition.status), &status)
         );
         if let Some(message) = transition
@@ -194,11 +261,20 @@ impl Jobs {
             line.push_str(&format!(" — {}", sanitize(message)));
         }
         if transition.status.is_terminal() || transition.status == TaskStatus::InputRequired {
+            let short = self
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .iter()
+                .find(|job| job.task_id == transition.task_id)
+                .map(|job| job.number.to_string())
+                .unwrap_or_else(|| task_id.to_string());
             line.push_str(&format!(
                 "  {}",
                 paint(
                     Style::new().dimmed(),
-                    &format!("run `task {task_id}` for details")
+                    &format!("run `task {short}` for details")
                 )
             ));
         }
@@ -261,9 +337,12 @@ mod tests {
             meta: None,
         });
         let line = printer.get_line().unwrap();
-        assert!(line.contains("[task task-1]"));
-        assert!(line.contains("completed"));
-        assert!(line.contains("task task-1"));
+        // The line names the task by its short session number, keeping the
+        // server's id visible so it can be matched against a log.
+        assert!(line.contains("[task 1 (task-1)]"), "{line}");
+        assert!(line.contains("completed"), "{line}");
+        // The follow-up hint is what the user types, so it is the number.
+        assert!(line.contains("run `task 1`"), "{line}");
 
         jobs.observe("task-1".into(), TaskStatus::Completed, None);
         assert!(printer.get_line().is_none(), "replay must be deduplicated");
@@ -294,8 +373,54 @@ mod tests {
             jobs.observe(id.into(), status, None);
             let line = printer.get_line().unwrap();
             assert!(line.contains(&status.to_string()), "{line}");
-            assert!(line.contains(&format!("task {id}")), "{line}");
+            // Each registration takes the next number; the server id stays
+            // alongside it.
+            assert!(line.contains(&format!("({id})")), "{line}");
         }
+    }
+
+    #[test]
+    fn a_task_is_reachable_by_number_id_or_prefix() {
+        let (jobs, _printer) = fixture();
+        jobs.register(
+            "f1c563f39a0b4e21".into(),
+            "slow_add".into(),
+            TaskStatus::Working,
+            None,
+        );
+        // What the announcement told the user to type.
+        assert_eq!(jobs.resolve("1").as_deref(), Some("f1c563f39a0b4e21"));
+        // The full id a server log would show.
+        assert_eq!(
+            jobs.resolve("f1c563f39a0b4e21").as_deref(),
+            Some("f1c563f39a0b4e21")
+        );
+        // The abbreviated form the REPL prints.
+        assert_eq!(
+            jobs.resolve("f1c563f3").as_deref(),
+            Some("f1c563f39a0b4e21")
+        );
+        // Nothing invented for a task this session never started: the
+        // command reports it instead of asking the server about a guess.
+        assert_eq!(jobs.resolve("2"), None);
+        assert_eq!(jobs.resolve("deadbeef"), None);
+    }
+
+    #[test]
+    fn an_ambiguous_prefix_resolves_to_nothing() {
+        let (jobs, _printer) = fixture();
+        jobs.register("abc111".into(), "a".into(), TaskStatus::Working, None);
+        jobs.register("abc222".into(), "b".into(), TaskStatus::Working, None);
+        assert_eq!(jobs.resolve("abc"), None);
+        assert_eq!(jobs.resolve("abc1").as_deref(), Some("abc111"));
+        // Numbers stay unambiguous even when the ids overlap.
+        assert_eq!(jobs.resolve("2").as_deref(), Some("abc222"));
+    }
+
+    #[test]
+    fn long_ids_are_shortened_and_short_ones_are_not() {
+        assert_eq!(abbreviate("f1c563f39a0b4e21f7"), "f1c563f3...");
+        assert_eq!(abbreviate("task-1"), "task-1");
     }
 
     #[test]

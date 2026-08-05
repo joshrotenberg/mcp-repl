@@ -27,6 +27,34 @@ struct Word {
     protected: bool,
 }
 
+/// Messages for input that is unfinished rather than wrong.
+///
+/// The distinction is what lets the editor keep reading instead of
+/// rejecting a half-typed line: a missing closing brace may still arrive,
+/// while a mismatched one never becomes valid. [`is_incomplete`] is the
+/// only reader, and the tests below pin each condition to it.
+const INCOMPLETE_TRAILING_ESCAPE: &str = "trailing backslash escapes no character";
+const INCOMPLETE_JSON_STRING: &str = "unterminated string in JSON argument";
+const INCOMPLETE_QUOTE: &str = "unmatched";
+const INCOMPLETE_JSON_ARGUMENT: &str = "unclosed JSON argument";
+
+/// Whether the line is merely unfinished, so more input could complete it.
+///
+/// Drives multiline editing: pasting a pretty-printed JSON body arrives one
+/// line at a time, and submitting the first line alone would only produce an
+/// error about a brace the user is about to type.
+pub fn is_incomplete(line: &str) -> bool {
+    match parse(line) {
+        Ok(_) => false,
+        Err(message) => {
+            message.starts_with(INCOMPLETE_QUOTE)
+                || message.starts_with(INCOMPLETE_JSON_ARGUMENT)
+                || message == INCOMPLETE_TRAILING_ESCAPE
+                || message == INCOMPLETE_JSON_STRING
+        }
+    }
+}
+
 /// Split one command line without losing quoted whitespace or JSON syntax.
 pub fn parse(line: &str) -> Result<ParsedCommand, String> {
     let mut words = Vec::new();
@@ -132,20 +160,20 @@ pub fn parse(line: &str) -> Result<ParsedCommand, String> {
     }
 
     if escaped {
-        return Err("trailing backslash escapes no character".to_string());
+        return Err(INCOMPLETE_TRAILING_ESCAPE.to_string());
     }
     if let Some(quote) = quote {
         let name = match quote {
             Quote::Single => "single",
             Quote::Double => "double",
         };
-        return Err(format!("unmatched {name} quote"));
+        return Err(format!("{INCOMPLETE_QUOTE} {name} quote"));
     }
     if json_string {
-        return Err("unterminated string in JSON argument".to_string());
+        return Err(INCOMPLETE_JSON_STRING.to_string());
     }
     if let Some(expected) = json_stack.last() {
-        return Err(format!("unclosed JSON argument: expected `{expected}`"));
+        return Err(format!("{INCOMPLETE_JSON_ARGUMENT}: expected `{expected}`"));
     }
     finish_word(&mut words, &mut current, &mut word_started, &mut protected);
 
@@ -181,6 +209,42 @@ fn finish_word(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfinished_input_asks_for_more() {
+        // Each of these could still become valid with more typing, which is
+        // exactly the pasted-JSON case.
+        assert!(is_incomplete(r#"call echo {"#));
+        assert!(is_incomplete(r#"call echo {"message": "#));
+        assert!(is_incomplete(r#"call echo {"message": "hi"#));
+        assert!(is_incomplete("tool a=[1,"));
+        assert!(is_incomplete(r#"tool a="unterminated"#));
+        assert!(is_incomplete("tool a='unterminated"));
+        assert!(is_incomplete("tool note=two\\"));
+    }
+
+    #[test]
+    fn finished_or_impossible_input_is_submitted() {
+        assert!(!is_incomplete(""));
+        assert!(!is_incomplete("tools"));
+        assert!(!is_incomplete(r#"call echo {"message": "hi"}"#));
+        assert!(!is_incomplete("tool a=[1, 2]"));
+        // A mismatched delimiter never becomes valid, so submit it and let
+        // the parser report it rather than trapping the editor.
+        assert!(!is_incomplete("tool a={1]"));
+    }
+
+    #[test]
+    fn a_multiline_json_body_parses_as_one_command() {
+        let parsed = parse("call echo {\n  \"message\": \"hello world\"\n}").unwrap();
+        assert_eq!(parsed.words[0], "call");
+        assert_eq!(parsed.words[1], "echo");
+        // The JSON keeps its own whitespace, so it stays valid JSON.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.words[2]).unwrap(),
+            serde_json::json!({"message": "hello world"})
+        );
+    }
 
     #[test]
     fn quotes_group_whitespace_and_are_removed() {
