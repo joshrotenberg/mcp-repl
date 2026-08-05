@@ -380,6 +380,7 @@ still work for the session and the REPL says they were not saved.
 
 ```text
 getting-started> help                      # built-ins plus the server's tools
+getting-started> help wait                 # what one built-in does
 getting-started> add a=2 b=3               # tools are commands; args coerced by inputSchema
 getting-started> echo message="hi there"   # tab-completes argument names
 getting-started> find note                 # keyword search across the surface
@@ -399,9 +400,33 @@ getting-started> echo message="hello world"
 getting-started> call echo {"message": "hello world"}
 ```
 
-An unmatched quote, trailing escape, or unclosed JSON argument is reported
-locally without calling the server. A quoted or escaped `&` is ordinary input;
+A line that is merely unfinished keeps the editor reading instead of failing:
+pasting a pretty-printed JSON body works, and the `::: ` continuation prompt
+shows while the quotes or braces are still open. A delimiter that can never
+match (`{1]`) is reported at once rather than waiting for input that would not
+help. An unmatched quote, trailing escape, or unclosed JSON argument in
+`--exec` is reported locally without calling the server. A quoted or escaped `&` is ordinary input;
 only a plain trailing `&` requests task-augmented execution.
+
+Tool listings and the completion menu carry the server's safety annotations,
+so what a tool does to the world is visible while choosing it rather than one
+`describe` later:
+
+```text
+cratesio> tools
+get_crate_info           Get detailed crate information [read-only idempotent]
+publish_crate            Publish a crate [destructive open-world]
+slow_add                 Add two numbers, slowly [task-capable]
+```
+
+A server that declares no annotations gets no tags.
+
+`ping` checks the server is answering, which is the smallest possible health
+check for a script:
+
+```bash
+mcp-repl --http https://example/mcp -e ping
+```
 
 `resources` lists concrete resources and `templates` lists parameterized
 (`{variable}`) ones; each points at the other so a server that splits its
@@ -411,12 +436,16 @@ Task-capable tools support shell-style backgrounding (SEP-2663):
 
 ```text
 demo> slow_add a=2 b=3 &
-[task task-1] started
-[task task-1] completed  run `task task-1` for details
-demo> task task-1
-task task-1  status=completed
+[task 1 (105e63bf...)] started
+[task 1 (105e63bf...)] completed  run `task 1` for details
+demo> wait 1
+task 1 (105e63bf...)  status=completed  Task completed
 5
 ```
+
+Task ids are opaque strings chosen by the server, so the REPL also gives each
+task a small number for this session. `task`, `wait`, and `cancel` accept the
+number, the full id, or an unambiguous prefix of it.
 
 The REPL tracks only tasks it started and consumes both legacy and final typed
 task-status notifications, deduplicating repeated transitions. A final client
@@ -586,6 +615,10 @@ tools:
 2 matches
 ```
 
+`find` searches the REPL's own commands too, so `find alias` reaches the
+alias built-in rather than reporting that the server has nothing by that name.
+`describe <built-in>` explains one the same way `help <built-in>` does.
+
 Matching is case-insensitive. Results rank an exact name match first, then a
 name prefix, then a name substring, then a description match, and last a
 subsequence (`gvd` reaches `get_version_downloads`) so a loose match never
@@ -611,8 +644,8 @@ enough, the message points at `help` as before.
 
 `describe <name>` looks up a tool, prompt, resource, or template by name:
 
-- Tools: behavior hints, task support, and the input/output schemas as
-  syntax-colored JSON.
+- Tools: behavior hints, task support, the input/output schemas as
+  syntax-colored JSON, and an `example:` line showing what to type.
 - Prompts: the argument table (name, required/optional, description).
 - Resources and templates: URI, name, MIME type, size, and description.
 

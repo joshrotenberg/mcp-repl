@@ -122,7 +122,19 @@ impl ProtocolMode {
     name = "mcp-repl",
     version,
     about = "Interactive MCP client REPL",
-    trailing_var_arg = true
+    trailing_var_arg = true,
+    after_help = "\
+EXAMPLES:
+  mcp-repl --demo                             the bundled demo server, no setup
+  mcp-repl --http https://example.com/mcp     a streamable HTTP server
+  mcp-repl -- ./my-server --stdio             spawn a stdio server
+  mcp-repl .mcp.json:local                    one entry from a client config
+  mcp-repl --server prod                      a profile from the config file
+
+  mcp-repl --demo -e 'echo message=hi'        run one command and exit
+  mcp-repl --demo --json -e tools | jq .      machine-readable NDJSON
+
+Inside the REPL, `help` lists the built-ins and `help <command>` explains one."
 )]
 struct Args {
     /// Protocol lifecycle to use. `stable` uses initialize/initialized;
@@ -429,6 +441,7 @@ pub(crate) const BUILTINS: &[(&str, &str)] = &[
     ("cancel", "cancel a background task"),
     ("alias", "define, list, or show a command alias"),
     ("unalias", "remove a command alias"),
+    ("ping", "check the server is answering"),
     ("refresh", "re-fetch the server surface"),
     ("info", "replay the connection banner plus capabilities"),
     ("wire", "toggle raw JSON-RPC frame tracing (on|off)"),
@@ -438,6 +451,159 @@ pub(crate) const BUILTINS: &[(&str, &str)] = &[
     ("quit", "exit"),
     ("exit", "exit"),
 ];
+
+/// Usage and a sentence of explanation per built-in, for `help <name>` and
+/// `describe <name>`. Names not listed here fall back to their one-line
+/// [`BUILTINS`] description.
+const BUILTIN_HELP: &[(&str, &str, &str)] = &[
+    (
+        "help",
+        "help [command]",
+        "With no argument, list the built-ins and the server's tools. With one, explain that command.",
+    ),
+    (
+        "tools",
+        "tools",
+        "List the server's tools. Every tool is also a command: `<tool> [k=v...]`.",
+    ),
+    ("prompts", "prompts", "List the server's prompts."),
+    (
+        "resources",
+        "resources",
+        "List concrete resources. Parameterized ones are under `templates`.",
+    ),
+    (
+        "templates",
+        "templates",
+        "List resource templates: URIs with `{variable}` parts, completed by the server.",
+    ),
+    (
+        "find",
+        "find <keyword>",
+        "Search names and descriptions across the surface and the built-ins. Exits non-zero when nothing matches, like grep.",
+    ),
+    (
+        "describe",
+        "describe <name>",
+        "Show a tool's schemas, a prompt's arguments, or a resource's metadata, plus an example invocation.",
+    ),
+    (
+        "snapshot",
+        "snapshot <name> [path]",
+        "Export a tool or prompt's schema as a versioned contract. Without a path, print it.",
+    ),
+    (
+        "validate",
+        "validate <path> [strict|compatible|ignore]",
+        "Compare a saved snapshot with the live surface. No request is sent.",
+    ),
+    (
+        "read",
+        "read <uri>",
+        "Read a resource. Tab completes URIs, and template variables via the server.",
+    ),
+    (
+        "subscribe",
+        "subscribe <uri>",
+        "Ask the server to report updates to a resource. Updates print inline.",
+    ),
+    (
+        "unsubscribe",
+        "unsubscribe <uri>",
+        "Stop receiving updates for a resource.",
+    ),
+    (
+        "subscriptions",
+        "subscriptions",
+        "List the resources the server is currently reporting updates for.",
+    ),
+    (
+        "prompt",
+        "prompt <name> [k=v...]",
+        "Retrieve a prompt. Argument values tab-complete through the server.",
+    ),
+    (
+        "call",
+        "call <tool> <json>",
+        "Call a tool with a raw JSON argument object, for when `k=v` coercion is not enough.",
+    ),
+    (
+        "bench",
+        "bench <tool> [k=v...] [--n N] [--concurrency C]",
+        "Time repeated calls and report the latency distribution. Any failure exits non-zero.",
+    ),
+    (
+        "jobs",
+        "jobs",
+        "List the background tasks this session started, with their current status.",
+    ),
+    (
+        "task",
+        "task <task>",
+        "Show one background task. Takes the short number from `jobs` or the server's id.",
+    ),
+    (
+        "wait",
+        "wait <task> [--timeout <seconds>]",
+        "Block until a task settles. Ctrl-C interrupts; the global --timeout does not apply.",
+    ),
+    (
+        "cancel",
+        "cancel <task>",
+        "Ask the server to cancel a task.",
+    ),
+    (
+        "alias",
+        "alias [--global] [<name>=<expansion>]",
+        "Define, list, or show a command alias. Saved to the config file.",
+    ),
+    (
+        "unalias",
+        "unalias [--global] <name>",
+        "Remove the alias that is in effect for a name.",
+    ),
+    (
+        "ping",
+        "ping",
+        "Send an empty request and report the round trip. Exits non-zero if the server does not answer.",
+    ),
+    (
+        "refresh",
+        "refresh",
+        "Re-fetch the surface. Usually unnecessary: list_changed notifications refresh it live.",
+    ),
+    (
+        "info",
+        "info",
+        "Replay the connection banner and show the server's capabilities.",
+    ),
+    (
+        "wire",
+        "wire [on|off]",
+        "Trace raw JSON-RPC frames to stderr. Bare `wire` reports the current state.",
+    ),
+    (
+        "last",
+        "last",
+        "Reprint the previous request and response. Frames are recorded whether or not tracing is on.",
+    ),
+    (
+        "vars",
+        "vars",
+        "List captured variables. Capture with `name = <command>`.",
+    ),
+    ("unset", "unset <name>", "Clear one captured variable."),
+    ("quit", "quit", "Close the session and exit."),
+    ("exit", "exit", "Close the session and exit."),
+];
+
+/// The usage line and explanation for a built-in, if it has one.
+fn builtin_help(name: &str) -> Option<(&'static str, &'static str)> {
+    BUILTIN_HELP
+        .iter()
+        .find(|(builtin, _, _)| *builtin == name)
+        .map(|(_, usage, detail)| (*usage, *detail))
+}
 
 /// Coerce a `key=value` string according to the tool's inputSchema.
 fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::Value {
@@ -519,10 +685,10 @@ fn render_content(content: &[Content]) {
     }
 }
 
-fn render_task(task: &TaskObject) {
+fn render_task(task: &TaskObject, label: &str) {
     println!(
         "task {}  status={}  {}",
-        paint(Style::new().bold(), &sanitize(&task.task_id)),
+        paint(Style::new().bold(), &sanitize(label)),
         paint(task_status_style(task.status), &task.status.to_string()),
         sanitize(task.status_message.as_deref().unwrap_or(""))
     );
@@ -665,9 +831,10 @@ fn print_tool_overview(surface: &Surface) {
     }
     for t in surface.tools.iter().take(CAP) {
         println!(
-            "{} {}",
+            "{} {}{}",
             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-            sanitize(t.description.as_deref().unwrap_or(""))
+            sanitize(t.description.as_deref().unwrap_or("")),
+            tool_tag_suffix(t)
         );
     }
     if surface.tools.len() > CAP {
@@ -742,6 +909,20 @@ fn print_counts(surface: &Surface) {
         plural(surface.prompts.len(), "prompt"),
         plural(surface.resources.len(), "resource"),
         plural(surface.templates.len(), "template")
+    );
+}
+
+/// The one-line nudge toward the features that are not obvious from a
+/// prompt: completion, search, schemas, and backgrounding. Interactive only,
+/// since `--exec` output is a data stream.
+fn print_first_run_hint() {
+    println!(
+        "{}",
+        paint(
+            Style::new().dimmed(),
+            "Tab completes commands and arguments  ·  `find <word>` searches  ·  \
+             `describe <name>` shows schemas  ·  trailing `&` runs a tool as a task"
+        )
     );
 }
 
@@ -2063,6 +2244,11 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         if !instructions_list_tools {
             print_tool_overview(&s);
         }
+        // Only for an interactive session: none of it applies to `--exec`,
+        // and it would be noise ahead of a data stream.
+        if !one_shot {
+            print_first_run_hint();
+        }
     }
 
     // One-shot: run each --exec command in order, then exit non-zero if any
@@ -2296,6 +2482,31 @@ async fn handle_line(
             return true;
         }
         "help" => {
+            // `help <command>` explains one built-in. Falls through to the
+            // full listing when the name is not one.
+            if let Some(name) = rest.first()
+                && let Some((usage, detail)) = builtin_help(name)
+            {
+                if json_output() {
+                    print_json(&serde_json::json!({
+                        "name": name,
+                        "usage": usage,
+                        "description": detail,
+                    }));
+                } else {
+                    println!("{}", paint(Style::new().bold(), usage));
+                    println!("  {detail}");
+                }
+                return false;
+            }
+            if let Some(name) = rest.first() {
+                report_error_with_hint(
+                    ExitStatus::NoMatch,
+                    &format!("no built-in named `{name}` (try `help` or `describe {name}`)"),
+                    find::did_you_mean(&surface.read().unwrap(), name).as_deref(),
+                );
+                return false;
+            }
             if json_output() {
                 let s = surface.read().unwrap();
                 print_json(&serde_json::json!({
@@ -2335,7 +2546,8 @@ async fn handle_line(
                 "  name = <cmd> [| <path>]                   capture a result (filter with | path)"
             );
             println!("  $name.path in args                        reference a captured value");
-            println!("  refresh | info | quit");
+            println!("  ping | refresh | info | quit");
+            println!("  help <command>                            explain one built-in");
             let s = surface.read().unwrap();
             if !s.tools.is_empty() {
                 println!("tools:");
@@ -2365,9 +2577,10 @@ async fn handle_line(
                 "tools" => {
                     for t in &s.tools {
                         println!(
-                            "{} {}",
+                            "{} {}{}",
                             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-                            sanitize(t.description.as_deref().unwrap_or(""))
+                            sanitize(t.description.as_deref().unwrap_or("")),
+                            tool_tag_suffix(t)
                         );
                     }
                 }
@@ -2747,7 +2960,7 @@ async fn handle_line(
                         jobs.sync(&job.task_id, task.status, task.status_message.clone());
                         println!(
                             "{}  {}  {}",
-                            sanitize(&job.task_id),
+                            sanitize(&job.label()),
                             sanitize(&job.tool),
                             paint(task_status_style(task.status), &task.status.to_string())
                         );
@@ -2756,7 +2969,7 @@ async fn handle_line(
                         note_error(ExitStatus::from_mcp_error(&error));
                         println!(
                             "{}  {}  (gone)",
-                            sanitize(&job.task_id),
+                            sanitize(&job.label()),
                             sanitize(&job.tool)
                         );
                     }
@@ -2784,10 +2997,23 @@ async fn handle_line(
                     return false;
                 }
             };
-            let Some(id) = rest.first() else {
-                command_error(&format!("usage: {cmd} <task-id>"));
+            let Some(typed) = rest.first() else {
+                command_error(&format!("usage: {cmd} <task>"));
                 return false;
             };
+            // `slow_add a=1 b=2 &` prints a small number; accept that, the
+            // server's full id, or an unambiguous prefix of it.
+            let Some(resolved) = jobs.resolve(typed) else {
+                report_error(
+                    ExitStatus::NoMatch,
+                    &format!(
+                        "no task `{typed}` in this session (run `jobs`; a task id belongs to \
+                         the session that created it)"
+                    ),
+                );
+                return false;
+            };
+            let id = &resolved.as_str();
             let outcome = match cmd {
                 "task" => client.task_get(id).await,
                 "wait" => match wait_limit {
@@ -2817,7 +3043,7 @@ async fn handle_line(
                 }
                 Ok(task) => {
                     jobs.sync(id, task.status, task.status_message.clone());
-                    render_task(&task);
+                    render_task(&task, &jobs.label_for(&task.task_id));
                 }
                 Err(e) => report_mcp_error(&e),
             }
@@ -2891,6 +3117,27 @@ async fn handle_line(
                 }
             }
         },
+        "ping" => {
+            let started = std::time::Instant::now();
+            match with_deadline(client.ping()).await {
+                Ok(()) => {
+                    let elapsed = started.elapsed();
+                    if json_output() {
+                        print_json(&serde_json::json!({
+                            "ok": true,
+                            "elapsedMs": elapsed.as_millis(),
+                        }));
+                    } else {
+                        println!(
+                            "{} {}",
+                            paint(Style::new().fg(Color::Green), "ok"),
+                            timing(elapsed)
+                        );
+                    }
+                }
+                Err(e) => report_mcp_error(&e),
+            }
+        }
         "refresh" => {
             let started = std::time::Instant::now();
             let fresh = refresh_surface(session).await;
@@ -3459,9 +3706,117 @@ fn parse_wait_timeout<'a>(
     Ok((limit, remaining))
 }
 
+/// The short safety tags for a tool: what it says it does to the world, and
+/// whether it can run as a task.
+///
+/// `describe` has shown these all along, but the decision they inform is
+/// made while reading a list, before anyone thinks to describe anything.
+pub(crate) fn tool_tags(tool: &ToolDefinition) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if let Some(a) = &tool.annotations {
+        if a.read_only_hint {
+            tags.push("read-only");
+        }
+        // A destructive read-only tool is a contradiction; trust read-only.
+        if a.destructive_hint && !a.read_only_hint {
+            tags.push("destructive");
+        }
+        if a.idempotent_hint {
+            tags.push("idempotent");
+        }
+        if a.open_world_hint {
+            tags.push("open-world");
+        }
+    }
+    if let Some(execution) = &tool.execution {
+        let v = serde_json::to_value(execution).unwrap_or_default();
+        match v.get("taskSupport").and_then(|m| m.as_str()) {
+            Some("required") => tags.push("task-only"),
+            Some("optional") => tags.push("task-capable"),
+            _ => {}
+        }
+    }
+    tags
+}
+
+/// The tags as they trail a listing row, or empty when the server declared
+/// none.
+fn tool_tag_suffix(tool: &ToolDefinition) -> String {
+    let tags = tool_tags(tool);
+    if tags.is_empty() {
+        return String::new();
+    }
+    format!(
+        " {}",
+        paint(Style::new().dimmed(), &format!("[{}]", tags.join(" ")))
+    )
+}
+
+/// A ready-to-run invocation synthesized from a tool's input schema:
+/// required arguments first with their types as placeholders, then optional
+/// ones in brackets. Long argument lists are trimmed, since the point is to
+/// show the shape rather than reproduce the schema.
+fn example_invocation(name: &str, schema: &serde_json::Value) -> String {
+    const SHOWN: usize = 4;
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return sanitize(name).into_owned();
+    };
+    let placeholder = |key: &str| -> String {
+        let ty = properties
+            .get(key)
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("value");
+        // An enum tells the user the actual choices, which beats the type.
+        let sample = properties
+            .get(key)
+            .and_then(|p| p.get("enum"))
+            .and_then(|e| e.as_array())
+            .and_then(|values| values.first())
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| Some(v.to_string()))
+            })
+            .unwrap_or_else(|| format!("<{ty}>"));
+        format!("{}={}", sanitize(key), sanitize(&sample))
+    };
+    let mut parts = vec![sanitize(name).into_owned()];
+    for key in &required {
+        parts.push(placeholder(key));
+    }
+    let optional: Vec<&String> = properties
+        .keys()
+        .filter(|key| !required.contains(&key.as_str()))
+        .collect();
+    for key in optional.iter().take(SHOWN.saturating_sub(required.len())) {
+        parts.push(format!("[{}]", placeholder(key)));
+    }
+    if optional.len() > SHOWN.saturating_sub(required.len()) {
+        parts.push("...".to_string());
+    }
+    parts.join(" ")
+}
+
 /// The `describe` built-in: schemas for a tool, the argument table for a
 /// prompt, metadata for a resource or template.
 fn describe(surface: &Surface, name: &str) {
+    // A built-in is a command too, so asking about one should answer rather
+    // than report that the server does not offer it.
+    if let Some((usage, detail)) = builtin_help(name) {
+        println!(
+            "built-in {}",
+            paint(Style::new().fg(Color::Cyan).bold(), name)
+        );
+        println!("  usage: {usage}");
+        println!("  {detail}");
+        return;
+    }
     if let Some(t) = surface.tools.iter().find(|t| t.name == name) {
         println!(
             "tool {}  {}",
@@ -3498,6 +3853,15 @@ fn describe(surface: &Surface, name: &str) {
             println!("output schema:");
             println!("{}", json_pretty(out));
         }
+        // A schema answers "what does it take"; the example answers "what do
+        // I type", which is the question at a prompt.
+        println!(
+            "example: {}",
+            paint(
+                Style::new().dimmed(),
+                &example_invocation(&t.name, &t.input_schema)
+            )
+        );
         return;
     }
     if let Some(p) = surface.prompts.iter().find(|p| p.name == name) {
@@ -3617,25 +3981,33 @@ async fn run_tool(
         .await
         {
             Ok(created) => {
+                let created_value = serde_json::to_value(&created).unwrap_or_default();
                 let task_id = created.task.task_id.clone();
                 let poll_interval = created.task.poll_interval;
-                if json_output() {
-                    print_json(&serde_json::to_value(&created).unwrap_or_default());
+                // Register before announcing, so the line can name the task
+                // by the short number the user will type.
+                jobs.register(
+                    created.task.task_id.clone(),
+                    name.to_string(),
+                    created.task.status,
+                    created.task.status_message.clone(),
+                );
+                if !output.is_plain() {
+                    // A backgrounded call returns the created task, so
+                    // `created = tool ... &` can bind it and a later command
+                    // can wait on `$created.task.taskId`.
+                    emit_result(created_value, output);
+                } else if json_output() {
+                    print_json(&created_value);
                 } else {
                     println!(
                         "{} started",
                         tag(
                             Style::new().fg(Color::Yellow),
-                            &format!("task {}", sanitize(&created.task.task_id))
+                            &format!("task {}", sanitize(&jobs.label_for(&task_id)))
                         )
                     );
                 }
-                jobs.register(
-                    created.task.task_id,
-                    name.to_string(),
-                    created.task.status,
-                    created.task.status_message,
-                );
                 watch_task(session.clone(), jobs.clone(), task_id, poll_interval);
             }
             Err(e) => report_mcp_error(&e),
@@ -4138,6 +4510,60 @@ mod tests {
     #[test]
     fn find_is_a_completable_builtin() {
         assert!(BUILTINS.iter().any(|(name, _)| *name == "find"));
+    }
+
+    #[test]
+    fn every_builtin_can_explain_itself() {
+        // `help <name>` and `describe <name>` both read this table, so a
+        // built-in missing from it answers with nothing useful.
+        for (name, _) in BUILTINS {
+            assert!(
+                builtin_help(name).is_some(),
+                "`{name}` has no usage line; add one to BUILTIN_HELP"
+            );
+        }
+        // And nothing in the table names a command that does not exist.
+        for (name, _, _) in BUILTIN_HELP {
+            assert!(
+                BUILTINS.iter().any(|(builtin, _)| builtin == name),
+                "BUILTIN_HELP documents `{name}`, which is not a built-in"
+            );
+        }
+    }
+
+    #[test]
+    fn an_example_invocation_shows_required_arguments_first() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "b": {"type": "integer"},
+                "a": {"type": "integer"},
+                "note": {"type": "string"},
+            },
+            "required": ["a", "b"],
+        });
+        let example = example_invocation("add", &schema);
+        assert!(
+            example.starts_with("add a=<integer> b=<integer>"),
+            "{example}"
+        );
+        assert!(example.contains("[note=<string>]"), "{example}");
+    }
+
+    #[test]
+    fn an_example_invocation_prefers_enum_values_to_types() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["fast", "slow"]}},
+            "required": ["mode"],
+        });
+        assert_eq!(example_invocation("run", &schema), "run mode=fast");
+    }
+
+    #[test]
+    fn a_tool_without_properties_still_has_an_example() {
+        let schema = serde_json::json!({"type": "object", "additionalProperties": true});
+        assert_eq!(example_invocation("about", &schema), "about");
     }
 
     #[test]

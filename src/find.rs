@@ -14,6 +14,9 @@ pub enum Kind {
     Prompt,
     Resource,
     Template,
+    /// A REPL command rather than something the server offers. `find alias`
+    /// should reach the alias command, not report that nothing matched.
+    Builtin,
 }
 
 impl Kind {
@@ -25,6 +28,7 @@ impl Kind {
             Kind::Prompt => "prompts",
             Kind::Resource => "resources",
             Kind::Template => "templates",
+            Kind::Builtin => "built-ins",
         }
     }
 
@@ -36,6 +40,9 @@ impl Kind {
             Kind::Prompt => 1,
             Kind::Resource => 2,
             Kind::Template => 3,
+            // Last: a search is usually about the server, and the built-ins
+            // are already one `help` away.
+            Kind::Builtin => 4,
         }
     }
 }
@@ -127,6 +134,9 @@ pub fn search(surface: &Surface, query: &str) -> Vec<Hit> {
     for t in &surface.templates {
         let description = t.description.clone().unwrap_or_else(|| t.name.clone());
         push(Kind::Template, &t.uri_template, &description);
+    }
+    for (name, description) in BUILTINS {
+        push(Kind::Builtin, name, description);
     }
 
     hits.sort_by(|a, b| {
@@ -279,7 +289,19 @@ mod tests {
         );
         assert_eq!(names("analyze"), vec!["analyze_crate"]);
         assert_eq!(names("readme"), vec!["crates://serde/readme"]);
-        assert_eq!(names("info"), vec!["crates://{name}/info"]);
+        // `info` is also a built-in now. The exact name match ranks first,
+        // ahead of the template that merely contains the word, which is the
+        // documented ranking rather than a preference for either source.
+        assert_eq!(names("info"), vec!["info", "crates://{name}/info"]);
+    }
+
+    #[test]
+    fn built_ins_are_searchable_too() {
+        let hits = search(&surface(), "alias");
+        let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
+        assert!(names.contains(&"alias"), "{names:?}");
+        assert!(names.contains(&"unalias"), "{names:?}");
+        assert!(hits.iter().all(|h| h.kind == Kind::Builtin));
     }
 
     #[test]

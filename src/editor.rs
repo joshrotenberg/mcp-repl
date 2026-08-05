@@ -18,7 +18,7 @@ use reedline::{
     ColumnarMenu, Completer, DefaultHinter, Emacs, ExternalPrinter, FileBackedHistory, Highlighter,
     KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
-    Suggestion, default_emacs_keybindings,
+    Suggestion, ValidationResult, Validator, default_emacs_keybindings,
 };
 
 use crate::session::Session;
@@ -28,6 +28,25 @@ use crate::style;
 use crate::{BUILTINS, Surface};
 
 const MENU_NAME: &str = "completion_menu";
+
+/// Keeps reading while the line is unfinished.
+///
+/// Without this, pasting a pretty-printed JSON body submits it one line at
+/// a time and the first line fails on a brace the rest of the paste was
+/// about to supply. The tokenizer already knows the difference between
+/// unfinished and wrong, so a mismatched delimiter still errors at once
+/// rather than trapping the editor in a continuation.
+struct ReplValidator;
+
+impl Validator for ReplValidator {
+    fn validate(&self, line: &str) -> ValidationResult {
+        if crate::command::is_incomplete(line) {
+            ValidationResult::Incomplete
+        } else {
+            ValidationResult::Complete
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Prompt
@@ -348,7 +367,19 @@ impl Completer for ReplCompleter {
             }
             for t in &surface.tools {
                 if t.name.starts_with(word) {
-                    out.push(word_suggestion(&t.name, t.description.clone(), span));
+                    // The menu is where an unfamiliar tool is picked, so the
+                    // safety tags belong here as much as in a listing.
+                    let tags = crate::tool_tags(t);
+                    let description = match (t.description.as_deref(), tags.is_empty()) {
+                        (_, false) => Some(format!(
+                            "{}{}[{}]",
+                            t.description.as_deref().unwrap_or(""),
+                            if t.description.is_some() { "  " } else { "" },
+                            tags.join(" ")
+                        )),
+                        (description, true) => description.map(str::to_string),
+                    };
+                    out.push(word_suggestion(&t.name, description, span));
                 }
             }
             return out;
@@ -675,6 +706,7 @@ fn run_interactive(
     );
 
     let mut editor = Reedline::create()
+        .with_validator(Box::new(ReplValidator))
         .with_completer(Box::new(completer))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
