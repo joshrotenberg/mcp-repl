@@ -21,7 +21,7 @@
 //! formatting elsewhere in the file survive.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
 
@@ -272,16 +272,7 @@ fn validate(name: &str, expansion: &str) -> Result<(), String> {
 
 /// Write to `path` through a temporary file in the same directory, so a
 /// failure part-way leaves the existing config intact rather than truncated.
-fn write_atomic(path: &Path, contents: &str) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
-}
+use crate::secure_file::write_atomic;
 
 // ---------------------------------------------------------------------------
 // Config file edits

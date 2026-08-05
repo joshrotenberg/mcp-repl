@@ -135,7 +135,14 @@ impl Config {
     /// allowed not to exist.
     pub fn load(path: &Path, explicit: bool) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
-            Ok(source) => Self::parse(&source).map_err(|e| format!("{}: {e}", path.display())),
+            Ok(source) => {
+                // The file may hold an inline bearer or an Authorization
+                // header. One written before this behavior existed, or by
+                // an older release, is tightened here rather than waiting
+                // for the next write to replace it.
+                crate::secure_file::restrict_existing(path);
+                Self::parse(&source).map_err(|e| format!("{}: {e}", path.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(Self::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }

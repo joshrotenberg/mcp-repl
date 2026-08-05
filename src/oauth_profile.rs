@@ -4,7 +4,7 @@
 //! tokens, refresh tokens, and DCR client secrets are serialized into one
 //! profile record in the operating-system credential store.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -591,16 +591,7 @@ fn edit_config(
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn write_atomic(path: &Path, contents: &str) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, contents)?;
-    std::fs::rename(temporary, path)
-}
+use crate::secure_file::write_atomic;
 
 #[cfg(test)]
 mod tests {

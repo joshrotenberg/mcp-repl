@@ -22,7 +22,7 @@ use tower_mcp::protocol::{
 };
 
 use crate::sampling::{self, SamplingMode};
-use crate::style::{paint, tag};
+use crate::style::{paint, sanitize, tag};
 
 /// Client handler that layers terminal elicitation and sampling on top of
 /// the notification callbacks.
@@ -86,9 +86,12 @@ impl ClientHandler for ReplClientHandler {
                 println!(
                     "{} {}",
                     tag(Style::new().fg(Color::Purple), "elicit"),
-                    url.message
+                    sanitize(&url.message)
                 );
-                println!("  open: {}", paint(Style::new().underline(), &url.url));
+                println!(
+                    "  open: {}",
+                    paint(Style::new().underline(), &sanitize(&url.url))
+                );
                 Ok(ElicitResult {
                     action: ElicitAction::Accept,
                     content: None,
@@ -127,7 +130,7 @@ fn prompt_form(form: &ElicitFormParams) -> ElicitResult {
     println!(
         "{} {}",
         tag(Style::new().fg(Color::Purple), "elicit"),
-        form.message
+        sanitize(&form.message)
     );
     let mut content: HashMap<String, ElicitFieldValue> = HashMap::new();
     let mut names: Vec<&String> = form.requested_schema.properties.keys().collect();
@@ -136,20 +139,29 @@ fn prompt_form(form: &ElicitFormParams) -> ElicitResult {
         let schema = &form.requested_schema.properties[name];
         let required = form.requested_schema.required.iter().any(|r| r == name);
         let (ty, detail, default) = describe_field(schema);
-        let mut prompt_line = format!("  {} ({ty}", paint(Style::new().fg(Color::Cyan), name));
+        // Field names, descriptions, and defaults are all server-authored.
+        let display_name = sanitize(name);
+        let mut prompt_line = format!(
+            "  {} ({}",
+            paint(Style::new().fg(Color::Cyan), &display_name),
+            sanitize(&ty)
+        );
         if required {
             prompt_line.push_str(", required");
         }
         if let Some(d) = &default {
-            prompt_line.push_str(&format!(", default {d}"));
+            prompt_line.push_str(&format!(", default {}", sanitize(d)));
         }
         prompt_line.push(')');
         if let Some(detail) = detail {
-            prompt_line.push_str(&format!(" {}", paint(Style::new().dimmed(), &detail)));
+            prompt_line.push_str(&format!(
+                " {}",
+                paint(Style::new().dimmed(), &sanitize(&detail))
+            ));
         }
         println!("{prompt_line}");
         loop {
-            print!("  {name}> ");
+            print!("  {display_name}> ");
             let _ = std::io::stdout().flush();
             let mut buf = String::new();
             let read = {
