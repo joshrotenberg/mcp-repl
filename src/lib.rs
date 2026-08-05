@@ -75,9 +75,9 @@ use nu_ansi_term::{Color, Style};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tower_mcp::client::{
-    HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder, NotificationHandler,
-    OAuthAuthorizationFlow, OAuthAuthorizationStart, OAuthClientError, OAuthScopeEscalationConfig,
-    StdioClientTransport,
+    ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder,
+    NotificationHandler, OAuthAuthorizationFlow, OAuthAuthorizationStart, OAuthClientError,
+    OAuthScopeEscalationConfig, StdioClientTransport,
 };
 use tower_mcp::protocol::{
     Content, DiscoverResult, Implementation, InitializeResult, LogLevel, PromptDefinition,
@@ -804,7 +804,11 @@ fn client_builder(protocol: ProtocolMode) -> Result<McpClientBuilder, ProtocolSu
     let builder = McpClient::builder()
         .protocol_support(protocol.support()?)
         .with_elicitation()
-        .with_sampling();
+        .with_sampling()
+        // A server only reports progress when the client asks for it, by
+        // carrying a token on the request. Without this the REPL renders
+        // progress lines it can never receive.
+        .request_progress();
     Ok(match protocol {
         ProtocolMode::Stable => builder,
         ProtocolMode::Final => builder.with_tasks(),
@@ -1446,14 +1450,9 @@ fn demo_router() -> tower_mcp::McpRouter {
                         message: "The demo server would like to know who you are.".to_string(),
                         requested_schema: ElicitFormSchema::new()
                             .string_field("username", Some("Any name will do"), true)
-                            // The choices are repeated in the description
-                            // because a client cannot currently see them: the
-                            // protocol types drop an enum field's values on
-                            // the way in (see the elicitation note in
-                            // src/elicit.rs).
                             .enum_field(
                                 "environment",
-                                Some("Which environment: staging or production"),
+                                Some("Which environment to sign in to"),
                                 vec!["staging".to_string(), "production".to_string()],
                                 false,
                             )
@@ -1541,95 +1540,6 @@ struct ConvertInput {
     from: Scale,
     /// The scale to convert it to.
     to: Scale,
-}
-
-/// Serve the demo router in this process, over a pair of in-memory pipes.
-///
-/// The obvious choice, `ChannelTransport`, delivers requests to the router
-/// but wires no client requester, so a tool cannot call back to ask the
-/// operator anything: elicitation and sampling fail with "no client
-/// requester configured". Running the bidirectional stdio transport over
-/// `tokio::io::duplex` instead gives the demo the same full-duplex framing a
-/// spawned server gets, without a child process, a socket, or a firewall
-/// prompt.
-fn demo_transport(protocol: ProtocolMode) -> Result<DemoTransport, ProtocolSupportError> {
-    // One buffer per direction. Large enough that neither side blocks on a
-    // surface listing, small enough to stay a rounding error.
-    let (server_side, client_side) = tokio::io::duplex(256 * 1024);
-    let (server_read, server_write) = tokio::io::split(server_side);
-    let support = protocol.support()?;
-    tokio::spawn(async move {
-        let mut transport = tower_mcp::transport::BidirectionalStdioTransport::new(demo_router())
-            .protocol_support(support);
-        // Ends when the REPL drops its half of the pipe, which is exactly
-        // when the session is over.
-        let _ = transport.run_with_streams(server_read, server_write).await;
-    });
-    Ok(DemoTransport::new(client_side))
-}
-
-/// The client half of [`demo_transport`]: newline-delimited JSON over an
-/// in-memory pipe, which is the same wire format a stdio child speaks.
-struct DemoTransport {
-    reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
-    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
-    open: bool,
-}
-
-impl DemoTransport {
-    fn new(stream: tokio::io::DuplexStream) -> Self {
-        let (read, write) = tokio::io::split(stream);
-        Self {
-            reader: BufReader::new(read),
-            writer: write,
-            open: true,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl tower_mcp::client::ClientTransport for DemoTransport {
-    async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        self.writer
-            .write_all(message.as_bytes())
-            .await
-            .map_err(|e| tower_mcp::Error::Transport(e.to_string()))?;
-        self.writer
-            .write_all(b"\n")
-            .await
-            .map_err(|e| tower_mcp::Error::Transport(e.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| tower_mcp::Error::Transport(e.to_string()))
-    }
-
-    async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line).await {
-            Ok(0) => {
-                self.open = false;
-                Ok(None)
-            }
-            Ok(_) => Ok(Some(line.trim_end().to_string())),
-            Err(e) => {
-                self.open = false;
-                Err(tower_mcp::Error::Transport(e.to_string()))
-            }
-        }
-    }
-
-    fn is_connected(&self) -> bool {
-        self.open
-    }
-
-    async fn close(&mut self) -> tower_mcp::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        self.open = false;
-        let _ = self.writer.shutdown().await;
-        Ok(())
-    }
 }
 
 /// How long the event loop waits after a `list_changed` before refetching.
@@ -2366,10 +2276,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     let client = if args.demo {
         builder
             .connect(
-                TracingTransport::new(
-                    demo_transport(args.protocol)
-                        .map_err(|e| tower_mcp::Error::Transport(e.to_string()))?,
-                ),
+                TracingTransport::new(ChannelTransport::new(demo_router())),
                 make_handler(),
             )
             .await?
@@ -4616,7 +4523,7 @@ mod tests {
     async fn stable_selection_uses_initialize() {
         let client = client_builder(ProtocolMode::Stable)
             .unwrap()
-            .connect_simple(tower_mcp::client::ChannelTransport::new(demo_router()))
+            .connect_simple(ChannelTransport::new(demo_router()))
             .await
             .unwrap();
         let info = establish_connection(&client, ProtocolMode::Stable)
@@ -5183,7 +5090,7 @@ mod tests {
     /// the reconnect path can be exercised without a socket.
     async fn demo_client() -> McpClient {
         let client = McpClient::builder()
-            .connect_simple(tower_mcp::client::ChannelTransport::new(demo_router()))
+            .connect_simple(ChannelTransport::new(demo_router()))
             .await
             .unwrap();
         client.initialize("mcp-repl-test", "0").await.unwrap();

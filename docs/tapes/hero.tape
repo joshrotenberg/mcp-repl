@@ -11,7 +11,7 @@ Output docs/media/hero.gif
 Set Shell bash
 Set FontSize 16
 Set Width 1180
-Set Height 660
+Set Height 720
 Set Padding 14
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 55ms
@@ -53,6 +53,12 @@ Enter
 Sleep 400ms
 Enter
 Sleep 1.4s
+
+# A slow tool reports progress as it goes.
+Type "scan steps=4"
+Sleep 500ms
+Enter
+Sleep 2.6s
 
 # A trailing & runs a task-capable tool in the background; the completion
 # notification arrives on its own.

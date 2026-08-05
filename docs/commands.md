@@ -101,10 +101,21 @@ Automatic transition lines are interactive-only. `--exec` and `--json`
 suppress them for deterministic scripted output; explicit task commands still
 return their normal text or JSON results.
 
-Progress and log notifications print inline as they arrive, and
-`list_changed` notifications refresh the command table mid-session, so
-dynamic servers (see the `dynamic_capabilities` example) grow and shrink the
-REPL's vocabulary live. Stable connections receive those notifications on
+Progress and log notifications print inline as they arrive:
+
+```text
+mcp-repl-demo> scan steps=4
+[progress 25%] scanned 1 of 4
+[progress 50%] scanned 2 of 4
+[progress 75%] scanned 3 of 4
+[progress 100%] scanned 4 of 4
+scanned 4 items
+```
+
+A server only sends progress when the client asks for it, so mcp-repl
+attaches a progress token to every request it issues. `list_changed`
+notifications refresh the command table mid-session, so dynamic servers grow
+and shrink the REPL's vocabulary live. Stable connections receive those notifications on
 their ordinary transport. An interactive final connection opens one
 `subscriptions/listen` stream for tool, prompt, and resource list changes
 after its initial surface fetch, validates the server's acknowledged subset,

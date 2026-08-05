@@ -365,8 +365,10 @@ fn describe_field(schema: &PrimitiveSchemaDefinition) -> (String, Option<String>
         .map(str::to_string);
     let default = raw.get("default").map(render_default);
     // Enum choices are more useful than the word "string": they are the
-    // answer, not the shape of it.
-    if let Some(values) = raw.get("enum").and_then(|e| e.as_array()) {
+    // answer, not the shape of it. A multi-select carries them one level
+    // down, on the schema for each item.
+    let choices = raw.get("enum").or_else(|| raw.pointer("/items/enum"));
+    if let Some(values) = choices.and_then(|e| e.as_array()) {
         let choices: Vec<String> = values.iter().map(render_default).collect();
         let label = match raw.get("type").and_then(|t| t.as_str()) {
             Some("array") => format!("any of {}, comma-separated", choices.join("|")),
@@ -384,16 +386,12 @@ fn describe_field(schema: &PrimitiveSchemaDefinition) -> (String, Option<String>
 
 /// A field schema as plain JSON.
 ///
-/// The typed `PrimitiveSchemaDefinition` cannot be matched on: it is an
-/// untagged union whose first variant is `String`, and a string schema's
-/// `type` field accepts any value, so every field deserializes as `String`
-/// no matter what the server sent. Re-reading the JSON recovers whatever
-/// survived that, which is enough to label and coerce a boolean, integer,
-/// number, or array correctly.
-///
-/// One thing does not survive: an enum field's `enum` values have nowhere to
-/// live on a string schema, so they are dropped before this sees them and
-/// the choices cannot be shown. That needs a fix in the protocol types.
+/// Reading the JSON rather than matching the typed
+/// `PrimitiveSchemaDefinition` variant: the schema is what the server said,
+/// and one shape handles every field kind, including ones the union grows
+/// later. It is also what kept booleans and enums working through
+/// tower-mcp 0.18, where the union was undiscriminated and every field
+/// arrived as `String`.
 fn field_json(schema: &PrimitiveSchemaDefinition) -> serde_json::Value {
     serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({}))
 }
@@ -474,7 +472,13 @@ mod tests {
         assert_eq!(coerced(serde_json::json!({"type": "number"}), "1.5"), 1.5);
         assert_eq!(coerced(serde_json::json!({"type": "boolean"}), "yes"), true);
         assert_eq!(
-            coerced(serde_json::json!({"type": "array"}), "a, b"),
+            coerced(
+                serde_json::json!({
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["a", "b", "c"]},
+                }),
+                "a, b"
+            ),
             serde_json::json!(["a", "b"])
         );
         // Anything that does not parse falls back to the raw text, which the
@@ -483,6 +487,22 @@ mod tests {
             coerced(serde_json::json!({"type": "integer"}), "many"),
             "many"
         );
+    }
+
+    #[test]
+    fn enum_choices_reach_the_prompt() {
+        // The whole point of an enum field: the operator sees the answers.
+        let (label, _, _) = describe_field(&field_from_wire(serde_json::json!({
+            "type": "string",
+            "enum": ["staging", "production"],
+        })));
+        assert_eq!(label, "one of staging|production");
+
+        let (label, _, _) = describe_field(&field_from_wire(serde_json::json!({
+            "type": "array",
+            "items": {"type": "string", "enum": ["read", "write"]},
+        })));
+        assert_eq!(label, "any of read|write, comma-separated");
     }
 
     #[test]
