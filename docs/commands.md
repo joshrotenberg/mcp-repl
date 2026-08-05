@@ -186,7 +186,19 @@ tools:
 alias built-in rather than reporting that the server has nothing by that name.
 `describe <built-in>` explains one the same way `help <built-in>` does.
 
-Matching is case-insensitive. Results rank an exact name match first, then a
+Flags follow grep's, since the exit status already does:
+
+```text
+cratesio> find --tools -m 3 download      # tools only, best three
+cratesio> find --case-sensitive Crate     # stop folding case
+cratesio> find --builtins alias           # the REPL's own commands
+```
+
+`--tools`, `--prompts`, `--resources`, `--templates`, and `--builtins` can be
+combined; several narrow to the union of those kinds. `-m N` (also `-mN`,
+`--max N`, `--max=N`) caps the results after ranking, so the best survive.
+
+Matching is case-insensitive unless `--case-sensitive` says otherwise. Results rank an exact name match first, then a
 name prefix, then a name substring, then a description match, and last a
 subsequence (`gvd` reaches `get_version_downloads`) so a loose match never
 buries a literal one. The search runs against the cached surface, so it

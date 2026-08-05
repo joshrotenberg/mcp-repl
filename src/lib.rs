@@ -505,8 +505,9 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "find",
-        "find <keyword>",
-        "Search names and descriptions across the surface and the built-ins. Exits non-zero when nothing matches, like grep.",
+        "find [-m N] [--case-sensitive] [--tools|--prompts|--resources|--templates|--builtins] <keyword>",
+        "Search names and descriptions across the surface and the built-ins. Kind flags narrow \
+         it, `-m` caps the results, and it exits non-zero when nothing matches, like grep.",
     ),
     (
         "describe",
@@ -930,8 +931,8 @@ fn print_tool_overview(surface: &Surface) {
 /// The `find` built-in's output: matches grouped by kind under the heading
 /// of the list command that shows the same entries, best match first within
 /// each group.
-fn print_find(surface: &Surface, query: &str, output: &vars::Output) {
-    let hits = find::search(surface, query);
+fn print_find(surface: &Surface, query: &find::Query, output: &vars::Output) {
+    let hits = find::search_query(surface, query);
     if !output.is_plain() || json_output() {
         let v: Vec<serde_json::Value> = hits
             .iter()
@@ -957,7 +958,7 @@ fn print_find(surface: &Surface, query: &str, output: &vars::Output) {
     if hits.is_empty() {
         // grep's convention: a search that matched nothing exits non-zero, so
         // `mcp-repl -e "find x"` can be tested in a script.
-        report_error(ExitStatus::NoMatch, &format!("no match for {query}"));
+        report_error(ExitStatus::NoMatch, &format!("no match for {}", query.text));
         return;
     }
     let total = hits.len();
@@ -2829,7 +2830,7 @@ async fn handle_line(
             }
             println!("built-ins:");
             println!("  tools | prompts | resources | templates   list the server surface");
-            println!("  find <keyword>                            search the surface");
+            println!("  find [flags] <keyword>                    search the surface");
             println!("  describe <name>                           schemas and metadata");
             println!("  snapshot <name> [path]                    export a schema contract");
             println!("  validate <path> [mode]                    check a schema contract");
@@ -2978,14 +2979,15 @@ async fn handle_line(
             }
         }
         "find" => {
-            // Everything after the command word is the query, so a phrase
+            // Everything that is not a flag is the query, so a phrase
             // (`find crate info`) is not silently truncated to its first word.
-            let query = rest.join(" ");
-            if query.is_empty() {
-                command_error("usage: find <keyword>");
-                return false;
+            match find::parse_query(rest) {
+                Ok(query) => print_find(&surface.read().unwrap(), &query, &output),
+                Err(message) => {
+                    command_error(&message);
+                    return false;
+                }
             }
-            print_find(&surface.read().unwrap(), &query, &output);
         }
         "describe" => {
             let Some(name) = rest.first() else {

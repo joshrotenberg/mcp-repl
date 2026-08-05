@@ -432,6 +432,22 @@ impl Completer for ReplCompleter {
         }
 
         match first {
+            // `find` has its own flags; offer them once a dash is typed.
+            "find" if word.starts_with('-') => {
+                for (flag, description) in [
+                    ("-m", "cap the number of results"),
+                    ("--case-sensitive", "do not fold case"),
+                    ("--tools", "search tools only"),
+                    ("--prompts", "search prompts only"),
+                    ("--resources", "search resources only"),
+                    ("--templates", "search resource templates only"),
+                    ("--builtins", "search the REPL's own commands only"),
+                ] {
+                    if flag.starts_with(word) {
+                        out.push(word_suggestion(flag, Some(description.to_string()), span));
+                    }
+                }
+            }
             "read" | "subscribe" => {
                 out.extend(self.complete_resource_word(&surface, word, span));
             }

@@ -65,9 +65,10 @@ pub struct Hit {
 /// The ladder is deliberately coarse: an exact or prefix name match outranks
 /// anything found only in prose, and a subsequence match (`gvd` for
 /// `get_version_downloads`) is last so it never buries a literal one.
-fn score(query: &str, name: &str, description: &str) -> Option<u32> {
-    let name = name.to_lowercase();
-    let description = description.to_lowercase();
+/// The ranking itself, over strings already folded (or deliberately not) by
+/// the caller: exact name, then prefix, then substring, then description,
+/// then subsequence, so a loose match never outranks a literal one.
+fn score_prepared(query: &str, name: &str, description: &str) -> Option<u32> {
     if name == query {
         return Some(100);
     }
@@ -80,7 +81,7 @@ fn score(query: &str, name: &str, description: &str) -> Option<u32> {
     if description.contains(query) {
         return Some(40);
     }
-    if is_subsequence(query, &name) {
+    if is_subsequence(query, name) {
         return Some(20);
     }
     None
@@ -95,17 +96,127 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
     needle.chars().all(|c| chars.any(|h| h == c))
 }
 
+/// A parsed `find` invocation.
+///
+/// The flags follow grep's, since `find` already follows its exit-status
+/// convention: `-m` caps results, `--case-sensitive` stops folding case, and
+/// a kind flag narrows which lists are searched.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Query {
+    /// The words to search for, joined, so `find crate info` is one phrase.
+    pub text: String,
+    /// Cap on results, applied after ranking so the best survive.
+    pub limit: Option<usize>,
+    /// Fold case (the default) or match exactly.
+    pub case_sensitive: bool,
+    /// Which lists to search. Empty means all of them.
+    pub kinds: Vec<Kind>,
+}
+
+/// Parse `find [flags] <words...>`.
+pub fn parse_query(tokens: &[&str]) -> Result<Query, String> {
+    let mut text: Vec<String> = Vec::new();
+    let mut limit = None;
+    let mut case_sensitive = false;
+    let mut kinds: Vec<Kind> = Vec::new();
+    let mut rest = tokens.iter().copied();
+
+    while let Some(token) = rest.next() {
+        match token {
+            "--tools" => kinds.push(Kind::Tool),
+            "--prompts" => kinds.push(Kind::Prompt),
+            "--resources" => kinds.push(Kind::Resource),
+            "--templates" => kinds.push(Kind::Template),
+            "--builtins" => kinds.push(Kind::Builtin),
+            "--case-sensitive" => case_sensitive = true,
+            "-m" | "--max" => {
+                let raw = rest
+                    .next()
+                    .ok_or_else(|| format!("{token} needs a count"))?;
+                limit = Some(parse_limit(token, raw)?);
+            }
+            _ => {
+                if let Some(raw) = token.strip_prefix("--max=") {
+                    limit = Some(parse_limit("--max", raw)?);
+                } else if let Some(raw) = token.strip_prefix("-m") {
+                    // `-m5`, the way grep also accepts it.
+                    limit = Some(parse_limit("-m", raw)?);
+                } else if token.starts_with('-') && token.len() > 1 {
+                    return Err(format!(
+                        "unknown option `{token}` (find takes -m/--max, --case-sensitive, \
+                         and --tools/--prompts/--resources/--templates/--builtins)"
+                    ));
+                } else {
+                    text.push(token.to_string());
+                }
+            }
+        }
+    }
+
+    let text = text.join(" ");
+    if text.is_empty() {
+        return Err("usage: find [-m N] [--case-sensitive] [--tools|...] <keyword>".to_string());
+    }
+    kinds.sort_by_key(|kind| kind.order());
+    kinds.dedup();
+    Ok(Query {
+        text,
+        limit,
+        case_sensitive,
+        kinds,
+    })
+}
+
+fn parse_limit(flag: &str, raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err(format!("{flag} must be at least 1")),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("{flag} expects a number, got `{raw}`")),
+    }
+}
+
+/// Every entry of the surface matching the parsed query, best first.
+pub fn search_query(surface: &Surface, query: &Query) -> Vec<Hit> {
+    let mut hits = search_filtered(surface, &query.text, query.case_sensitive, &query.kinds);
+    if let Some(limit) = query.limit {
+        hits.truncate(limit);
+    }
+    hits
+}
+
 /// Every entry of the surface matching `query`, best first.
 ///
 /// Case-insensitive across tool, prompt, resource, and template names and
 /// descriptions. Ties break on name so repeated searches print in a stable
 /// order.
-pub fn search(surface: &Surface, query: &str) -> Vec<Hit> {
-    let query = query.to_lowercase();
+/// The search `find` actually runs: case folding and kind filtering are
+/// options rather than fixed behaviour.
+fn search_filtered(
+    surface: &Surface,
+    query: &str,
+    case_sensitive: bool,
+    kinds: &[Kind],
+) -> Vec<Hit> {
+    // Folding both sides is what makes the match case-insensitive; keeping
+    // both as typed is what makes it exact.
+    let query = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+    let wanted = |kind: Kind| kinds.is_empty() || kinds.contains(&kind);
     let mut hits = Vec::new();
 
     let mut push = |kind: Kind, name: &str, description: &str| {
-        if let Some(score) = score(&query, name, description) {
+        if !wanted(kind) {
+            return;
+        }
+        let (name_key, description_key) = if case_sensitive {
+            (name.to_string(), description.to_string())
+        } else {
+            (name.to_lowercase(), description.to_lowercase())
+        };
+        if let Some(score) = score_prepared(&query, &name_key, &description_key) {
             hits.push(Hit {
                 kind,
                 name: name.to_string(),
@@ -271,6 +382,86 @@ mod tests {
                 .unwrap(),
             ],
         }
+    }
+
+    /// A plain search, the way `find` runs one with no flags.
+    fn search(surface: &Surface, query: &str) -> Vec<Hit> {
+        search_filtered(surface, query, false, &[])
+    }
+
+    fn q(tokens: &[&str]) -> Query {
+        parse_query(tokens).expect("parses")
+    }
+
+    #[test]
+    fn flags_are_separated_from_the_query() {
+        let parsed = q(&["-m", "5", "--tools", "--case-sensitive", "crate", "info"]);
+        // Non-flag words stay a phrase, in order.
+        assert_eq!(parsed.text, "crate info");
+        assert_eq!(parsed.limit, Some(5));
+        assert!(parsed.case_sensitive);
+        assert_eq!(parsed.kinds, vec![Kind::Tool]);
+    }
+
+    #[test]
+    fn a_limit_is_accepted_the_ways_grep_accepts_it() {
+        assert_eq!(q(&["-m", "3", "x"]).limit, Some(3));
+        assert_eq!(q(&["-m3", "x"]).limit, Some(3));
+        assert_eq!(q(&["--max", "3", "x"]).limit, Some(3));
+        assert_eq!(q(&["--max=3", "x"]).limit, Some(3));
+        assert_eq!(q(&["x"]).limit, None);
+    }
+
+    #[test]
+    fn a_malformed_invocation_says_what_is_wrong() {
+        for bad in [
+            vec!["-m"],
+            vec!["-m", "zero", "x"],
+            vec!["-m", "0", "x"],
+            vec!["--nope", "x"],
+            vec!["--tools"],
+        ] {
+            assert!(parse_query(&bad).is_err(), "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn kind_filters_narrow_the_search() {
+        let s = surface();
+        // `info` names a built-in and appears in a template URI.
+        let all = search_query(&s, &q(&["info"]));
+        assert!(all.iter().any(|h| h.kind == Kind::Builtin));
+        assert!(all.iter().any(|h| h.kind == Kind::Template));
+
+        let templates_only = search_query(&s, &q(&["--templates", "info"]));
+        assert!(!templates_only.is_empty());
+        assert!(templates_only.iter().all(|h| h.kind == Kind::Template));
+
+        // Several filters union rather than intersect.
+        let two = search_query(&s, &q(&["--templates", "--builtins", "info"]));
+        assert!(two.len() > templates_only.len());
+    }
+
+    #[test]
+    fn a_limit_keeps_the_best_matches() {
+        let s = surface();
+        let all = search_query(&s, &q(&["download"]));
+        assert!(all.len() >= 2, "fixture should match more than one");
+        let capped = search_query(&s, &q(&["-m", "1", "download"]));
+        assert_eq!(capped.len(), 1);
+        // The cap applies after ranking, so the survivor is the best one.
+        assert_eq!(capped[0].name, all[0].name);
+    }
+
+    #[test]
+    fn case_sensitivity_is_opt_in() {
+        let s = surface();
+        assert!(!search_query(&s, &q(&["GET_DOWNLOADS"])).is_empty());
+        assert!(
+            search_query(&s, &q(&["--case-sensitive", "GET_DOWNLOADS"])).is_empty(),
+            "an exact-case search must not fold"
+        );
+        assert!(!search_query(&s, &q(&["--case-sensitive", "get_downloads"])).is_empty());
     }
 
     #[test]
