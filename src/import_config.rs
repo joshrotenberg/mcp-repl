@@ -77,6 +77,147 @@ pub fn load_with(
     })
 }
 
+/// Where MCP clients keep their server lists.
+///
+/// Project files first, since a scan is usually run inside a repository and
+/// that is the config the user means. Paths that do not exist are dropped by
+/// [`scan`], so this can list every location worth trying.
+pub fn candidate_paths(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = vec![
+        cwd.join(".mcp.json"),
+        cwd.join(".vscode").join("mcp.json"),
+        cwd.join(".cursor").join("mcp.json"),
+    ];
+    let Some(home) = home else {
+        return paths;
+    };
+    paths.push(home.join(".claude.json"));
+    paths.push(home.join(".cursor").join("mcp.json"));
+    // Claude Desktop, per platform.
+    #[cfg(target_os = "macos")]
+    paths.push(
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude_desktop_config.json"),
+    );
+    #[cfg(target_os = "linux")]
+    paths.push(
+        home.join(".config")
+            .join("Claude")
+            .join("claude_desktop_config.json"),
+    );
+    #[cfg(target_os = "windows")]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        paths.push(
+            PathBuf::from(appdata)
+                .join("Claude")
+                .join("claude_desktop_config.json"),
+        );
+    }
+    paths
+}
+
+/// What one config file yielded.
+#[derive(Debug)]
+pub struct ScannedFile {
+    pub path: PathBuf,
+    /// The entries, or why the file could not be read. A malformed file is
+    /// reported rather than skipped: silence would read as "nothing here".
+    pub result: Result<Vec<DiscoveredEntry>, String>,
+}
+
+/// Describe every config that exists among `paths`.
+///
+/// Files that are absent are skipped; files that exist but cannot be parsed
+/// are included with their error.
+pub fn scan(paths: &[PathBuf]) -> Vec<ScannedFile> {
+    paths
+        .iter()
+        .filter(|path| path.is_file())
+        .map(|path| ScannedFile {
+            path: path.clone(),
+            result: list_entries(path),
+        })
+        .collect()
+}
+
+/// One entry found in a client config, described without being resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredEntry {
+    /// The name to put after the colon in a `PATH:ENTRY` selector.
+    pub name: String,
+    /// `stdio` or `http`, or `?` when the entry declares neither.
+    pub transport: String,
+    /// The command line or URL, as written in the file.
+    pub summary: String,
+}
+
+/// List what a config file offers, without resolving it.
+///
+/// Deliberately not [`load_with`]: resolution expands `${env:NAME}` and fails
+/// on a variable that is not set, which would make a scan of somebody else's
+/// config report errors for entries that are perfectly fine to use once the
+/// variable is exported. Placeholders are shown as written.
+///
+/// Nothing here executes anything: it reads a file and describes it.
+pub fn list_entries(path: &Path) -> Result<Vec<DiscoveredEntry>, String> {
+    let source = std::fs::read_to_string(path).map_err(|error| plain_io_error(&error))?;
+    let document: Document =
+        serde_json::from_str(&source).map_err(|error| format!("not valid JSON: {error}"))?;
+    let mut found: Vec<DiscoveredEntry> = document
+        .mcp_servers
+        .iter()
+        .chain(document.servers.iter())
+        .map(|(name, entry)| DiscoveredEntry {
+            name: name.clone(),
+            transport: entry.declared_transport().to_string(),
+            summary: entry.summary(),
+        })
+        .collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found.dedup_by(|a, b| a.name == b.name);
+    Ok(found)
+}
+
+/// An io error without the path repeated: the caller already prints it.
+fn plain_io_error(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "no such file".to_string(),
+        std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+        _ => error.to_string(),
+    }
+}
+
+impl Entry {
+    /// What the entry says it is, before any validation.
+    fn declared_transport(&self) -> &'static str {
+        let declared = self.kind.as_deref().or(self.transport.as_deref());
+        match declared {
+            Some(kind) if kind.eq_ignore_ascii_case("stdio") => "stdio",
+            Some(_) => "http",
+            None if self.command.is_some() => "stdio",
+            None if self.url.is_some() => "http",
+            None => "?",
+        }
+    }
+
+    /// The command line or URL as written, for a scan listing.
+    fn summary(&self) -> String {
+        if let Some(command) = &self.command {
+            let mut line = command.clone();
+            for arg in &self.args {
+                line.push(' ');
+                line.push_str(arg);
+            }
+            return line;
+        }
+        self.url
+            .clone()
+            .unwrap_or_else(|| "(no command or url)".to_string())
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct Document {
     #[serde(default, rename = "mcpServers")]
@@ -333,6 +474,111 @@ fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn listing_describes_both_roots_and_both_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            ".mcp.json",
+            r#"{
+                "mcpServers": {
+                    "local": {"command": "node", "args": ["server.js", "--stdio"]}
+                },
+                "servers": {
+                    "remote": {"type": "http", "url": "https://example.com/mcp"}
+                }
+            }"#,
+        );
+        let entries = list_entries(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "local");
+        assert_eq!(entries[0].transport, "stdio");
+        assert_eq!(entries[0].summary, "node server.js --stdio");
+        assert_eq!(entries[1].name, "remote");
+        assert_eq!(entries[1].transport, "http");
+        assert_eq!(entries[1].summary, "https://example.com/mcp");
+    }
+
+    #[test]
+    fn listing_does_not_resolve_placeholders() {
+        // Resolution fails on a variable that is not set. A scan of someone
+        // else's config must still describe the entry, since exporting the
+        // variable is all that is needed to use it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            ".mcp.json",
+            r#"{"mcpServers": {"x": {"url": "${env:NEVER_SET_ANYWHERE}"}}}"#,
+        );
+        let entries = list_entries(&path).unwrap();
+        assert_eq!(entries[0].summary, "${env:NEVER_SET_ANYWHERE}");
+        // The resolving path is the one that objects.
+        assert!(
+            load_with(
+                Selector {
+                    path,
+                    entry: "x".to_string()
+                },
+                |_| None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_malformed_file_reports_rather_than_disappearing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), ".mcp.json", "not json {{{");
+        let error = list_entries(&path).unwrap_err();
+        assert!(error.contains("not valid JSON"), "{error}");
+
+        // And a scan includes it, so a broken config is visible instead of
+        // looking like an empty one.
+        let scanned = scan(std::slice::from_ref(&path));
+        assert_eq!(scanned.len(), 1);
+        assert!(scanned[0].result.is_err());
+    }
+
+    #[test]
+    fn scanning_skips_paths_that_do_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = write(
+            dir.path(),
+            ".mcp.json",
+            r#"{"mcpServers":{"a":{"url":"http://x"}}}"#,
+        );
+        let scanned = scan(&[dir.path().join("absent.json"), real]);
+        assert_eq!(scanned.len(), 1, "a missing file is not an error to report");
+    }
+
+    #[test]
+    fn candidates_cover_the_project_files_and_the_home_ones() {
+        let cwd = std::path::Path::new("/work/api");
+        let home = std::path::Path::new("/home/dev");
+        let paths = candidate_paths(cwd, Some(home));
+        for expected in [
+            cwd.join(".mcp.json"),
+            cwd.join(".vscode").join("mcp.json"),
+            cwd.join(".cursor").join("mcp.json"),
+            home.join(".claude.json"),
+        ] {
+            assert!(paths.contains(&expected), "missing {}", expected.display());
+        }
+        // Project files come first: a scan run in a repo means that repo.
+        assert!(paths[0].starts_with(cwd));
+        // Without a home directory it still offers the project files.
+        assert_eq!(candidate_paths(cwd, None).len(), 3);
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let values: BTreeMap<String, String> = pairs

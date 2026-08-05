@@ -42,6 +42,7 @@ its own:
 ```bash
 mcp-repl --http https://cratesio-mcp.fly.dev/   # a public server to try
 mcp-repl -- ./my-server --stdio                 # spawn a stdio server
+mcp-repl --scan                                 # what other clients have configured
 mcp-repl .mcp.json:local                        # one entry from a client config
 mcp-repl --server prod                          # a saved profile
 ```

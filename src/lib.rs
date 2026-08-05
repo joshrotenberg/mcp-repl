@@ -177,6 +177,14 @@ struct Args {
     #[arg(long)]
     list_servers: bool,
 
+    /// Print the servers other MCP clients have configured, as selectors you
+    /// can pass straight back, and exit.
+    ///
+    /// Reads the well-known config files and describes them. It connects to
+    /// nothing and runs nothing.
+    #[arg(long)]
+    scan: bool,
+
     /// Print a shell completion script for mcp-repl's own flags and exit.
     ///
     /// The REPL completes a server's surface from the moment it connects;
@@ -2091,6 +2099,108 @@ fn print_man() {
     }
 }
 
+/// `--scan`: what other MCP clients have configured, as selectors.
+///
+/// Discovery on purpose stops at describing. Automatic connection would make
+/// the source of a session invisible, which is the reason `PATH:ENTRY` is
+/// explicit in the first place; this just saves typing the path.
+fn print_scan() -> ExitStatus {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let paths = import_config::candidate_paths(&cwd, home.as_deref());
+    let scanned = import_config::scan(&paths);
+
+    if json_output() {
+        let files: Vec<serde_json::Value> = scanned
+            .iter()
+            .map(|file| match &file.result {
+                Ok(entries) => serde_json::json!({
+                    "path": file.path.display().to_string(),
+                    "entries": entries.iter().map(|entry| serde_json::json!({
+                        "entry": entry.name,
+                        "selector": format!("{}:{}", file.path.display(), entry.name),
+                        "transport": entry.transport,
+                        "summary": entry.summary,
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(error) => serde_json::json!({
+                    "path": file.path.display().to_string(),
+                    "error": error,
+                }),
+            })
+            .collect();
+        let found = scanned
+            .iter()
+            .filter_map(|file| file.result.as_ref().ok())
+            .map(Vec::len)
+            .sum::<usize>();
+        print_json(&serde_json::Value::Array(files));
+        return no_match_when_empty(found);
+    }
+
+    if scanned.is_empty() {
+        // grep's convention, so a script can test for "nothing configured".
+        report_error(
+            ExitStatus::NoMatch,
+            "no MCP client configs found (looked for .mcp.json, .vscode/mcp.json, \
+             .cursor/mcp.json, and the Claude configs under your home directory)",
+        );
+        return ExitStatus::NoMatch;
+    }
+
+    let mut total = 0usize;
+    for file in &scanned {
+        println!(
+            "{}",
+            paint(Style::new().bold(), &file.path.display().to_string())
+        );
+        match &file.result {
+            // A file that cannot be read is reported but does not decide the
+            // status: what the caller asked is whether anything was found.
+            Err(error) => println!("  {} {}", style::error_prefix(), sanitize(error)),
+            Ok(entries) if entries.is_empty() => {
+                println!("  {}", paint(Style::new().dimmed(), "(no servers)"));
+            }
+            Ok(entries) => {
+                let width = entries.iter().map(|e| e.name.len()).max().unwrap_or(0);
+                for entry in entries {
+                    total += 1;
+                    println!(
+                        "  {}  {} {}",
+                        style::column(Style::new().fg(Color::Green), &sanitize(&entry.name), width),
+                        paint(Style::new().dimmed(), &format!("{:>5}", entry.transport)),
+                        sanitize(&entry.summary)
+                    );
+                }
+            }
+        }
+    }
+    if total > 0 {
+        println!(
+            "{}",
+            paint(
+                Style::new().dimmed(),
+                &format!(
+                    "{} in {}. Connect with `mcp-repl <path>:<entry>`.",
+                    plural(total, "server"),
+                    plural(scanned.len(), "file")
+                )
+            )
+        );
+    }
+    no_match_when_empty(total)
+}
+
+/// Nothing found is a no-match, the way `find` reports one, so a script can
+/// branch on it.
+fn no_match_when_empty(found: usize) -> ExitStatus {
+    if found == 0 {
+        ExitStatus::NoMatch
+    } else {
+        ExitStatus::Success
+    }
+}
+
 /// `--list-servers`: the configured profiles, one per line.
 fn print_servers(config: &config::Config) {
     if config.servers.is_empty() {
@@ -2229,6 +2339,9 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     if args.list_servers {
         print_servers(&profiles);
         return Ok(());
+    }
+    if args.scan {
+        std::process::exit(print_scan().code());
     }
     let schema_contracts =
         schema_contract::ContractSet::load(&args.schema_contracts, args.schema_mode)
