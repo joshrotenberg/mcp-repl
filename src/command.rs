@@ -246,6 +246,52 @@ mod tests {
         );
     }
 
+    /// The splitter, over the shapes a `key=value` argument actually takes.
+    ///
+    /// Table-driven because the failure mode is silent: a value split at a
+    /// space still produces a valid call, and the mistake surfaces later as a
+    /// confusing result rather than an error (#48).
+    #[test]
+    fn quoted_values_survive_splitting() {
+        let cases: &[(&str, &[&str])] = &[
+            // Bare values, the easy case.
+            ("tool a=plain", &["tool", "a=plain"]),
+            ("tool a=1 b=2", &["tool", "a=1", "b=2"]),
+            // Double quotes group spaces and are removed.
+            (r#"tool a="two words""#, &["tool", "a=two words"]),
+            (
+                r#"tool a="two words" b=single"#,
+                &["tool", "a=two words", "b=single"],
+            ),
+            // Single quotes do the same, and take double quotes literally.
+            ("tool a='two words'", &["tool", "a=two words"]),
+            (r#"tool a='say "hi"'"#, &["tool", r#"a=say "hi""#]),
+            // Escapes: a quote inside double quotes, and a bare space.
+            (r#"tool a="say \"hi\"""#, &["tool", r#"a=say "hi""#]),
+            (r"tool a=two\ words", &["tool", "a=two words"]),
+            // An empty value is a value, not an absent argument.
+            (r#"tool a="""#, &["tool", "a="]),
+            // Whitespace inside quotes is part of the value.
+            (r#"tool a="  padded  ""#, &["tool", "a=  padded  "]),
+            // Characters the splitter must not treat as syntax.
+            (r#"tool a="k=v""#, &["tool", "a=k=v"]),
+            (r#"tool a="trailing &""#, &["tool", "a=trailing &"]),
+            (r#"tool a="a | b""#, &["tool", "a=a | b"]),
+            // Quotes opening mid-value, not right after `=`.
+            (r#"tool a=pre"quoted tail""#, &["tool", "a=prequoted tail"]),
+            // Several quoted arguments in one line.
+            (
+                r#"tool a="one two" b="three four""#,
+                &["tool", "a=one two", "b=three four"],
+            ),
+        ];
+        for (line, expected) in cases {
+            let parsed = parse(line).unwrap_or_else(|e| panic!("{line:?} failed to parse: {e}"));
+            assert_eq!(parsed.words, *expected, "{line:?}");
+            assert!(!parsed.background, "{line:?} is not a background call");
+        }
+    }
+
     #[test]
     fn quotes_group_whitespace_and_are_removed() {
         let parsed = parse(r#"tool a="hello world" b='single value'"#).unwrap();

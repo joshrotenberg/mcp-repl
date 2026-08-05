@@ -5018,6 +5018,69 @@ mod tests {
         assert_eq!(example_invocation("about", &schema), "about");
     }
 
+    /// The whole `key=value` path, from typed line to the JSON the server
+    /// receives.
+    ///
+    /// The splitter is tested separately; this covers the part that made #48
+    /// worth filing, where a mis-split value still produces a valid call and
+    /// the mistake only shows up in the result.
+    #[test]
+    fn quoted_arguments_reach_the_server_intact() {
+        // A schema with the shapes coercion actually branches on.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mission": {"type": "string"},
+                "count": {"type": "integer"},
+                "flag": {"type": "boolean"},
+                "untyped": {},
+            },
+        });
+        let arguments = |line: &str| -> serde_json::Value {
+            let parsed = command::parse(line).expect("parses");
+            let tokens: Vec<&str> = parsed.words[1..].iter().map(String::as_str).collect();
+            parse_kv_args(&schema, &tokens)
+        };
+
+        assert_eq!(
+            arguments(r#"tool mission="two words" count=2"#),
+            serde_json::json!({"mission": "two words", "count": 2})
+        );
+        assert_eq!(
+            arguments("tool mission='two words'"),
+            serde_json::json!({"mission": "two words"})
+        );
+        assert_eq!(
+            arguments(r"tool mission=two\ words"),
+            serde_json::json!({"mission": "two words"})
+        );
+        assert_eq!(
+            arguments(r#"tool mission="say \"hi\"""#),
+            serde_json::json!({"mission": "say \"hi\""})
+        );
+        // An empty value is sent, not dropped.
+        assert_eq!(
+            arguments(r#"tool mission="""#),
+            serde_json::json!({"mission": ""})
+        );
+        // A quoted value that looks like another argument stays one value.
+        assert_eq!(
+            arguments(r#"tool mission="count=9""#),
+            serde_json::json!({"mission": "count=9"})
+        );
+        // Typed coercion still applies to the value the quotes produced.
+        assert_eq!(
+            arguments(r#"tool count="7" flag="true""#),
+            serde_json::json!({"count": 7, "flag": true})
+        );
+        // An untyped property takes a JSON literal, and quoted text that is
+        // not JSON stays a string.
+        assert_eq!(
+            arguments(r#"tool untyped="two words""#),
+            serde_json::json!({"untyped": "two words"})
+        );
+    }
+
     #[test]
     fn counted_nouns_agree_with_their_number() {
         assert_eq!(plural(0, "tool"), "0 tools");
