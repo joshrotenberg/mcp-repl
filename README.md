@@ -747,20 +747,23 @@ or a file acknowledgement; `validate` returns its compatibility report; and
 `help`, `bench`, `jobs`, aliases, `wire`, `last`, `refresh`, `info`, `vars`,
 `unset`, and `quit` return objects.
 
-JSON errors also stay on stdout so they occupy that command's one output line:
+JSON errors stay on stdout so they occupy that command's one output line:
 
 ```json
 {"error":"unknown command: nope","kind":"usage","exitStatus":2}
 ```
 
-Diagnostics explaining the failure may still appear on stderr. Human mode
-keeps readable text output. Process statuses are stable:
+In human mode errors go to **stderr**, because stdout is the data stream:
+`mcp-repl -e "get_thing" > out.txt` captures the result or nothing, never the
+text explaining why there is no result. Every failure carries the same `error:`
+prefix, whichever command produced it, and adds `did you mean ...` when a near
+name exists. Process statuses are stable:
 
 | Status | Meaning |
 | ---: | --- |
 | 0 | success |
-| 1 | no-match/check-style result (for example, `find` found nothing) |
-| 2 | local invocation or command usage error |
+| 1 | no-match: the command ran and the thing asked about is not there (`find` matched nothing, `describe`/`bench` named something absent) |
+| 2 | local invocation or command usage error, including an unrecognized command word |
 | 3 | server rejection or tool error result |
 | 4 | transport or protocol connection failure (including a `--timeout`) |
 | 5 | authentication or authorization failure |
@@ -797,7 +800,27 @@ mcp-repl -e "x = search_crates query=serde" \
          -e "get_crate_info name=\$x.crates[0].name" <server>
 ```
 
-Capture and filtering currently act on tool-call results.
+Capture and filtering act on tool calls and on the built-ins that return a
+documented value: `tools`, `prompts`, `resources`, `templates`, `describe`,
+`read`, `find`, and `info`.
+
+```text
+demo> t = tools
+$t = [3 items]
+demo> tools | [0].name
+about
+```
+
+A command that reports rather than returning a value (`help`, `alias`,
+`wire`, `refresh`, ...) refuses the request instead of ignoring it:
+
+```text
+demo> x = help
+error: cannot capture the result of `help`: it reports rather than returning a value.
+```
+
+That matters most in an `-e` chain, where a silently dropped capture would
+surface much later as an undefined `$name`.
 
 ## Related tools
 

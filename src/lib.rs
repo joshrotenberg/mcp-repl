@@ -285,6 +285,10 @@ fn json_output() -> bool {
     JSON_OUTPUT.load(Ordering::Relaxed)
 }
 
+/// Whether any user command has been dispatched. Only `last` cares: before
+/// the first one, the newest recorded frame is the REPL's own startup fetch.
+static COMMAND_RAN: AtomicBool = AtomicBool::new(false);
+
 /// `--timeout` in seconds; 0 means wait indefinitely.
 static REQUEST_TIMEOUT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -341,15 +345,40 @@ fn error_json(status: ExitStatus, message: &str) -> serde_json::Value {
     })
 }
 
+/// Report a failed command.
+///
+/// Every failure goes through here, so the prefix, the stream, and the
+/// recorded status agree no matter which command produced it.
+///
+/// Under `--json` the envelope is the command's one value and belongs on
+/// stdout, which is the documented NDJSON contract. In human mode stdout is
+/// the data stream: `mcp-repl -e get_thing > out.txt` should capture the
+/// result or nothing, never the words explaining why there is no result.
 fn report_error(status: ExitStatus, message: &str) {
+    report_error_with_hint(status, message, None);
+}
+
+/// A failure plus a suggestion of what to type instead.
+fn report_error_with_hint(status: ExitStatus, message: &str, hint: Option<&str>) {
     note_error(status);
     if json_output() {
-        print_json(&error_json(status, message));
-    } else {
-        // Server-originated errors are echoed here; keep their bytes
-        // from reprogramming the terminal.
-        println!("{}: {}", style::error_prefix(), sanitize(message));
+        let mut value = error_json(status, message);
+        if let Some(hint) = hint {
+            value["didYouMean"] = serde_json::json!(hint);
+        }
+        print_json(&value);
+        return;
     }
+    // Server-originated text reaches here; keep its bytes from
+    // reprogramming the terminal.
+    let mut line = format!("{}: {}", style::error_prefix(), sanitize(message));
+    if let Some(hint) = hint {
+        line.push_str(&format!(
+            "; did you mean `{}`?",
+            paint(Style::new().fg(Color::Green), &sanitize(hint))
+        ));
+    }
+    eprintln!("{line}");
 }
 
 fn report_mcp_error(error: &tower_mcp::Error) {
@@ -636,8 +665,8 @@ fn print_tool_overview(surface: &Surface) {
     }
     for t in surface.tools.iter().take(CAP) {
         println!(
-            "{:24} {}",
-            paint(Style::new().fg(Color::Green), &sanitize(&t.name)),
+            "{} {}",
+            style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
             sanitize(t.description.as_deref().unwrap_or(""))
         );
     }
@@ -655,9 +684,9 @@ fn print_tool_overview(surface: &Surface) {
 /// The `find` built-in's output: matches grouped by kind under the heading
 /// of the list command that shows the same entries, best match first within
 /// each group.
-fn print_find(surface: &Surface, query: &str) {
+fn print_find(surface: &Surface, query: &str, output: &vars::Output) {
     let hits = find::search(surface, query);
-    if json_output() {
+    if !output.is_plain() || json_output() {
         let v: Vec<serde_json::Value> = hits
             .iter()
             .map(|h| {
@@ -669,17 +698,20 @@ fn print_find(surface: &Surface, query: &str) {
                 })
             })
             .collect();
+        // An empty result is still a result: grep-style, it exits non-zero
+        // but the value is a well-formed empty array.
         if v.is_empty() {
             note_error(ExitStatus::NoMatch);
         }
-        print_json(&serde_json::Value::Array(v));
+        emit_value(serde_json::Value::Array(v), output, || {
+            unreachable!("plain output handled below")
+        });
         return;
     }
     if hits.is_empty() {
         // grep's convention: a search that matched nothing exits non-zero, so
         // `mcp-repl -e "find x"` can be tested in a script.
-        note_error(ExitStatus::NoMatch);
-        println!("no match for {}", paint(Style::new().fg(Color::Red), query));
+        report_error(ExitStatus::NoMatch, &format!("no match for {query}"));
         return;
     }
     let total = hits.len();
@@ -687,8 +719,8 @@ fn print_find(surface: &Surface, query: &str) {
         println!("{}:", paint(Style::new().bold(), kind.heading()));
         for hit in group {
             println!(
-                "  {:24} {}",
-                paint(Style::new().fg(Color::Green), &sanitize(&hit.name)),
+                "  {} {}",
+                style::column(Style::new().fg(Color::Green), &sanitize(&hit.name), 24),
                 sanitize(&hit.description)
             );
         }
@@ -705,12 +737,21 @@ fn print_find(surface: &Surface, query: &str) {
 /// The one-line surface summary.
 fn print_counts(surface: &Surface) {
     println!(
-        "{} tools, {} prompts, {} resources, {} templates. Type `help`.",
-        surface.tools.len(),
-        surface.prompts.len(),
-        surface.resources.len(),
-        surface.templates.len()
+        "{}, {}, {}, {}. Type `help`.",
+        plural(surface.tools.len(), "tool"),
+        plural(surface.prompts.len(), "prompt"),
+        plural(surface.resources.len(), "resource"),
+        plural(surface.templates.len(), "template")
     );
+}
+
+/// `1 tool`, `2 tools`. Every noun the REPL counts is regular.
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 /// Run one request, and if it fails because the server lost the session,
@@ -1510,8 +1551,8 @@ fn print_servers(config: &config::Config) {
     let width = config.names().iter().map(|n| n.len()).max().unwrap_or(0);
     for (name, profile) in &config.servers {
         println!(
-            "{:width$}  {}",
-            paint(Style::new().fg(Color::Cyan), name),
+            "{}  {}",
+            style::column(Style::new().fg(Color::Cyan), name, width),
             paint(Style::new().dimmed(), &profile.summary()),
         );
     }
@@ -2087,9 +2128,11 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                 tokio::time::sleep(SURFACE_REFRESH_DEBOUNCE).await;
                 refresh_rx.mark_unchanged();
                 let fresh = fetch_surface(&session.client()).await;
-                async_output.line(format!("{} {} tools, {} prompts, {} resources",
+                async_output.line(format!("{} {}, {}, {}",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),
-                    fresh.tools.len(), fresh.prompts.len(), fresh.resources.len()));
+                    plural(fresh.tools.len(), "tool"),
+                    plural(fresh.prompts.len(), "prompt"),
+                    plural(fresh.resources.len(), "resource")));
                 *surface.write().unwrap() = fresh;
             }
             maybe_line = line_rx.recv() => {
@@ -2223,6 +2266,27 @@ async fn handle_line(
     }
     let cmd = tokens[0];
     let rest = &tokens[1..];
+    COMMAND_RAN.store(true, Ordering::Relaxed);
+
+    // Routing that cannot be honored is an error, not a silent no-op: in an
+    // `-e` chain a dropped capture leaves a later `$name` undefined, and the
+    // failure surfaces far from its cause.
+    let is_builtin = BUILTINS.iter().any(|(name, _)| *name == cmd);
+    if !output.is_plain() && is_builtin && !ROUTABLE_BUILTINS.contains(&cmd) {
+        let what = match (&output.capture, &output.filter) {
+            (Some(_), _) => "capture",
+            _ => "filter",
+        };
+        report_error(
+            ExitStatus::Usage,
+            &format!(
+                "cannot {what} the result of `{cmd}`: it reports rather than returning a value. \
+                 Routable commands: {}",
+                ROUTABLE_BUILTINS.join(", ")
+            ),
+        );
+        return false;
+    }
 
     match cmd {
         "quit" | "exit" => {
@@ -2277,8 +2341,8 @@ async fn handle_line(
                 println!("tools:");
                 for t in &s.tools {
                     println!(
-                        "  {:24} {}",
-                        paint(Style::new().fg(Color::Green), &sanitize(&t.name)),
+                        "  {} {}",
+                        style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
                         sanitize(t.description.as_deref().unwrap_or(""))
                     );
                 }
@@ -2286,7 +2350,7 @@ async fn handle_line(
         }
         "tools" | "prompts" | "resources" | "templates" => {
             let s = surface.read().unwrap();
-            if json_output() {
+            if !output.is_plain() || json_output() {
                 let v = match cmd {
                     "tools" => serde_json::to_value(&s.tools),
                     "prompts" => serde_json::to_value(&s.prompts),
@@ -2294,15 +2358,15 @@ async fn handle_line(
                     _ => serde_json::to_value(&s.templates),
                 }
                 .unwrap_or_default();
-                print_json(&v);
+                emit_value(v, &output, || unreachable!("plain output handled below"));
                 return false;
             }
             match cmd {
                 "tools" => {
                     for t in &s.tools {
                         println!(
-                            "{:24} {}",
-                            paint(Style::new().fg(Color::Green), &sanitize(&t.name)),
+                            "{} {}",
+                            style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
                             sanitize(t.description.as_deref().unwrap_or(""))
                         );
                     }
@@ -2321,8 +2385,8 @@ async fn handle_line(
                             })
                             .collect();
                         println!(
-                            "{:24} {} {}",
-                            paint(Style::new().fg(Color::Green), &sanitize(&p.name)),
+                            "{} {} {}",
+                            style::column(Style::new().fg(Color::Green), &sanitize(&p.name), 24),
                             paint(Style::new().fg(Color::Cyan), &args.join(" ")),
                             sanitize(p.description.as_deref().unwrap_or(""))
                         );
@@ -2331,8 +2395,8 @@ async fn handle_line(
                 "resources" => {
                     for r in &s.resources {
                         println!(
-                            "{:40} {}",
-                            paint(Style::new().fg(Color::Green), &sanitize(&r.uri)),
+                            "{} {}",
+                            style::column(Style::new().fg(Color::Green), &sanitize(&r.uri), 40),
                             sanitize(&r.name)
                         );
                     }
@@ -2354,8 +2418,12 @@ async fn handle_line(
                 _ => {
                     for t in &s.templates {
                         println!(
-                            "{:40} {}",
-                            paint(Style::new().fg(Color::Green), &sanitize(&t.uri_template)),
+                            "{} {}",
+                            style::column(
+                                Style::new().fg(Color::Green),
+                                &sanitize(&t.uri_template),
+                                40
+                            ),
                             sanitize(&t.name)
                         );
                     }
@@ -2382,7 +2450,7 @@ async fn handle_line(
                 command_error("usage: find <keyword>");
                 return false;
             }
-            print_find(&surface.read().unwrap(), &query);
+            print_find(&surface.read().unwrap(), &query, &output);
         }
         "describe" => {
             let Some(name) = rest.first() else {
@@ -2390,12 +2458,15 @@ async fn handle_line(
                 return false;
             };
             let surface = surface.read().unwrap();
-            if json_output() {
+            if !output.is_plain() || json_output() {
                 match describe_value(&surface, name) {
-                    Some(value) => print_json(&value),
-                    None => report_error(
+                    Some(value) => {
+                        emit_value(value, &output, || unreachable!("plain handled below"))
+                    }
+                    None => report_error_with_hint(
                         ExitStatus::NoMatch,
                         &format!("nothing on the surface named `{name}`"),
+                        find::did_you_mean(&surface, name).as_deref(),
                     ),
                 }
             } else {
@@ -2499,6 +2570,9 @@ async fn handle_line(
             )
             .await
             {
+                Ok(result) if !output.is_plain() => {
+                    emit_result(serde_json::to_value(&result).unwrap_or_default(), &output)
+                }
                 Ok(result) if json_output() => {
                     print_json(&serde_json::to_value(&result).unwrap_or_default())
                 }
@@ -2627,6 +2701,9 @@ async fn handle_line(
             handle_bench(&client, surface, schema_contracts, rest, background).await;
         }
         "jobs" => {
+            // Every listed job costs a `tasks/get`, so the annotation
+            // answers the same question it does for a tool call.
+            let started = std::time::Instant::now();
             if json_output() {
                 let mut rendered = Vec::new();
                 for job in jobs.list() {
@@ -2656,7 +2733,13 @@ async fn handle_line(
                 return false;
             }
             if jobs.is_empty() {
-                println!("no background tasks");
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        "no background tasks (run a task-capable tool with a trailing `&`)"
+                    )
+                );
             }
             for job in jobs.list() {
                 match client.task_get(&job.task_id).await {
@@ -2679,11 +2762,17 @@ async fn handle_line(
                     }
                 }
             }
+            if !json_output() {
+                println!("{}", timing(started.elapsed()));
+            }
         }
         // Task commands do not reconnect: a task id belongs to the session
         // that created it, so a fresh session would only report it missing.
         // "(gone)" from `jobs` is the honest answer there.
         "task" | "wait" | "cancel" => {
+            // `wait` blocks until the task settles, so how long that took is
+            // the most useful number the command can report.
+            let started = std::time::Instant::now();
             // `wait` takes an optional deadline of its own. The global
             // --timeout deliberately does not apply: a task exists precisely
             // to outlive the call that created it, so the useful default is
@@ -2732,6 +2821,9 @@ async fn handle_line(
                 }
                 Err(e) => report_mcp_error(&e),
             }
+            if !json_output() {
+                println!("{}", timing(started.elapsed()));
+            }
         }
         "alias" | "unalias" => {
             // Everything after the command word is taken raw: an expansion is
@@ -2776,6 +2868,19 @@ async fn handle_line(
                         "response": response.map(|r| r.json),
                     }));
                 } else {
+                    // Before the first command, the newest frame is the
+                    // REPL's own startup fetch. Showing it is right for a
+                    // wire tool; letting it look like something the user ran
+                    // is not.
+                    if !COMMAND_RAN.load(Ordering::Relaxed) {
+                        println!(
+                            "{}",
+                            paint(
+                                Style::new().dimmed(),
+                                "(no command has run yet; this is mcp-repl's own startup traffic)"
+                            )
+                        );
+                    }
                     println!("{}", wire::render(wire::Direction::Sent, &request));
                     match response {
                         Some(response) => {
@@ -2787,6 +2892,7 @@ async fn handle_line(
             }
         },
         "refresh" => {
+            let started = std::time::Instant::now();
             let fresh = refresh_surface(session).await;
             if json_output() {
                 print_json(&serde_json::json!({
@@ -2797,26 +2903,33 @@ async fn handle_line(
                 }));
             } else {
                 println!(
-                    "{} tools, {} prompts, {} resources, {} templates",
-                    fresh.tools.len(),
-                    fresh.prompts.len(),
-                    fresh.resources.len(),
-                    fresh.templates.len()
+                    "{}, {}, {}, {}",
+                    plural(fresh.tools.len(), "tool"),
+                    plural(fresh.prompts.len(), "prompt"),
+                    plural(fresh.resources.len(), "resource"),
+                    plural(fresh.templates.len(), "template")
                 );
+            }
+            if !json_output() {
+                println!("{}", timing(started.elapsed()));
             }
             *surface.write().unwrap() = fresh;
         }
         "info" => match connection_info(&client).await {
             Some(info) => {
-                if json_output() {
-                    print_json(&serde_json::json!({
-                        "protocolVersion": info.protocol_version,
-                        "serverInfo": info.server_info,
-                        "capabilities": info.capabilities,
-                        "instructions": info.instructions,
-                        "sampling": sampling::mode().as_str(),
-                        "elicitation": elicit::mode().as_str(),
-                    }));
+                if !output.is_plain() || json_output() {
+                    emit_value(
+                        serde_json::json!({
+                            "protocolVersion": info.protocol_version,
+                            "serverInfo": info.server_info,
+                            "capabilities": info.capabilities,
+                            "instructions": info.instructions,
+                            "sampling": sampling::mode().as_str(),
+                            "elicitation": elicit::mode().as_str(),
+                        }),
+                        &output,
+                        || unreachable!("plain output handled below"),
+                    );
                     return false;
                 }
                 // Replay the full startup banner, then add capabilities.
@@ -2845,7 +2958,13 @@ async fn handle_line(
                 let map: serde_json::Map<String, serde_json::Value> = all.into_iter().collect();
                 print_json(&serde_json::Value::Object(map));
             } else if all.is_empty() {
-                println!("{}", paint(Style::new().dimmed(), "no variables"));
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        "no variables (capture one with `name = <command>`)"
+                    )
+                );
             } else {
                 for (name, value) in all {
                     println!(
@@ -2879,25 +2998,17 @@ async fn handle_line(
                     .map(|t| t.input_schema.clone())
             };
             let Some(schema) = schema else {
-                note_error(ExitStatus::Usage);
+                // The command word itself did not resolve, so the line could
+                // not be dispatched at all: a usage error, the way a shell
+                // treats "command not found". A *name argument* that is
+                // absent from the surface is the other case, and reports
+                // NoMatch (see `describe` and `bench`).
                 let suggestion = find::did_you_mean(&surface.read().unwrap(), tool_name);
-                if json_output() {
-                    let mut value =
-                        error_json(ExitStatus::Usage, &format!("unknown command: {tool_name}"));
-                    if let Some(near) = &suggestion {
-                        value["didYouMean"] = serde_json::json!(near);
-                    }
-                    print_json(&value);
-                } else {
-                    let name = paint(Style::new().fg(Color::Red), &sanitize(tool_name));
-                    match suggestion {
-                        Some(near) => println!(
-                            "unknown command: {name}; did you mean `{}`?",
-                            paint(Style::new().fg(Color::Green), &sanitize(&near))
-                        ),
-                        None => println!("unknown command: {name} (try `help`)"),
-                    }
-                }
+                let message = match suggestion {
+                    Some(_) => format!("unknown command: {tool_name}"),
+                    None => format!("unknown command: {tool_name} (try `help`)"),
+                };
+                report_error_with_hint(ExitStatus::Usage, &message, suggestion.as_deref());
                 return false;
             };
             let arguments = parse_kv_args(&schema, rest);
@@ -2949,7 +3060,13 @@ async fn handle_bench(
             .map(|t| t.input_schema.clone())
     };
     let Some(schema) = schema else {
-        command_error(&format!("no tool named `{}` (try `tools`)", plan.tool));
+        // Same condition as `describe` on an unknown name, so the same
+        // status: the invocation was well formed, the name just is not there.
+        report_error_with_hint(
+            ExitStatus::NoMatch,
+            &format!("no tool named `{}` (try `tools`)", plan.tool),
+            find::did_you_mean(&surface.read().unwrap(), &plan.tool).as_deref(),
+        );
         return;
     };
     if !enforce_tool_contract(schema_contracts, surface, &plan.tool) {
@@ -3105,8 +3222,8 @@ fn handle_alias(
         let width = entries.iter().map(|e| e.name.len()).max().unwrap_or(0);
         for e in &entries {
             println!(
-                "{:width$}  {}  {}",
-                paint(Style::new().fg(Color::Cyan), &e.name),
+                "{}  {}  {}",
+                style::column(Style::new().fg(Color::Cyan), &e.name, width),
                 e.expansion,
                 paint(Style::new().dimmed(), &format!("({})", e.scope.label()))
             );
@@ -3395,9 +3512,13 @@ fn describe(surface: &Surface, name: &str) {
             println!("arguments:");
             for a in &p.arguments {
                 println!(
-                    "  {:20} {:10} {}",
-                    paint(Style::new().fg(Color::Cyan), &sanitize(&a.name)),
-                    if a.required { "required" } else { "optional" },
+                    "  {} {} {}",
+                    style::column(Style::new().fg(Color::Cyan), &sanitize(&a.name), 20),
+                    style::column(
+                        Style::new(),
+                        if a.required { "required" } else { "optional" },
+                        10
+                    ),
                     sanitize(a.description.as_deref().unwrap_or(""))
                 );
             }
@@ -3451,19 +3572,26 @@ fn describe(surface: &Surface, name: &str) {
             println!("arguments:");
             for a in &t.arguments {
                 println!(
-                    "  {:20} {:10} {}",
-                    paint(Style::new().fg(Color::Cyan), &sanitize(&a.name)),
-                    if a.required { "required" } else { "optional" },
+                    "  {} {} {}",
+                    style::column(Style::new().fg(Color::Cyan), &sanitize(&a.name), 20),
+                    style::column(
+                        Style::new(),
+                        if a.required { "required" } else { "optional" },
+                        10
+                    ),
                     sanitize(a.description.as_deref().unwrap_or(""))
                 );
             }
         }
         return;
     }
-    note_error(ExitStatus::NoMatch);
-    println!(
-        "nothing on the surface named `{}` (try `tools`, `prompts`, `resources`)",
-        sanitize(name)
+    // A name that is not on the surface is the same condition wherever it is
+    // asked about, so it carries the same status everywhere: `describe`,
+    // `snapshot`, `bench`, and a bare command word all report NoMatch.
+    report_error_with_hint(
+        ExitStatus::NoMatch,
+        &format!("nothing on the surface named `{name}` (try `tools`, `prompts`, `resources`)"),
+        find::did_you_mean(surface, name).as_deref(),
     );
 }
 
@@ -3556,6 +3684,34 @@ fn result_value(result: &tower_mcp::CallToolResult) -> serde_json::Value {
             .unwrap_or_else(|_| serde_json::Value::String(text.clone()));
     }
     serde_json::to_value(&result.content).unwrap_or_default()
+}
+
+/// Built-ins whose result is a documented value, so `x = <cmd>` and
+/// `<cmd> | <path>` mean something. Everything else either has no result
+/// (`quit`), or produces a report rather than data (`help`, `alias`, `wire`,
+/// `refresh`), and says so rather than dropping the request.
+const ROUTABLE_BUILTINS: &[&str] = &[
+    "tools",
+    "prompts",
+    "resources",
+    "templates",
+    "describe",
+    "read",
+    "find",
+    "info",
+];
+
+/// Emit a built-in's canonical value: routed when the line asked for a
+/// capture or a filter, as one JSON value under `--json`, and otherwise
+/// however the command renders for a human.
+fn emit_value(value: serde_json::Value, output: &vars::Output, human: impl FnOnce()) {
+    if !output.is_plain() {
+        emit_result(value, output);
+    } else if json_output() {
+        print_json(&value);
+    } else {
+        human();
+    }
 }
 
 /// Apply a capture/filter [`vars::Output`] to a result value: select a path,
@@ -3982,6 +4138,39 @@ mod tests {
     #[test]
     fn find_is_a_completable_builtin() {
         assert!(BUILTINS.iter().any(|(name, _)| *name == "find"));
+    }
+
+    #[test]
+    fn counted_nouns_agree_with_their_number() {
+        assert_eq!(plural(0, "tool"), "0 tools");
+        assert_eq!(plural(1, "tool"), "1 tool");
+        assert_eq!(plural(2, "template"), "2 templates");
+    }
+
+    #[test]
+    fn only_commands_with_a_value_accept_capture_and_filter() {
+        // The set backing the guard: a command that reports rather than
+        // returning data must not silently swallow a capture.
+        for routable in ["tools", "describe", "read", "find", "info"] {
+            assert!(
+                ROUTABLE_BUILTINS.contains(&routable),
+                "{routable} returns a documented value"
+            );
+        }
+        for reporting in ["help", "alias", "wire", "refresh", "quit", "unset"] {
+            assert!(
+                !ROUTABLE_BUILTINS.contains(&reporting),
+                "{reporting} has no value to capture"
+            );
+        }
+        // Every routable name is a real built-in, so the guard cannot
+        // advertise a command that does not exist.
+        for name in ROUTABLE_BUILTINS {
+            assert!(
+                BUILTINS.iter().any(|(builtin, _)| builtin == name),
+                "{name} is not a built-in"
+            );
+        }
     }
 
     #[test]
