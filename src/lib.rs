@@ -742,6 +742,13 @@ fn render_task(task: &TaskObject, label: &str) {
         sanitize(task.status_message.as_deref().unwrap_or(""))
     );
     if let Some(result) = &task.result {
+        // A task whose tool failed still settles as `completed`, so without
+        // this the status line reads as success and the error text below it
+        // has nothing marking it as an error. Same tag the foreground call
+        // path prints, for the same result shape.
+        if result.is_error {
+            println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+        }
         render_content(&result.content);
     }
     if let Some(err) = &task.error {
@@ -1732,6 +1739,26 @@ fn demo_router() -> tower_mcp::McpRouter {
                         Ok(CallToolResult::text(format!("scanned {steps} items")))
                     },
                 )
+                .build(),
+        )
+        // The demo server otherwise always succeeds, which leaves two things
+        // with no example: how a tool error renders, and that a failed task
+        // fails the script that waited for it. Task-capable so both are
+        // reachable from the one tool.
+        //
+        //   mcp-repl --demo -e fail                 # tool error, exit 3
+        //   mcp-repl --demo -e 'fail &' -e wait     # failed task, exit 3
+        .tool(
+            ToolBuilder::new("fail")
+                .description("Always fails (try `fail &` then `wait`)")
+                .annotations(local_read_only())
+                .task_support(TaskSupportMode::Optional)
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    // An `isError` result rather than a transport failure:
+                    // this is the shape a tool uses to say the work failed,
+                    // and the one a server is most likely to return.
+                    Ok(CallToolResult::error("the demo `fail` tool always fails"))
+                })
                 .build(),
         )
         // Elicitation: the server asks the operator for the values instead of

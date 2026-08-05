@@ -19,6 +19,7 @@ mcp-repl-demo> echo message="hi there"     # args coerced by inputSchema
 mcp-repl-demo> echo msg=hi                 # refused: `message` is required
 mcp-repl-demo> convert value=100 from=celsius to=<Tab>  # completes the enum values
 mcp-repl-demo> slow_add a=2 b=3 &          # runs task-augmented; `jobs`, `wait 1`
+mcp-repl-demo> fail                        # what a tool error looks like
 mcp-repl-demo> sign_in                     # the server asks *you* (elicitation)
 mcp-repl-demo> find note                   # keyword search across the surface
 mcp-repl-demo> describe convert            # input/output schemas, colored

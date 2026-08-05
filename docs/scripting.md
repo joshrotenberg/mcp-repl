@@ -50,6 +50,18 @@ cancelled sets the process exit status (3 and 6 respectively), so a script can
 tell the work failed rather than only that it finished. `--timeout` on `wait`
 applies per task.
 
+The demo server's `fail` tool is task-capable and always fails, so both halves
+of that are visible without a server of your own:
+
+```bash
+mcp-repl --demo -e fail                  # tool error, exits 3
+mcp-repl --demo -e 'fail &' -e wait      # failed task, also exits 3
+```
+
+Note that a failed task still settles as `completed`: the status describes
+the task, not the work. What failed is in the result, which is why the exit
+status is the reliable thing for a script to check.
+
 In human `--exec` mode the banner and surface listing are suppressed by
 default; pass `--verbose` to keep them. Under `--json`, stdout is always a
 machine-only [NDJSON](https://github.com/ndjson/ndjson-spec) stream: every

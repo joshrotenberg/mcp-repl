@@ -775,6 +775,23 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
         String::from_utf8_lossy(&failed.stdout)
     );
 
+    // The other failure shape, and the one a server is most likely to send:
+    // an `isError` result rather than a handler error. The demo's `fail` is
+    // task-capable so this is reachable without a server of your own, which
+    // is the whole point of it being there.
+    let error_result = run_demo_answering(
+        "",
+        "demo task tool error",
+        &["--exec", "fail &", "--exec", "wait"],
+    )
+    .await;
+    assert_status(&error_result, 3, "demo task tool error");
+    let stdout = String::from_utf8_lossy(&error_result.stdout);
+    assert!(
+        stdout.contains("tool error"),
+        "a failed task settles as `completed`, so the error needs saying:\n{stdout}"
+    );
+
     // Nothing to wait for is a distinct outcome from a task that failed.
     let empty = run_stdio(
         fixture,
