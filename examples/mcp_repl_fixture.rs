@@ -175,7 +175,7 @@ async fn observe_subscription(request: Request, next: Next) -> Response {
 ///
 /// Speaking JSON-RPC directly is the point: this is the shape of a server we
 /// did not write.
-fn serve_raw_tools_only(bad_meta: bool) -> Result<(), tower_mcp::BoxError> {
+fn serve_raw_tools_only(failing_list: bool) -> Result<(), tower_mcp::BoxError> {
     use std::io::{BufRead, Write};
 
     let stdin = std::io::stdin();
@@ -201,20 +201,19 @@ fn serve_raw_tools_only(bad_meta: bool) -> Result<(), tower_mcp::BoxError> {
                     "serverInfo": { "name": "raw-tools-only", "version": "1.0.0" },
                 },
             }),
+            // Declared the capability, then fails to serve it. That is the
+            // shape the REPL must not round down to "this server has no
+            // tools": the listing was never read, which is a different fact
+            // from an empty one.
+            "tools/list" if failing_list => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32603, "message": "tool index unavailable" },
+            }),
             "tools/list" => serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    // FastMCP emits this. The name starts with an underscore,
-                    // which the `_meta` grammar forbids, and a client that
-                    // validates on the way in throws away the whole listing
-                    // over it (tower-mcp#1212). What the REPL must not do is
-                    // then report the missing listing as an empty one.
-                    "_meta": if bad_meta {
-                        serde_json::json!({ "_fastmcp": { "version": "2.0" } })
-                    } else {
-                        serde_json::json!({})
-                    },
                     "tools": [{
                         "name": "add",
                         "description": "Add two integers",
@@ -249,7 +248,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
     // Not a router: this mode speaks JSON-RPC by hand so it can reject the
     // methods it never advertised, the way a server from another SDK does.
     if std::env::args().any(|arg| arg == "--tools-only") {
-        serve_raw_tools_only(std::env::args().any(|arg| arg == "--bad-meta"))?;
+        serve_raw_tools_only(std::env::args().any(|arg| arg == "--failing-list"))?;
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
         return Ok(());
     }
