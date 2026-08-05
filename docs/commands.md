@@ -89,6 +89,22 @@ them. History lives at `$XDG_STATE_HOME/mcp-repl/history` (falling back to
 or `--no-history` to keep it in memory. A pre-0.3 `~/.mcp-repl_history` is
 moved to the new location once, automatically.
 
+`read <uri> --out <path>` writes the content to a file instead of printing
+it, decoding a binary resource back to bytes:
+
+```text
+mcp-repl-demo> read img://pixel
+[binary 96 base64 chars]
+mcp-repl-demo> read img://pixel --out pixel.png
+wrote 70 bytes to pixel.png
+```
+
+The file is created owner-only, since whatever a server serves is as
+sensitive as the server. An existing file is refused unless `--force` is
+given, and a resource that came back as several contents is refused rather
+than concatenated, because joining them produces a file that is none of
+them. Under `--json` the command reports `{"uri", "path", "bytes"}`.
+
 `resources` lists concrete resources and `templates` lists parameterized
 (`{variable}`) ones; each points at the other so a server that splits its
 resources across the two MCP lists is not confusing.

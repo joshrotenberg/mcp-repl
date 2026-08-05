@@ -113,6 +113,27 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write bytes to a new or existing file, owner-only.
+///
+/// Used by `read --out`: whatever a server serves is as sensitive as the
+/// server, so a saved resource does not land at whatever the umask allows.
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    create_parent_dir(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(OWNER_ONLY);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    // An existing file keeps its old mode through `open`, so tighten it.
+    restrict_existing(path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
