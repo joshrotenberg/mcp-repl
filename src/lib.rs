@@ -469,7 +469,7 @@ pub(crate) const BUILTINS: &[(&str, &str)] = &[
     ("bench", "time repeated calls to a tool"),
     ("jobs", "list background tasks"),
     ("task", "show a background task"),
-    ("wait", "wait for a background task"),
+    ("wait", "wait for background tasks"),
     ("cancel", "cancel a background task"),
     ("alias", "define, list, or show a command alias"),
     ("unalias", "remove a command alias"),
@@ -577,19 +577,24 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "task",
         "task <task> [respond]",
-        "Show one background task. Takes the short number from `jobs` or the server's id. \
+        "Show one background task. Takes the short number from `jobs`, `last`, or the server's \
+         id. \
          `respond` answers what an `input_required` task is waiting for and lets its handler \
          resume; it needs --protocol 2026-07-28.",
     ),
     (
         "wait",
-        "wait <task> [--timeout <seconds>]",
-        "Block until a task settles. Ctrl-C interrupts; the global --timeout does not apply.",
+        "wait [<task>] [--timeout <seconds>]",
+        "Block until a task settles. With no task, waits for every task this session started, \
+         in start order, which is how an --exec script waits for work whose id it never saw. \
+         `last` names the most recent. A task that failed or was cancelled sets a non-zero exit \
+         status. Ctrl-C interrupts; the global --timeout does not apply, and this one applies \
+         per task.",
     ),
     (
         "cancel",
         "cancel <task>",
-        "Ask the server to cancel a task.",
+        "Ask the server to cancel a task. `last` names the most recent.",
     ),
     (
         "alias",
@@ -737,6 +742,13 @@ fn render_task(task: &TaskObject, label: &str) {
         sanitize(task.status_message.as_deref().unwrap_or(""))
     );
     if let Some(result) = &task.result {
+        // A task whose tool failed still settles as `completed`, so without
+        // this the status line reads as success and the error text below it
+        // has nothing marking it as an error. Same tag the foreground call
+        // path prints, for the same result shape.
+        if result.is_error {
+            println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+        }
         render_content(&result.content);
     }
     if let Some(err) = &task.error {
@@ -746,6 +758,92 @@ fn render_task(task: &TaskObject, label: &str) {
             err.code,
             sanitize(&err.message)
         );
+    }
+}
+
+/// Block until one task settles, honoring `wait`'s own deadline.
+async fn wait_for_one(
+    client: &McpClient,
+    id: &str,
+    limit: Option<Duration>,
+) -> tower_mcp::Result<TaskObject> {
+    match limit {
+        None => client.task_wait(id).await,
+        Some(limit) => match tokio::time::timeout(limit, client.task_wait(id)).await {
+            Ok(result) => result,
+            Err(_) => Err(tower_mcp::Error::Transport(format!(
+                "task {id} was still running after {}s (--timeout)",
+                limit.as_secs()
+            ))),
+        },
+    }
+}
+
+/// Record what a settled task means for the process exit status.
+///
+/// Only `wait` calls this. A script uses `wait` to ask whether the work
+/// succeeded, so a task that failed has to be visible in the status rather
+/// than only in the rendered output. `task` and `cancel` report state instead
+/// of judging it, and a `cancel` that worked is not a failure of `cancel`.
+fn note_settled_task(task: &TaskObject) {
+    use tower_mcp::protocol::TaskStatus;
+    // Three shapes mean the same thing. A handler returning `Err` surfaces as
+    // a *completed* task carrying an error rather than a failed one, and a
+    // tool-level error result is a third. Judging on status alone would call
+    // the most common failure a success.
+    if task.error.is_some() || task.result.as_ref().is_some_and(|r| r.is_error) {
+        note_error(ExitStatus::Server);
+        return;
+    }
+    match task.status {
+        TaskStatus::Failed => note_error(ExitStatus::Server),
+        // Not the operator's Ctrl-C, but the same shape of outcome: the work
+        // was abandoned and produced no result, and a script that waited for
+        // one should not read that as success.
+        TaskStatus::Cancelled => note_error(ExitStatus::Cancelled),
+        _ => {}
+    }
+}
+
+/// Wait for every task this session started, oldest first.
+///
+/// `--timeout` applies per task, matching what it means for `wait <task>`.
+async fn wait_for_all(
+    client: &McpClient,
+    jobs: &Arc<Jobs>,
+    limit: Option<Duration>,
+    started: std::time::Instant,
+) {
+    let ids = jobs.all_ids();
+    if ids.is_empty() {
+        report_error(
+            ExitStatus::NoMatch,
+            "no tasks in this session to wait for (start one with a trailing `&`)",
+        );
+        return;
+    }
+    let mut settled = Vec::new();
+    for id in &ids {
+        match wait_for_one(client, id, limit).await {
+            Ok(task) => {
+                jobs.sync(id, task.status, task.status_message.clone());
+                note_settled_task(&task);
+                if !json_output() {
+                    render_task(&task, &jobs.label_for(&task.task_id));
+                }
+                settled.push(task);
+            }
+            // Keep going: one unreachable task should not hide the outcome of
+            // the others a script is also waiting on.
+            Err(e) => report_mcp_error(&e),
+        }
+    }
+    if json_output() {
+        // One value per command, so several tasks are one array rather than
+        // several NDJSON lines.
+        print_json(&serde_json::to_value(&settled).unwrap_or_default());
+    } else {
+        println!("{}", timing(started.elapsed()));
     }
 }
 
@@ -1641,6 +1739,26 @@ fn demo_router() -> tower_mcp::McpRouter {
                         Ok(CallToolResult::text(format!("scanned {steps} items")))
                     },
                 )
+                .build(),
+        )
+        // The demo server otherwise always succeeds, which leaves two things
+        // with no example: how a tool error renders, and that a failed task
+        // fails the script that waited for it. Task-capable so both are
+        // reachable from the one tool.
+        //
+        //   mcp-repl --demo -e fail                 # tool error, exit 3
+        //   mcp-repl --demo -e 'fail &' -e wait     # failed task, exit 3
+        .tool(
+            ToolBuilder::new("fail")
+                .description("Always fails (try `fail &` then `wait`)")
+                .annotations(local_read_only())
+                .task_support(TaskSupportMode::Optional)
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    // An `isError` result rather than a transport failure:
+                    // this is the shape a tool uses to say the work failed,
+                    // and the one a server is most likely to return.
+                    Ok(CallToolResult::error("the demo `fail` tool always fails"))
+                })
                 .build(),
         )
         // Elicitation: the server asks the operator for the values instead of
@@ -3669,12 +3787,20 @@ async fn handle_line(
                     return false;
                 }
             };
+            // A bare `wait` waits for every task this session started, in
+            // start order. A script cannot name an id the server generated
+            // inside an earlier `-e` command, so without this there is no way
+            // for one to wait on its own work.
+            if cmd == "wait" && rest.is_empty() {
+                wait_for_all(&client, jobs, wait_limit, started).await;
+                return false;
+            }
             let Some(typed) = rest.first() else {
                 command_error(&format!("usage: {cmd} <task>"));
                 return false;
             };
-            // `slow_add a=1 b=2 &` prints a small number; accept that, the
-            // server's full id, or an unambiguous prefix of it.
+            // `slow_add a=1 b=2 &` prints a small number; accept that, `last`,
+            // the server's full id, or an unambiguous prefix of it.
             let Some(resolved) = jobs.resolve(typed) else {
                 report_error(
                     ExitStatus::NoMatch,
@@ -3699,16 +3825,7 @@ async fn handle_line(
             }
             let outcome = match cmd {
                 "task" => client.task_get(id).await,
-                "wait" => match wait_limit {
-                    None => client.task_wait(id).await,
-                    Some(limit) => match tokio::time::timeout(limit, client.task_wait(id)).await {
-                        Ok(result) => result,
-                        Err(_) => Err(tower_mcp::Error::Transport(format!(
-                            "task {id} was still running after {}s (--timeout)",
-                            limit.as_secs()
-                        ))),
-                    },
-                },
+                "wait" => wait_for_one(&client, id, wait_limit).await,
                 _ => match client.task_cancel(id, None).await {
                     Ok(()) => {
                         if !json_output() {
@@ -3722,10 +3839,16 @@ async fn handle_line(
             match outcome {
                 Ok(task) if json_output() => {
                     jobs.sync(id, task.status, task.status_message.clone());
+                    if cmd == "wait" {
+                        note_settled_task(&task);
+                    }
                     print_json(&serde_json::to_value(&task).unwrap_or_default());
                 }
                 Ok(task) => {
                     jobs.sync(id, task.status, task.status_message.clone());
+                    if cmd == "wait" {
+                        note_settled_task(&task);
+                    }
                     render_task(&task, &jobs.label_for(&task.task_id));
                 }
                 Err(e) => report_mcp_error(&e),

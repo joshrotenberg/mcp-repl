@@ -19,6 +19,7 @@ mcp-repl-demo> echo message="hi there"     # args coerced by inputSchema
 mcp-repl-demo> echo msg=hi                 # refused: `message` is required
 mcp-repl-demo> convert value=100 from=celsius to=<Tab>  # completes the enum values
 mcp-repl-demo> slow_add a=2 b=3 &          # runs task-augmented; `jobs`, `wait 1`
+mcp-repl-demo> fail                        # what a tool error looks like
 mcp-repl-demo> sign_in                     # the server asks *you* (elicitation)
 mcp-repl-demo> find note                   # keyword search across the surface
 mcp-repl-demo> describe convert            # input/output schemas, colored
@@ -122,7 +123,10 @@ task 1 (105e63bf...)  status=completed  Task completed
 
 Task ids are opaque strings chosen by the server, so the REPL also gives each
 task a small number for this session. `task`, `wait`, and `cancel` accept the
-number, the full id, or an unambiguous prefix of it.
+number, `last` for the most recently started task, the full id, or an
+unambiguous prefix of it. `wait` with no argument waits for every task the
+session started, oldest first, which is how an `--exec` script waits for work
+whose id it never saw; see [scripting](scripting.md).
 
 A task that needs an answer from the operator parks in `input_required`, and
 `task <id> respond` is what moves it forward: it asks whatever the task is

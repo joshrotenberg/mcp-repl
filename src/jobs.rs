@@ -150,12 +150,43 @@ impl Jobs {
         self.state.lock().unwrap().jobs.clone()
     }
 
+    /// Every task this session started, oldest first.
+    ///
+    /// The order is what makes a bare `wait` deterministic: a script that
+    /// starts three tasks gets them reported in the order it started them,
+    /// not the order they happen to finish.
+    pub fn all_ids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .map(|job| job.task_id.clone())
+            .collect()
+    }
+
+    /// The most recently started task, which is what `last` names.
+    pub fn last_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .last()
+            .map(|job| job.task_id.clone())
+    }
+
     /// Resolve what the user typed to a server task id.
     ///
-    /// Accepts the short session number, the full id, or an unambiguous
-    /// prefix of one. Returns `None` when nothing matches, so the caller
-    /// can report it rather than sending a made-up id to the server.
+    /// Accepts `last`, the short session number, the full id, or an
+    /// unambiguous prefix of one. Returns `None` when nothing matches, so the
+    /// caller can report it rather than sending a made-up id to the server.
     pub fn resolve(&self, typed: &str) -> Option<String> {
+        // A script cannot name an id the server has not generated yet, so
+        // `last` is the only way for one `-e` command to refer to the task
+        // the previous one started.
+        if typed == "last" {
+            return self.last_id();
+        }
         let state = self.state.lock().unwrap();
         if let Ok(number) = typed.parse::<usize>()
             && let Some(job) = state.jobs.iter().find(|job| job.number == number)
@@ -416,6 +447,40 @@ mod tests {
         assert_eq!(jobs.resolve("abc1").as_deref(), Some("abc111"));
         // Numbers stay unambiguous even when the ids overlap.
         assert_eq!(jobs.resolve("2").as_deref(), Some("abc222"));
+    }
+
+    /// A script cannot name an id the server generated inside an earlier
+    /// `-e` command, so `last` and the start-ordered list are the only ways
+    /// one `-e` command can refer to another's task.
+    #[test]
+    fn last_names_the_most_recent_task_and_all_ids_keep_start_order() {
+        let (jobs, _printer) = fixture();
+        assert_eq!(jobs.last_id(), None);
+        assert!(jobs.all_ids().is_empty());
+
+        jobs.register("first".into(), "a".into(), TaskStatus::Working, None);
+        jobs.register("second".into(), "b".into(), TaskStatus::Working, None);
+        assert_eq!(jobs.resolve("last").as_deref(), Some("second"));
+        assert_eq!(jobs.all_ids(), vec!["first", "second"]);
+
+        // Settling does not reorder: `wait` reports in the order the script
+        // started them, not the order they finished.
+        jobs.observe("second".into(), TaskStatus::Completed, None);
+        assert_eq!(jobs.all_ids(), vec!["first", "second"]);
+        assert_eq!(jobs.resolve("last").as_deref(), Some("second"));
+
+        jobs.register("third".into(), "c".into(), TaskStatus::Working, None);
+        assert_eq!(jobs.resolve("last").as_deref(), Some("third"));
+    }
+
+    /// `last` is a keyword, not a prefix to match against ids.
+    #[test]
+    fn last_wins_over_an_id_that_starts_with_it() {
+        let (jobs, _printer) = fixture();
+        jobs.register("lasting".into(), "a".into(), TaskStatus::Working, None);
+        jobs.register("other".into(), "b".into(), TaskStatus::Working, None);
+        assert_eq!(jobs.resolve("last").as_deref(), Some("other"));
+        assert_eq!(jobs.resolve("lasti").as_deref(), Some("lasting"));
     }
 
     #[test]
