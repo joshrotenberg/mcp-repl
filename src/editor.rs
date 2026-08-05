@@ -481,6 +481,20 @@ impl Completer for ReplCompleter {
                     }
                 }
             }
+            // `task <id> respond` is the only subcommand, and it is easy to
+            // miss: offer it once the task is named.
+            "task" if head.split_whitespace().count() >= 2 => {
+                let naming_task = head.split_whitespace().count() == 2
+                    && !head.ends_with(' ')
+                    && !word.is_empty();
+                if !naming_task && "respond".starts_with(word) {
+                    out.push(word_suggestion(
+                        "respond",
+                        Some("answer what the task is waiting for".to_string()),
+                        span,
+                    ));
+                }
+            }
             "describe" | "snapshot" => {
                 out.extend(Self::complete_describe_word(&surface, word, span));
             }

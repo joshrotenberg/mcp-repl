@@ -270,13 +270,14 @@ impl Jobs {
                 .find(|job| job.task_id == transition.task_id)
                 .map(|job| job.number.to_string())
                 .unwrap_or_else(|| task_id.to_string());
-            line.push_str(&format!(
-                "  {}",
-                paint(
-                    Style::new().dimmed(),
-                    &format!("run `task {short}` for details")
-                )
-            ));
+            // A parked task needs an action, not a status read: say the thing
+            // that moves it forward, since nothing else will.
+            let hint = if transition.status == TaskStatus::InputRequired {
+                format!("run `task {short} respond` to answer")
+            } else {
+                format!("run `task {short}` for details")
+            };
+            line.push_str(&format!("  {}", paint(Style::new().dimmed(), &hint)));
         }
         self.output.line(line);
     }

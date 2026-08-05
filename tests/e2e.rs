@@ -687,6 +687,90 @@ async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
     assert!(stderr.contains("mcp-repl fixture ready"), "{stderr}");
 }
 
+/// Run the demo server, answering elicitation prompts from `stdin`.
+async fn run_demo_answering(answers: &str, case: &str, repl_args: &[&str]) -> Output {
+    let mut command = repl_command();
+    command
+        .args(["--demo", "--no-history", "--color", "never"])
+        .args(repl_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {case}: {error}"));
+    let mut stdin = child.stdin.take().expect("elicitation stdin");
+    stdin
+        .write_all(answers.as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("write {case} answers: {error}"));
+    drop(stdin);
+    tokio::time::timeout(CASE_TIMEOUT, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("{case} timed out"))
+        .unwrap_or_else(|error| panic!("wait for {case}: {error}"))
+}
+
+/// A form's fields must be asked in the order the server declared them.
+///
+/// The schema is an ordered map and the order is protocol-significant, so
+/// sorting the field names alphabetically silently pairs each answer with the
+/// wrong field. Answering positionally is what catches it: the fields here are
+/// declared username, environment, remember_me, which is not alphabetical, so
+/// a re-sorted form signs in as `staging`.
+async fn exercise_elicitation_field_order() {
+    let output = run_demo_answering(
+        "ada\nstaging\ny\n",
+        "elicitation order",
+        &["--elicitation", "prompt", "--exec", "sign_in"],
+    )
+    .await;
+    assert_success(&output, "elicitation order");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("signed in as ada"),
+        "answers must land in declared order\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let username = stderr.find("username").expect("username prompt");
+    let environment = stderr.find("environment").expect("environment prompt");
+    assert!(
+        username < environment,
+        "username is declared first, so it is asked first:\n{stderr}"
+    );
+}
+
+/// `respond` only works where a task can report what it is waiting for, and
+/// the refusal has to explain the protocol rather than leak the framework's
+/// "task_get_detailed requires ..." transport error.
+async fn exercise_respond_needs_the_final_lifecycle() {
+    let output = run_demo_answering(
+        "",
+        "respond on stable",
+        &[
+            "--protocol",
+            "stable",
+            // A real task, so the refusal is about the lifecycle rather than
+            // an unresolvable id.
+            "--exec",
+            "slow_add a=1 b=2 &",
+            "--exec",
+            "task 1 respond",
+        ],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("2026-07-28"),
+        "the refusal names the lifecycle that supports it:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("task_get_detailed"),
+        "an internal API name is not an explanation:\n{stderr}"
+    );
+}
+
 /// Interrupting a call has to reach the server, not just free the prompt.
 ///
 /// The framework cancels a request when the caller's future drops, which is
@@ -935,6 +1019,8 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_generators().await;
+        exercise_elicitation_field_order().await;
+        exercise_respond_needs_the_final_lifecycle().await;
         #[cfg(unix)]
         exercise_cancellation().await;
         exercise_json_contract(&fixture, &temp).await;

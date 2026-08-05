@@ -124,6 +124,28 @@ Task ids are opaque strings chosen by the server, so the REPL also gives each
 task a small number for this session. `task`, `wait`, and `cancel` accept the
 number, the full id, or an unambiguous prefix of it.
 
+A task that needs an answer from the operator parks in `input_required`, and
+`task <id> respond` is what moves it forward: it asks whatever the task is
+waiting for and hands the answers back, after which the handler resumes.
+
+```text
+demo> sign_in &
+[task 1 (9587890f...)] started
+[task 1 (9587890f...)] input_required — Awaiting client input  run `task 1 respond` to answer
+demo> task 1 respond
+[elicit] server mcp-repl-demo is asking:
+  The demo server would like to know who you are.
+  username (string, required) Any name will do
+  username> ada
+[task 1 (9587890f...)] completed — Task completed
+signed in as ada
+```
+
+This needs `--protocol 2026-07-28`, the only lifecycle where a task reports
+what it is waiting for. On the stable lifecycle a server asks by sending
+`elicitation/create` itself, which is declined while the editor holds the
+terminal, so run such a tool in the foreground rather than as a task.
+
 The REPL tracks only tasks it started and consumes both legacy and final typed
 task-status notifications, deduplicating repeated transitions. A final client
 opens a task-scoped `subscriptions/listen` stream; a bounded per-task poller
@@ -378,9 +400,11 @@ unsubscribed note://status
 Tools that request user input via `elicitation/create` prompt for each
 field at the terminal during a foreground call: the field's type, default,
 and description are shown, empty input accepts the default, and EOF
-cancels. Try `sign_in` in `--demo`. If a
+cancels. Fields are asked in the order the server declared them, which is
+part of the schema rather than incidental. Try `sign_in` in `--demo`. If a
 background task elicits while the editor owns the terminal, the request is
-declined rather than fighting the editor for stdin.
+declined rather than fighting the editor for stdin; on the 2026-07-28
+lifecycle the question is parked instead, and `task <id> respond` asks it.
 
 Everything in a form comes from the server: the message, the field names,
 and their descriptions. The REPL is only the terminal it arrives at, so:

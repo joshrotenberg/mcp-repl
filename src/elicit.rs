@@ -217,6 +217,49 @@ impl ClientHandler for ReplClientHandler {
     }
 }
 
+/// Answer one elicitation request from a foreground command.
+///
+/// The handler above refuses while the editor owns the terminal, because a
+/// second stdin reader would corrupt raw mode. This is the other door into
+/// the same prompts, for a question a task parked earlier: the operator
+/// typed the command that asks it, so the editor is parked on the ack and
+/// reading stdin is safe.
+///
+/// Refusals are explained on stderr rather than through the external
+/// printer, since nothing else is competing for the terminal here.
+pub async fn answer_in_foreground(server: &str, params: ElicitRequestParams) -> ElicitResult {
+    if mode() == ElicitationMode::Decline {
+        eprintln!(
+            "{} declined (--elicitation decline)",
+            tag(Style::new().fg(Color::Purple), "elicit")
+        );
+        return ElicitResult::decline();
+    }
+    let server = server.to_string();
+    let answered = match params {
+        ElicitRequestParams::Url(url) => {
+            // Same gate as the server-initiated path: terminals linkify what
+            // they print, so a scheme that executes or reads local files is
+            // refused rather than shown.
+            if !is_web_url(&url.url) {
+                eprintln!(
+                    "{} declined a request to open {} (only http and https are shown)",
+                    tag(Style::new().fg(Color::Purple), "elicit"),
+                    sanitize(&url.url)
+                );
+                return ElicitResult::decline();
+            }
+            let (message, link) = (url.message.clone(), url.url.clone());
+            tokio::task::spawn_blocking(move || confirm_url(&server, &message, &link)).await
+        }
+        ElicitRequestParams::Form(form) => {
+            tokio::task::spawn_blocking(move || prompt_form(&server, &form)).await
+        }
+        _ => return ElicitResult::decline(),
+    };
+    answered.unwrap_or_else(|_| ElicitResult::decline())
+}
+
 /// Whether a URL is an ordinary web link. Anything else (`javascript:`,
 /// `file:`, `data:`) is refused rather than displayed, since terminals
 /// linkify what they print.
@@ -285,10 +328,11 @@ fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
     eprintln!("{}", provenance(server));
     eprintln!("  {}", sanitize(&form.message));
     let mut content: HashMap<String, ElicitFieldValue> = HashMap::new();
-    let mut names: Vec<&String> = form.requested_schema.properties.keys().collect();
-    names.sort();
-    for name in names {
-        let schema = &form.requested_schema.properties[name];
+    // Declaration order, not alphabetical. The schema is an `IndexMap` and
+    // the order is protocol-significant: a server puts the fields in the
+    // order it wants them answered, and asking out of order is how an answer
+    // ends up in the wrong field.
+    for (name, schema) in &form.requested_schema.properties {
         let required = form.requested_schema.required.iter().any(|r| r == name);
         let (ty, detail, default) = describe_field(schema);
         // Field names, descriptions, and defaults are all server-authored.
