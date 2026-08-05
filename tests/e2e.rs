@@ -687,6 +687,109 @@ async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
     assert!(stderr.contains("mcp-repl fixture ready"), "{stderr}");
 }
 
+/// Interrupting a call has to reach the server, not just free the prompt.
+///
+/// The framework cancels a request when the caller's future drops, which is
+/// what `run_cancellable` does to the losing `select!` branch, so nothing in
+/// this crate sends the notification. What is worth pinning is that the
+/// notification goes out at all, that it names this call rather than every
+/// pending request, and that a numeric id stays numeric on the way out.
+#[cfg(unix)]
+async fn exercise_cancellation() {
+    let mut command = repl_command();
+    command
+        .args([
+            "--demo",
+            "--trace",
+            "--no-history",
+            "--color",
+            "never",
+            "--exec",
+            "slow_add a=1 b=2",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("spawn cancellation case");
+    let mut stderr = child.stderr.take().expect("cancellation stderr");
+    let pid = child.id().expect("cancellation pid");
+
+    // `slow_add` sleeps three seconds server-side, but interrupt on the trace
+    // rather than on a timer: a loaded runner can spend longer than that
+    // getting the process up and connected, and a signal that arrives before
+    // the call is in flight would test nothing.
+    let mut trace = String::new();
+    tokio::time::timeout(CASE_TIMEOUT, async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stderr.read(&mut chunk).await.expect("read wire trace");
+            if read == 0 {
+                break;
+            }
+            trace.push_str(&String::from_utf8_lossy(&chunk[..read]));
+            if trace.contains("\"slow_add\"") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the call to reach the wire");
+
+    let signalled = Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .await
+        .expect("send SIGINT");
+    assert!(signalled.success(), "kill -INT {pid} failed");
+
+    // The cancellation lands in whatever trace follows the signal.
+    stderr
+        .read_to_string(&mut trace)
+        .await
+        .expect("drain wire trace");
+    let status = tokio::time::timeout(CASE_TIMEOUT, child.wait())
+        .await
+        .expect("cancellation case timed out")
+        .expect("wait for cancellation case");
+
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "an interrupted command exits cancelled:\n{trace}"
+    );
+    assert!(
+        trace.contains("notifications/cancelled"),
+        "the server is never told the call was abandoned:\n{trace}"
+    );
+    let id = traced_request_id(&trace, "tools/call");
+    // Unquoted in the pretty-printed frame, so this also pins the JSON type:
+    // a numeric id must not be reported as a string.
+    assert!(
+        trace.contains(&format!("\"requestId\": {id}")),
+        "the cancellation names request {id}:\n{trace}"
+    );
+}
+
+/// The id of the last traced request for `method`, read back out of the
+/// pretty-printed frame that `--trace` writes.
+#[cfg(unix)]
+fn traced_request_id(trace: &str, method: &str) -> u64 {
+    let frame = trace
+        .rsplit_once(&format!("\"method\": \"{method}\""))
+        .unwrap_or_else(|| panic!("no traced {method} request in:\n{trace}"))
+        .0;
+    let (_, id) = frame
+        .rsplit_once("\"id\": ")
+        .unwrap_or_else(|| panic!("traced {method} request carries no id in:\n{trace}"));
+    id.trim_start()
+        .trim_end_matches([',', '\n', ' '])
+        .split(['\n', ','])
+        .next()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("unparsable {method} request id in:\n{trace}"))
+}
+
 async fn exercise_interactive_final_task(http: &HttpFixture) {
     let mut command = repl_command();
     command
@@ -832,6 +935,8 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_generators().await;
+        #[cfg(unix)]
+        exercise_cancellation().await;
         exercise_json_contract(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
