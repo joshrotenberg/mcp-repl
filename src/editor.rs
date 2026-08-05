@@ -448,6 +448,21 @@ impl Completer for ReplCompleter {
                     }
                 }
             }
+            // `read` writes the payload to a file with --out; offer both
+            // flags once a dash is typed.
+            "read" if word.starts_with('-') => {
+                for (flag, description) in [
+                    (
+                        "--out",
+                        "write the content to a file instead of printing it",
+                    ),
+                    ("--force", "overwrite the file if it exists"),
+                ] {
+                    if flag.starts_with(word) {
+                        out.push(word_suggestion(flag, Some(description.to_string()), span));
+                    }
+                }
+            }
             "read" | "subscribe" => {
                 out.extend(self.complete_resource_word(&surface, word, span));
             }

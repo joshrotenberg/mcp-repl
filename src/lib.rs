@@ -526,8 +526,10 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "read",
-        "read <uri>",
-        "Read a resource. Tab completes URIs, and template variables via the server.",
+        "read <uri> [--out <path>] [--force]",
+        "Read a resource. Tab completes URIs, and template variables via the server. \
+         `--out` writes the content to a file, decoding a binary resource, instead of \
+         printing it.",
     ),
     (
         "subscribe",
@@ -1329,6 +1331,9 @@ fn demo_router() -> tower_mcp::McpRouter {
         }
     }
 
+    /// One transparent pixel, base64 as it travels on the wire.
+    const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
     const NOTES: &[(&str, &str)] = &[
         ("groceries", "- eggs\n- coffee"),
         ("ideas", "# Ideas\n\n- a REPL for MCP servers"),
@@ -1364,6 +1369,28 @@ fn demo_router() -> tower_mcp::McpRouter {
                         "note://status",
                         "all quiet on the demo server",
                     ))
+                })
+                .build(),
+        )
+        // A binary resource, so `read <uri> --out <file>` has something whose
+        // bytes matter. One transparent pixel: a real PNG an image viewer
+        // opens, small enough to sit in the source.
+        .resource(
+            tower_mcp::resource::ResourceBuilder::new("img://pixel")
+                .name("Pixel")
+                .description("A 1x1 transparent PNG (try `read img://pixel --out pixel.png`)")
+                .mime_type("image/png")
+                .handler(|| async {
+                    Ok(ReadResourceResult {
+                        contents: vec![tower_mcp::protocol::ResourceContent {
+                            uri: "img://pixel".to_string(),
+                            mime_type: Some("image/png".to_string()),
+                            text: None,
+                            blob: Some(PIXEL_PNG.to_string()),
+                            meta: None,
+                        }],
+                        ..Default::default()
+                    })
                 })
                 .build(),
         )
@@ -2889,7 +2916,7 @@ async fn handle_line(
             println!("  describe <name>                           schemas and metadata");
             println!("  snapshot <name> [path]                    export a schema contract");
             println!("  validate <path> [mode]                    check a schema contract");
-            println!("  read <uri>                                read a resource");
+            println!("  read <uri> [--out <path>]                 read a resource");
             println!("  subscribe <uri> | unsubscribe <uri>       watch a resource for updates");
             println!("  subscriptions                             list active subscriptions");
             println!("  prompt <name> [k=v...]                    get a prompt");
@@ -3150,10 +3177,26 @@ async fn handle_line(
             render_validation_report(&report, true);
         }
         "read" => {
-            let Some(uri) = rest.first() else {
-                command_error("usage: read <uri>");
+            let (destination, force, rest) = match parse_read_flags(rest) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    command_error(&message);
+                    return false;
+                }
+            };
+            let Some(uri) = rest.first().copied() else {
+                command_error("usage: read <uri> [--out <path>] [--force]");
                 return false;
             };
+            if let Some(path) = &destination
+                && !force
+                && std::path::Path::new(path).exists()
+            {
+                command_error(&format!(
+                    "{path} already exists; pass --force to overwrite it"
+                ));
+                return false;
+            }
             let started = std::time::Instant::now();
             match with_reconnect(
                 session,
@@ -3162,6 +3205,29 @@ async fn handle_line(
             )
             .await
             {
+                // Saving is the whole command when --out is given: the
+                // payload is bytes on disk, not something to render.
+                Ok(result) if destination.is_some() => {
+                    let path = destination.clone().unwrap_or_default();
+                    match save_resource(&result, &path) {
+                        Ok(written) => {
+                            if json_output() {
+                                print_json(&serde_json::json!({
+                                    "uri": uri,
+                                    "path": path,
+                                    "bytes": written,
+                                }));
+                            } else {
+                                println!(
+                                    "wrote {} to {}",
+                                    plural(written, "byte"),
+                                    sanitize(&path)
+                                );
+                            }
+                        }
+                        Err(message) => report_error(ExitStatus::Usage, &message),
+                    }
+                }
                 Ok(result) if !output.is_plain() => {
                     emit_result(serde_json::to_value(&result).unwrap_or_default(), &output)
                 }
@@ -4088,6 +4154,68 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
 /// returning the deadline and the remaining arguments. Only `wait` accepts
 /// it; `task` and `cancel` are single round-trips already covered by the
 /// global deadline.
+/// Pull `--out <path>` and `--force` out of `read`'s arguments.
+fn parse_read_flags<'a>(rest: &[&'a str]) -> Result<(Option<String>, bool, Vec<&'a str>), String> {
+    let mut destination = None;
+    let mut force = false;
+    let mut remaining = Vec::new();
+    let mut tokens = rest.iter().copied();
+    while let Some(token) = tokens.next() {
+        match token {
+            "--force" => force = true,
+            "--out" => {
+                let path = tokens
+                    .next()
+                    .ok_or_else(|| "--out needs a path".to_string())?;
+                destination = Some(path.to_string());
+            }
+            _ => match token.strip_prefix("--out=") {
+                Some(path) if !path.is_empty() => destination = Some(path.to_string()),
+                Some(_) => return Err("--out needs a path".to_string()),
+                None if token.starts_with("--") => {
+                    return Err(format!(
+                        "unknown option `{token}` (read takes --out and --force)"
+                    ));
+                }
+                None => remaining.push(token),
+            },
+        }
+    }
+    Ok((destination, force, remaining))
+}
+
+/// Write a resource's content to a file, decoding a blob back to bytes.
+///
+/// Returns the number of bytes written. A resource that came back as several
+/// contents is refused rather than concatenated: joining a set of blobs
+/// produces a file that is not any of them.
+fn save_resource(
+    result: &tower_mcp::protocol::ReadResourceResult,
+    path: &str,
+) -> Result<usize, String> {
+    let mut contents = result.contents.iter();
+    let (Some(content), None) = (contents.next(), contents.next()) else {
+        return Err(format!(
+            "the resource returned {} contents; --out writes a single one",
+            result.contents.len()
+        ));
+    };
+    let bytes: Vec<u8> = match (&content.text, &content.blob) {
+        (Some(text), _) => text.as_bytes().to_vec(),
+        (None, Some(blob)) => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .map_err(|e| format!("the server sent a blob that is not valid base64: {e}"))?
+        }
+        (None, None) => return Err("the resource returned no content".to_string()),
+    };
+    // Owner-only: a saved resource is as sensitive as whatever served it.
+    crate::secure_file::write_bytes(std::path::Path::new(path), &bytes)
+        .map_err(|e| format!("could not write {path}: {e}"))?;
+    Ok(bytes.len())
+}
+
 fn parse_wait_timeout<'a>(
     cmd: &str,
     rest: &[&'a str],
@@ -5134,6 +5262,110 @@ mod tests {
             arguments(r#"tool untyped="two words""#),
             serde_json::json!({"untyped": "two words"})
         );
+    }
+
+    #[test]
+    fn read_flags_are_separated_from_the_uri() {
+        let (out, force, rest) =
+            parse_read_flags(&["note://status", "--out", "/tmp/x", "--force"]).unwrap();
+        assert_eq!(out.as_deref(), Some("/tmp/x"));
+        assert!(force);
+        assert_eq!(rest, vec!["note://status"]);
+
+        // The attached form, and the plain call.
+        let (out, force, rest) = parse_read_flags(&["--out=/tmp/y", "note://status"]).unwrap();
+        assert_eq!(out.as_deref(), Some("/tmp/y"));
+        assert!(!force);
+        assert_eq!(rest, vec!["note://status"]);
+
+        let (out, _, rest) = parse_read_flags(&["note://status"]).unwrap();
+        assert_eq!(out, None);
+        assert_eq!(rest, vec!["note://status"]);
+    }
+
+    #[test]
+    fn read_flag_errors_say_what_is_wrong() {
+        assert!(parse_read_flags(&["note://x", "--out"]).is_err());
+        assert!(parse_read_flags(&["note://x", "--out="]).is_err());
+        assert!(parse_read_flags(&["note://x", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn saving_decodes_a_blob_and_writes_text_as_is() {
+        use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+        let dir = tempfile::tempdir().unwrap();
+
+        let content = |text: Option<&str>, blob: Option<&str>| ResourceContent {
+            uri: "x://y".to_string(),
+            mime_type: None,
+            text: text.map(str::to_string),
+            blob: blob.map(str::to_string),
+            meta: None,
+        };
+
+        // Text goes out byte for byte, with no trailing newline added.
+        let text_path = dir.path().join("note.txt");
+        let result = ReadResourceResult {
+            contents: vec![content(
+                Some(
+                    "hello
+world",
+                ),
+                None,
+            )],
+            ..Default::default()
+        };
+        let written = save_resource(&result, text_path.to_str().unwrap()).unwrap();
+        assert_eq!(written, 11);
+        assert_eq!(std::fs::read_to_string(&text_path).unwrap(), "hello\nworld");
+
+        // A blob is decoded, so the file is the bytes rather than base64.
+        let png_path = dir.path().join("pixel.png");
+        let result = ReadResourceResult {
+            contents: vec![content(None, Some(PIXEL_PNG_FOR_TEST))],
+            ..Default::default()
+        };
+        let written = save_resource(&result, png_path.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(&png_path).unwrap();
+        assert_eq!(written, bytes.len());
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG header");
+    }
+
+    /// The same pixel the demo serves.
+    const PIXEL_PNG_FOR_TEST: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn saving_refuses_what_it_cannot_write_faithfully() {
+        use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let empty = ReadResourceResult::default();
+        assert!(save_resource(&empty, path.to_str().unwrap()).is_err());
+
+        // Concatenating several contents would produce a file that is none
+        // of them.
+        let two = ReadResourceResult {
+            contents: vec![
+                ResourceContent {
+                    uri: "a".into(),
+                    mime_type: None,
+                    text: Some("one".into()),
+                    blob: None,
+                    meta: None,
+                },
+                ResourceContent {
+                    uri: "b".into(),
+                    mime_type: None,
+                    text: Some("two".into()),
+                    blob: None,
+                    meta: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(save_resource(&two, path.to_str().unwrap()).is_err());
+        // Nothing was written for either refusal.
+        assert!(!path.exists());
     }
 
     #[test]
