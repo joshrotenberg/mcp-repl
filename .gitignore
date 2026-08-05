@@ -1,1 +1,3 @@
 /target
+# VHS scratch recordings; the committed assets are the Screenshot stills.
+target/vhs-scratch-*.gif
