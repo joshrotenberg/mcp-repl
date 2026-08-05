@@ -273,6 +273,13 @@ pub fn grouped(hits: Vec<Hit>) -> Vec<(Kind, Vec<Hit>)> {
     groups
 }
 
+/// Longest word `did_you_mean` will compare.
+///
+/// `edit_distance` is O(a*b), and both operands are outside our control: the
+/// word is whatever was typed and the candidates are names the server chose.
+/// Well past any real command, tool, or prompt name.
+const MAX_COMPARE: usize = 128;
+
 /// Levenshtein distance, two rows.
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -309,6 +316,12 @@ fn tolerance(word: &str) -> usize {
 pub fn did_you_mean(surface: &Surface, word: &str) -> Option<String> {
     let lowered = word.to_lowercase();
     let max = tolerance(&lowered);
+    let typed_len = lowered.chars().count();
+    // Nothing this long is a typo of a command word, and comparing it would
+    // cost length-squared work per candidate.
+    if typed_len > MAX_COMPARE {
+        return None;
+    }
     let candidates = BUILTINS
         .iter()
         .map(|(name, _)| (*name).to_string())
@@ -317,7 +330,15 @@ pub fn did_you_mean(surface: &Surface, word: &str) -> Option<String> {
 
     let mut best: Option<(usize, String)> = None;
     for candidate in candidates {
-        let distance = edit_distance(&lowered, &candidate.to_lowercase());
+        let lowered_candidate = candidate.to_lowercase();
+        let candidate_len = lowered_candidate.chars().count();
+        // Both filters are exact, so they change what this costs and not what
+        // it answers. A distance is never smaller than the difference in
+        // lengths, and every name the surface offers came from the server.
+        if candidate_len > MAX_COMPARE || candidate_len.abs_diff(typed_len) > max {
+            continue;
+        }
+        let distance = edit_distance(&lowered, &lowered_candidate);
         if distance > max {
             continue;
         }
@@ -572,6 +593,68 @@ mod tests {
     #[test]
     fn did_you_mean_stays_quiet_when_nothing_is_close() {
         assert_eq!(did_you_mean(&surface(), "kubectl"), None);
+    }
+
+    /// A pasted line is not a typo of anything, and comparing it against the
+    /// whole surface would be quadratic in its length.
+    #[test]
+    fn an_enormous_word_suggests_nothing() {
+        assert_eq!(did_you_mean(&surface(), &"x".repeat(4096)), None);
+    }
+
+    /// The cap applies to the server's names too, not only to what was typed.
+    ///
+    /// Behavioral rather than timed: one edit apart, so without the cap this
+    /// is the obvious suggestion, and with it the pair is never compared.
+    #[test]
+    fn a_name_past_the_cap_is_never_suggested() {
+        let mut s = surface();
+        let long_name = "n".repeat(MAX_COMPARE + 1);
+        s.tools.push(
+            serde_json::from_value(serde_json::json!({
+                "name": long_name,
+                "description": "a name no server should have",
+                "inputSchema": { "type": "object" },
+            }))
+            .unwrap(),
+        );
+        // A single character shorter, so the distance is 1 and the tolerance
+        // for a word this long is 3.
+        let typo = "n".repeat(MAX_COMPARE);
+        assert_eq!(did_you_mean(&s, &typo), None);
+    }
+
+    /// Levenshtein is quadratic and both operands come from outside: the word
+    /// is typed and the names are the server's. The length-difference filter
+    /// is exact, so it cannot be observed through the answer, only the cost.
+    #[test]
+    fn a_surface_of_huge_names_does_not_stall_a_suggestion() {
+        let mut s = surface();
+        for i in 0..200 {
+            s.tools.push(
+                serde_json::from_value(serde_json::json!({
+                    "name": format!("{}{i}", "n".repeat(16 * 1024)),
+                    "description": "a name no server should have",
+                    "inputSchema": { "type": "object" },
+                }))
+                .unwrap(),
+            );
+        }
+        let started = std::time::Instant::now();
+        // Still finds the real match, past all the noise.
+        assert_eq!(
+            did_you_mean(&s, "serch_crates").as_deref(),
+            Some("search_crates")
+        );
+        let elapsed = started.elapsed();
+        // Sized from measurement rather than guessed: comparing these
+        // unfiltered costs ~650ms in an unoptimized build, while skipping
+        // them leaves only the lowercasing, ~20ms. The bound sits between,
+        // far enough from both that a slow runner does not flip it.
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "took {elapsed:?}, so the long names were not skipped"
+        );
     }
 
     #[test]

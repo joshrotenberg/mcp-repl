@@ -3127,10 +3127,18 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
         }
         let status = exit_status::current().code();
         drop(client);
-        let session = Arc::try_unwrap(session).unwrap_or_else(|_| {
-            panic!("one-shot MCP session is still shared after all commands completed")
-        });
-        session.shutdown().await?;
+        // Every command has finished, so nothing should still hold the
+        // session. If something does, a background task outlived its command,
+        // and skipping the orderly shutdown is a far better answer than
+        // panicking after the work already succeeded: the child is killed on
+        // drop either way, and the status the commands earned survives.
+        match Arc::try_unwrap(session) {
+            Ok(session) => session.shutdown().await?,
+            Err(_) => eprintln!(
+                "warning: a background task outlived its command; exiting without the orderly \
+                 shutdown"
+            ),
+        }
         std::process::exit(status);
     }
 

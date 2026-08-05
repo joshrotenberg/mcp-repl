@@ -90,3 +90,35 @@ cratesio> bench get_downloads crate=serde --n 50 --concurrency 8
   `firstError`, and `minMs` / `p50Ms` / `p95Ms` / `maxMs` / `totalMs`. The
   latency fields are `null` when nothing succeeded, so a failed run cannot be
   read as an instant one.
+
+## Framework logs
+
+`wire on` shows what was sent and received. When the question is what the
+client did *around* those frames, the tower-mcp client library logs through
+[`tracing`], and `RUST_LOG` turns it on:
+
+```bash
+RUST_LOG=tower_mcp=debug mcp-repl --http https://example.invalid/mcp
+```
+
+This is off by default, including its warnings. The client narrates failures
+mcp-repl already reports in its own words, and warns about responses to
+requests mcp-repl cancelled deliberately, so leaving it on meant the same
+event arrived twice and framework text landed at a prompt that otherwise
+controls its own rendering.
+
+Reach for `RUST_LOG` when a frame never appears at all: a request that was
+never sent, a connection that failed before the first message, a
+`subscriptions/listen` stream that ended without a terminal response. Once
+frames are flowing, `wire on` is the better view, since it redacts secrets,
+pairs each response with its request, and reports elapsed time.
+
+Prefer `tower_mcp=debug` over a bare `RUST_LOG=debug` or `RUST_LOG=trace`.
+The latter enable hyper, reqwest, and mio as well, whose connection-pool
+records outnumber the protocol ones by roughly ten to one and interleave with
+the prompt. Narrow further with `RUST_LOG=tower_mcp::client=debug`.
+
+`--color never` applies to these records too, so a redirected stderr stays
+free of escape sequences.
+
+[`tracing`]: https://docs.rs/tracing

@@ -79,6 +79,35 @@ struct State {
 /// Well past any realistic number of concurrent requests from a REPL.
 const PENDING_CAP: usize = 256;
 
+/// Above this, a frame is summarized rather than kept.
+///
+/// Every frame is parsed and redacted whether or not tracing is on, and the
+/// last exchange is held until the next one replaces it, so a server that
+/// returns a large resource would otherwise keep several times its size
+/// resident for as long as the session lasts. Nobody reads a megabyte of
+/// JSON in a terminal either, so the same cap bounds what `--trace` prints.
+const MAX_FRAME_BYTES: usize = 1 << 20;
+
+/// Keep what identifies a frame, drop what makes it large.
+///
+/// The id and method are what `last` and the elapsed-time pairing need, and
+/// they are small by construction.
+fn summarize(raw_len: usize, json: &Value) -> Value {
+    let mut summary = serde_json::Map::new();
+    for key in ["jsonrpc", "id", "method"] {
+        if let Some(value) = json.get(key) {
+            summary.insert(key.to_string(), value.clone());
+        }
+    }
+    summary.insert(
+        "mcp-repl/truncated".to_string(),
+        Value::String(format!(
+            "{raw_len} bytes, over the {MAX_FRAME_BYTES} byte cap; body not retained"
+        )),
+    );
+    Value::Object(summary)
+}
+
 impl Wire {
     pub fn new(trace: bool) -> Self {
         Self {
@@ -123,6 +152,13 @@ impl Wire {
         let now = Instant::now();
         let json = redact(&parse(raw));
         let id = frame_id(&json);
+        // Parsing a large frame is transient; keeping it is not. Summarize
+        // before anything stores or renders it.
+        let json = if raw.len() > MAX_FRAME_BYTES {
+            summarize(raw.len(), &json)
+        } else {
+            json
+        };
         // A frame carrying a `method` is a request or a notification, whichever
         // side sent it. That is what separates our request from our response to
         // a server-initiated one, and a server's response from its own request.
@@ -476,6 +512,47 @@ mod tests {
 
     fn response(id: u32) -> String {
         serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}}).to_string()
+    }
+
+    /// The last exchange is held until the next one replaces it, so a server
+    /// that returns a large resource would otherwise keep it resident for the
+    /// rest of the session, several times over.
+    #[test]
+    fn an_oversized_frame_is_summarized_rather_than_kept() {
+        let wire = Wire::new(true);
+        let body = "x".repeat(4 * MAX_FRAME_BYTES);
+        let huge =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"text": body}}).to_string();
+        wire.sent(&request(1, "resources/read"));
+        wire.received(&huge);
+
+        let (_, response) = wire.last_exchange().unwrap();
+        let response = response.expect("the response is still paired with its request");
+        // What identifies the frame survives, so `last` still shows which
+        // exchange this was.
+        assert_eq!(response.json["id"], 1);
+        // The body does not.
+        assert!(response.json.get("result").is_none(), "{:?}", response.json);
+        let note = response.json["mcp-repl/truncated"]
+            .as_str()
+            .expect("the truncation is explained rather than silent");
+        assert!(note.contains(&huge.len().to_string()), "{note}");
+        // Cheap proxy for "not retained": the whole rendered frame is now far
+        // smaller than the payload it stood in for.
+        assert!(
+            serde_json::to_string(&response.json).unwrap().len() < 1024,
+            "the summary is small"
+        );
+    }
+
+    /// The cap must not touch ordinary traffic.
+    #[test]
+    fn a_normal_frame_is_kept_whole() {
+        let wire = Wire::new(true);
+        wire.sent(&request(1, "tools/call"));
+        wire.received(&response(1));
+        let (_, response) = wire.last_exchange().unwrap();
+        assert_eq!(response.unwrap().json["result"]["ok"], true);
     }
 
     #[test]
