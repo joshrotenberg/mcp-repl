@@ -132,7 +132,7 @@ impl ClientHandler for ReplClientHandler {
         match sampling::mode() {
             SamplingMode::Decline => Err(sampling::declined("--sampling decline")),
             SamplingMode::Canned => {
-                println!(
+                eprintln!(
                     "{} answered with the canned reply",
                     tag(Style::new().fg(Color::Purple), "sampling")
                 );
@@ -259,14 +259,14 @@ fn read_line() -> Option<String> {
 /// yes is a claim about something that happened outside the REPL, so the
 /// REPL cannot make it on the operator's behalf.
 fn confirm_url(server: &str, message: &str, url: &str) -> ElicitResult {
-    println!("{}", provenance(server));
-    println!("  {}", sanitize(message));
-    println!(
+    eprintln!("{}", provenance(server));
+    eprintln!("  {}", sanitize(message));
+    eprintln!(
         "  open: {}",
         paint(Style::new().underline(), &sanitize(url))
     );
-    print!("  confirm you completed this [y/N]> ");
-    let _ = std::io::stdout().flush();
+    eprint!("  confirm you completed this [y/N]> ");
+    let _ = std::io::stderr().flush();
     match read_line() {
         Some(answer) if matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") => ElicitResult {
             action: ElicitAction::Accept,
@@ -282,8 +282,8 @@ fn confirm_url(server: &str, message: &str, url: &str) -> ElicitResult {
 /// cancels. Empty input picks the default when one exists, otherwise skips
 /// optional fields.
 fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
-    println!("{}", provenance(server));
-    println!("  {}", sanitize(&form.message));
+    eprintln!("{}", provenance(server));
+    eprintln!("  {}", sanitize(&form.message));
     let mut content: HashMap<String, ElicitFieldValue> = HashMap::new();
     let mut names: Vec<&String> = form.requested_schema.properties.keys().collect();
     names.sort();
@@ -311,20 +311,20 @@ fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
                 paint(Style::new().dimmed(), &sanitize(&detail))
             ));
         }
-        println!("{prompt_line}");
+        eprintln!("{prompt_line}");
         // A server can ask for anything it likes, including an API key it
         // has no business holding. Say so before the answer is typed, since
         // afterwards it is too late.
         if crate::wire::looks_like_credential(name) {
-            println!(
+            eprintln!(
                 "  {} this field name looks like a credential; mcp-repl sends the answer to \
                  the server as typed",
                 paint(Style::new().fg(Color::Yellow).bold(), "warning:")
             );
         }
         loop {
-            print!("  {display_name}> ");
-            let _ = std::io::stdout().flush();
+            eprint!("  {display_name}> ");
+            let _ = std::io::stderr().flush();
             let mut buf = String::new();
             let read = {
                 let mut lock = std::io::stdin().lock();
@@ -343,7 +343,7 @@ fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
                     }
                     (None, false) => break,
                     (None, true) => {
-                        println!("  (required)");
+                        eprintln!("  (required)");
                         continue;
                     }
                 }

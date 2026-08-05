@@ -1305,11 +1305,12 @@ fn selected_oauth_profile(
 }
 
 fn demo_router() -> tower_mcp::McpRouter {
+    use tower_mcp::context::RequestContext;
     use tower_mcp::extract::{Context, Json, RawArgs};
     use tower_mcp::protocol::ToolAnnotations;
     use tower_mcp::protocol::{
-        CompleteResult, CompletionReference, ElicitAction, ElicitFormParams, ElicitFormSchema,
-        ReadResourceResult,
+        CompleteResult, CompletionReference, ElicitRequestParams, InputRequest, InputRequests,
+        InputRequiredResult, InputResponse, ReadResourceResult, RequestOutcome,
     };
     use tower_mcp::resource::ResourceTemplateBuilder;
     use tower_mcp::{CallToolResult, PromptBuilder, TaskSupportMode, ToolBuilder};
@@ -1496,41 +1497,95 @@ fn demo_router() -> tower_mcp::McpRouter {
         .tool(
             ToolBuilder::new("sign_in")
                 .description("Ask you for credentials (elicitation demo)")
-                .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
-                    let form = ElicitFormParams {
-                        mode: None,
-                        message: "The demo server would like to know who you are.".to_string(),
-                        requested_schema: ElicitFormSchema::new()
-                            .string_field("username", Some("Any name will do"), true)
-                            .enum_field(
-                                "environment",
-                                Some("Which environment to sign in to"),
-                                vec!["staging".to_string(), "production".to_string()],
-                                false,
-                            )
-                            .boolean_field("remember_me", Some("Stay signed in"), false),
-                        meta: None,
-                    };
-                    let answer = ctx.elicit_form(form).await?;
-                    let text = match answer.action {
-                        ElicitAction::Accept => {
-                            let content = answer.content.unwrap_or_default();
-                            // Render the answer as the operator typed it,
-                            // not as Rust's Debug shows it.
-                            let username = content
-                                .get("username")
-                                .and_then(|v| serde_json::to_value(v).ok())
-                                .and_then(|v| v.as_str().map(str::to_string))
-                                .unwrap_or_else(|| "(nobody)".to_string());
-                            format!("signed in as {username}")
-                        }
-                        ElicitAction::Decline => "declined".to_string(),
-                        _ => "cancelled".to_string(),
-                    };
-                    Ok(CallToolResult::text(text))
+                // An MRTR handler, because the two lifecycles route a
+                // server's question to the operator differently and this
+                // tool has to work on both. See `sign_in_form`.
+                .mrtr_handler(|ctx: RequestContext, _input: SignInInput| async move {
+                    // A 2026-07-28 retry carries the answers the client
+                    // collected for the requests returned below.
+                    if let Some(responses) = ctx.input_responses() {
+                        let answer = responses.values().find_map(|response| match response {
+                            InputResponse::Elicit(result) => Some(result.clone()),
+                            _ => None,
+                        });
+                        return Ok(RequestOutcome::Complete(CallToolResult::text(
+                            describe_sign_in(answer.as_ref()),
+                        )));
+                    }
+                    if uses_final_lifecycle(&ctx) {
+                        // 2026-07-28 has no server-initiated requests: the
+                        // question travels as an input request in the result,
+                        // and the client fulfils it and calls again
+                        // (SEP-2322).
+                        let mut requests = InputRequests::new();
+                        requests.insert(
+                            "credentials".to_string(),
+                            InputRequest::Elicit(ElicitRequestParams::Form(sign_in_form())),
+                        );
+                        return Ok(RequestOutcome::input_required(
+                            InputRequiredResult::with_requests(requests),
+                        ));
+                    }
+                    // The stable lifecycle lets the server ask directly.
+                    let answer = ctx.elicit_form(sign_in_form()).await?;
+                    Ok(RequestOutcome::Complete(CallToolResult::text(
+                        describe_sign_in(Some(&answer)),
+                    )))
                 })
                 .build(),
         )
+}
+
+/// `sign_in` takes no arguments; the values come from the operator.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct SignInInput {}
+
+/// What the demo asks for, in both lifecycles.
+fn sign_in_form() -> tower_mcp::protocol::ElicitFormParams {
+    tower_mcp::protocol::ElicitFormParams {
+        mode: None,
+        message: "The demo server would like to know who you are.".to_string(),
+        requested_schema: tower_mcp::protocol::ElicitFormSchema::new()
+            .string_field("username", Some("Any name will do"), true)
+            .enum_field(
+                "environment",
+                Some("Which environment to sign in to"),
+                vec!["staging".to_string(), "production".to_string()],
+                false,
+            )
+            .boolean_field("remember_me", Some("Stay signed in"), false),
+        meta: None,
+    }
+}
+
+/// Whether this request is on the 2026-07-28 lifecycle, which is what
+/// decides between returning an input request and asking directly.
+fn uses_final_lifecycle(ctx: &tower_mcp::context::RequestContext) -> bool {
+    ctx.extensions()
+        .get::<tower_mcp::stateless::StatelessRequestMeta>()
+        .and_then(|meta| meta.protocol_version.as_deref())
+        .is_some_and(|version| version == tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
+}
+
+/// Render an elicitation answer the way the operator gave it.
+fn describe_sign_in(answer: Option<&tower_mcp::protocol::ElicitResult>) -> String {
+    use tower_mcp::protocol::ElicitAction;
+    let Some(answer) = answer else {
+        return "no answer".to_string();
+    };
+    match answer.action {
+        ElicitAction::Accept => {
+            let content = answer.content.clone().unwrap_or_default();
+            let username = content
+                .get("username")
+                .and_then(|v| serde_json::to_value(v).ok())
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "(nobody)".to_string());
+            format!("signed in as {username}")
+        }
+        ElicitAction::Decline => "declined".to_string(),
+        _ => "cancelled".to_string(),
+    }
 }
 
 // Every field's doc comment below becomes the description the completion
