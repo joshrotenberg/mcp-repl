@@ -13,6 +13,17 @@ All of these must pass before submitting a PR. The black-box tests build and
 spawn the fixture server in `examples/mcp_repl_fixture.rs`, so the first run
 compiles tower-mcp's server features as dev-dependencies.
 
+Adding or updating a dependency also needs:
+
+```bash
+cargo deny check
+```
+
+which checks the graph against RUSTSEC advisories, the license allowlist in
+`deny.toml`, and the ban on wildcard versions and non-crates.io sources. CI
+runs it on every push and daily, since an advisory can be published against a
+dependency that has not changed. Install it with `cargo install cargo-deny`.
+
 ## Commit Messages
 
 Use conventional-commit prefixes (`feat:`, `fix:`, `docs:`, `test:`,

@@ -1,0 +1,52 @@
+# cargo-deny: dependency advisories, licenses, and sources.
+#
+# Run locally with `cargo deny check`. CI runs the same thing on every push
+# and pull request, plus daily so a newly published advisory against an
+# unchanged dependency is noticed without waiting for the next commit.
+
+[graph]
+# Check every target, not just the host's. `keyring` and `webbrowser` pull
+# different dependencies per platform, and a Linux-only advisory is still an
+# advisory for a crate people install with `cargo install`.
+all-features = true
+
+[advisories]
+version = 2
+# Nothing ignored. An entry here needs a comment saying why and when it goes.
+ignore = []
+
+[licenses]
+version = 2
+# Everything the graph actually uses, and nothing broader. This crate is
+# MIT OR Apache-2.0, so the list stays permissive-only: no copyleft, and no
+# "allow anything" escape hatch.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # The Mozilla CA root bundle that rustls ships, via reqwest. A permissive
+    # license for *data* rather than code, which is what a list of
+    # certificates is. Nothing in this crate is CDLA-licensed.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicate versions are a fact of a large graph and not something this crate
+# can fix from here, so they are visible rather than fatal.
+multiple-versions = "warn"
+# A wildcard dependency makes the build unreproducible and would let a
+# breaking upload land silently.
+wildcards = "deny"
+
+[sources]
+# Everything comes from crates.io. A git dependency would also make the crate
+# unpublishable, so this catches a stray `[patch]` left in by accident.
+unknown-registry = "deny"
+unknown-git = "deny"
