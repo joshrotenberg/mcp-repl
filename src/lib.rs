@@ -432,8 +432,67 @@ fn report_error_with_hint(status: ExitStatus, message: &str, hint: Option<&str>)
 fn report_mcp_error(error: &tower_mcp::Error) {
     report_error(
         ExitStatus::from_mcp_error(error),
-        collapse_repeated_label(&error.to_string()),
+        &describe_mcp_error(error),
     );
+}
+
+/// Pull the human sentence out of an error a peer embedded as JSON.
+///
+/// A server that relays a client-originated failure puts the whole encoded
+/// error in its message, so declining a sampling request comes back as
+/// `Client error: {"code":-32007,"message":"sampling declined: ..."}`. The
+/// only part worth reading is the innermost message, and declining is a
+/// documented choice here rather than an exotic path.
+///
+/// Conservative by construction: the embedded text has to parse as an object
+/// carrying a string `message`, or the original is returned untouched.
+fn unwrap_nested(message: &str) -> String {
+    let Some(start) = message.find('{') else {
+        return message.to_string();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&message[start..]) else {
+        return message.to_string();
+    };
+    match value.get("message").and_then(serde_json::Value::as_str) {
+        // Recurse: nothing stops a relay from being relayed.
+        Some(inner) if !inner.is_empty() => unwrap_nested(inner),
+        _ => message.to_string(),
+    }
+}
+
+/// What a server's failure should look like to the operator.
+///
+/// The framework's `Display` for a JSON-RPC error is `{0:?}`, so the struct
+/// arrives as Rust debug output: `JsonRpcError { code: -32601, message:
+/// "Method not found", data: None }`. That is the single most common failure
+/// a client shows, since it is every rejection a server sends, and the parts
+/// worth reading are buried in syntax that means nothing to a person.
+///
+/// Rendered here rather than upstream because this is a presentation choice:
+/// a library is right to keep the whole value, and only the thing with a
+/// terminal knows what belongs on it.
+fn describe_mcp_error(error: &tower_mcp::Error) -> String {
+    let tower_mcp::Error::JsonRpc(rpc) = error else {
+        return collapse_repeated_label(&error.to_string()).to_string();
+    };
+    let mut described = format!(
+        "{} (code {})",
+        sanitize(&unwrap_nested(&rpc.message)),
+        rpc.code
+    );
+    // `data` is free-form and server-authored. Worth showing, since it is
+    // where a server puts the detail that makes a rejection actionable, but
+    // only when it says something a person can read.
+    if let Some(data) = &rpc.data {
+        let detail = match data {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        if !detail.is_empty() && detail != "null" {
+            described.push_str(&format!(": {}", sanitize(&detail)));
+        }
+    }
+    described
 }
 
 /// Build the log subscriber once the CLI's own settings are known.
@@ -1451,7 +1510,7 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
                 } else {
                     eprintln!(
                         "warning: fetching {what} failed: {}",
-                        collapse_repeated_label(&e.to_string())
+                        describe_mcp_error(&e)
                     );
                     // A part the REPL could not read is a failure of the run,
                     // not an empty result: without this an --exec script that
@@ -5533,6 +5592,69 @@ mod tests {
             Some(3),
             "{value}"
         );
+    }
+
+    #[test]
+    fn a_json_rpc_error_reads_as_a_sentence_and_a_code() {
+        let error = tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
+            code: -32601,
+            message: "Method not found".to_string(),
+            data: None,
+        });
+        // Not `JsonRpcError { code: -32601, message: "...", data: None }`.
+        assert_eq!(describe_mcp_error(&error), "Method not found (code -32601)");
+    }
+
+    #[test]
+    fn structured_error_data_is_shown_when_it_says_something() {
+        let with_data = |data: serde_json::Value| {
+            describe_mcp_error(&tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
+                code: -32602,
+                message: "Invalid params".to_string(),
+                data: Some(data),
+            }))
+        };
+        assert_eq!(
+            with_data(serde_json::json!("field `name` is required")),
+            "Invalid params (code -32602): field `name` is required"
+        );
+        // Null carries nothing, so it is not printed as the word "null".
+        assert_eq!(
+            with_data(serde_json::Value::Null),
+            "Invalid params (code -32602)"
+        );
+    }
+
+    #[test]
+    fn an_error_relayed_as_json_shows_its_innermost_message() {
+        // What a server sends back when this client declines a request.
+        assert_eq!(
+            unwrap_nested(
+                r#"Client error: {"code":-32007,"message":"sampling declined: --sampling decline"}"#
+            ),
+            "sampling declined: --sampling decline"
+        );
+        // Relays can nest.
+        assert_eq!(
+            unwrap_nested(r#"outer: {"message":"middle: {\"message\":\"inner\"}"}"#),
+            "inner"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_is_left_alone_by_the_unwrapping() {
+        for message in [
+            "Method not found",
+            "",
+            // A brace, but not JSON.
+            "unexpected token {",
+            // JSON, but not an error envelope.
+            r#"bad input: {"field":"name"}"#,
+            // An envelope with no message to promote.
+            r#"relayed: {"code":-1}"#,
+        ] {
+            assert_eq!(unwrap_nested(message), message, "{message:?}");
+        }
     }
 
     #[test]
