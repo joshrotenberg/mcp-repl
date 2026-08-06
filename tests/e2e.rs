@@ -879,26 +879,49 @@ async fn exercise_login_json(temp: &TempDir) {
         String::from_utf8_lossy(&with_exec.stdout)
     );
 
-    // Removing a profile reports what it removed, as one value.
+    // Removing a profile touches the operating-system credential store, which
+    // a headless runner does not have. Both outcomes are correct, and the
+    // contract is what this pins: exactly one parseable value either way,
+    // the success shape or the standard auth envelope. The failure branch is
+    // worth covering in its own right, since "a script gets an envelope
+    // rather than prose when it fails" is half the point of the flag.
     let mut logout = repl_command();
     logout.args(["--logout", "work", "--json", "--config", &config]);
     let logout = run(logout, "logout json", CASE_TIMEOUT).await;
-    assert_success(&logout, "logout json");
     let values = json_lines(&logout, "logout json");
     assert_eq!(values.len(), 1, "one value per invocation");
-    assert_eq!(values[0]["profile"], "work");
-    assert_eq!(values[0]["removed"], true);
+    match logout.status.code() {
+        Some(0) => {
+            assert_eq!(values[0]["profile"], "work");
+            assert_eq!(values[0]["removed"], true);
+        }
+        Some(5) => {
+            assert_eq!(values[0]["kind"], "auth");
+            assert_eq!(values[0]["exitStatus"], 5);
+        }
+        other => panic!("unexpected logout status {other:?}: {}", values[0]),
+    }
 
-    // Without `--json`, the human wording is unchanged.
+    // Without `--json`, the human wording is unchanged. Same split: the
+    // message goes to stdout on success and stderr on failure, because
+    // stdout is the data stream.
     let mut human = repl_command();
     human.args(["--logout", "work", "--config", &config]);
     let human = run(human, "logout human", CASE_TIMEOUT).await;
-    assert_success(&human, "logout human");
-    assert!(
-        String::from_utf8_lossy(&human.stdout).contains("removed OAuth profile"),
-        "{}",
-        String::from_utf8_lossy(&human.stdout)
-    );
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    if human.status.success() {
+        assert!(stdout.contains("removed OAuth profile"), "{stdout}");
+    } else {
+        assert!(
+            stderr.contains("credential store"),
+            "a failure explains itself on stderr:\n{stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "and stdout stays the data stream: {stdout}"
+        );
+    }
 }
 
 /// `[repl] request_timeout` supplies the default `--timeout` uses.
