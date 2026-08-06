@@ -28,7 +28,23 @@ tape means to type out.
 PATH="$PWD/target/release:$PATH" vhs docs/tapes/scripting.tape
 ```
 
-Two details worth knowing before editing a tape. `Output` ending in `.png`
-makes vhs write a directory of frames, so the still tapes send `Output` to a
-throwaway GIF and keep only the `Screenshot`. And `Type` cannot parse escaped
-quotes, so a line containing double quotes has to be wrapped in single ones.
+Three details worth knowing before editing a tape, all of which fail
+silently rather than loudly.
+
+`Output` ending in `.png` makes vhs write a *directory* of frames, so the
+still tapes send `Output` to a throwaway GIF and keep only the `Screenshot`.
+
+`Screenshot` on the last line of a tape writes nothing, and vhs still exits
+0. Every still tape therefore ends with a `Sleep`, so there is a frame after
+the one being captured. Without it the old image stays on disk and the run
+looks like it worked, which is exactly how `scripting.png` went stale.
+
+`Type` cannot parse escaped quotes, so a line containing double quotes has to
+be wrapped in single ones.
+
+A tape that shells out to `mcp-repl` by name runs whatever `PATH` resolves,
+and vhs starts a login shell that re-reads your profile. An older
+`cargo install`ed copy in `~/.cargo/bin` will win, and the recording will
+show a version of the tool that is not the one you built. Check with
+`bash -lc 'command -v mcp-repl'` if a recording shows something you do not
+recognise.
