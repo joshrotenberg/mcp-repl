@@ -842,6 +842,65 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
+/// `--login`/`--logout` under `--json` speak the same NDJSON contract.
+///
+/// The success path of `--login` needs a real authorization server, so what
+/// is reachable here is everything around it: that `--json` is accepted at
+/// all, that a failure is the standard envelope rather than prose, and that
+/// `--logout` reports what it removed. The shape of a saved profile is
+/// covered by a unit test.
+async fn exercise_login_json(temp: &TempDir) {
+    let config = temp.path().join("login.toml");
+    std::fs::write(&config, "").expect("write empty config");
+    let config = config.display().to_string();
+
+    // A usage failure is the same envelope every other command emits, on
+    // stdout, so it occupies that invocation's one output line.
+    let mut missing_url = repl_command();
+    missing_url.args(["--login", "work", "--json", "--config", &config]);
+    let missing_url = run(missing_url, "login without a url", CASE_TIMEOUT).await;
+    assert_status(&missing_url, 2, "login without a url");
+    let values = json_lines(&missing_url, "login without a url");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "usage");
+    assert_eq!(values[0]["exitStatus"], 2);
+
+    // `--json` is now allowed, but the genuinely incompatible combinations
+    // are still refused.
+    let mut with_exec = repl_command();
+    with_exec.args([
+        "--login", "work", "--json", "--exec", "tools", "--config", &config,
+    ]);
+    let with_exec = run(with_exec, "login with exec", CASE_TIMEOUT).await;
+    assert_status(&with_exec, 2, "login with exec");
+    assert!(
+        String::from_utf8_lossy(&with_exec.stdout).contains("standalone credential"),
+        "{}",
+        String::from_utf8_lossy(&with_exec.stdout)
+    );
+
+    // Removing a profile reports what it removed, as one value.
+    let mut logout = repl_command();
+    logout.args(["--logout", "work", "--json", "--config", &config]);
+    let logout = run(logout, "logout json", CASE_TIMEOUT).await;
+    assert_success(&logout, "logout json");
+    let values = json_lines(&logout, "logout json");
+    assert_eq!(values.len(), 1, "one value per invocation");
+    assert_eq!(values[0]["profile"], "work");
+    assert_eq!(values[0]["removed"], true);
+
+    // Without `--json`, the human wording is unchanged.
+    let mut human = repl_command();
+    human.args(["--logout", "work", "--config", &config]);
+    let human = run(human, "logout human", CASE_TIMEOUT).await;
+    assert_success(&human, "logout human");
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("removed OAuth profile"),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+}
+
 /// `[repl] request_timeout` supplies the default `--timeout` uses.
 ///
 /// The precedence is what matters and what a unit test cannot see: the flag
@@ -1475,6 +1534,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_tools_only_server(&fixture, &temp).await;
         exercise_loglevel(&fixture, &temp).await;
         exercise_repl_config(&temp).await;
+        exercise_login_json(&temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;

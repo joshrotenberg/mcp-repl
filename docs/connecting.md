@@ -105,7 +105,25 @@ mcp-repl --login work --http https://mcp.example.com/mcp --no-browser
 
 # Remove both profile metadata and credentials.
 mcp-repl --logout work
+
+# Report what was created, for a script that provisions profiles.
+mcp-repl --login work --http https://mcp.example.com/mcp --json
 ```
+
+`--json` works on both, following the same NDJSON conventions `--exec` does:
+one value on stdout, prompts and progress on stderr, and the standard error
+envelope on failure.
+
+```json
+{"profile":"work","serverUrl":"https://mcp.example.com/mcp","scopes":["openid","offline_access"]}
+{"profile":"work","removed":true}
+```
+
+The scopes reported are the ones actually recorded, not the ones requested,
+which is what a provisioning script needs to know. No credential appears
+there and none can: the tokens are in the operating-system credential store
+and mcp-repl's config side never holds them. `--no-browser` benefits most,
+since that flow is the one a remote or headless setup drives.
 
 Login follows MCP protected-resource and authorization-server discovery,
 requires PKCE S256, tries an optional Client ID Metadata Document before
