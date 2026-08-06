@@ -1239,6 +1239,15 @@ async fn exercise_unreadable_listing(fixture: &Path, temp: &TempDir) {
         Some(0),
         "a listing that failed to load is not a success:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    // The server's rejection is a sentence and a code, not a struct dump.
+    assert!(
+        stderr.contains("tool index unavailable (code -32603)"),
+        "a server's error reads as a sentence:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("JsonRpcError {"),
+        "and not as Rust debug output:\n{stderr}"
+    );
     assert!(
         stdout.trim().is_empty(),
         "stdout is the data stream, and there is no data:\n{stdout}"
