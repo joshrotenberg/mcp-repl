@@ -3325,6 +3325,27 @@ enum Ran {
 /// awaited and the REPL takes the next line. The server is not told to stop
 /// (see the note in the module docs), so a tool with side effects may still
 /// be running on the other end.
+/// The tool a cancelled line was calling, when it could have been a task.
+///
+/// Only for the hint after an interrupt. A line that already ends in `&` is
+/// a task and returned long ago, and a built-in is not a tool, so neither
+/// gets one.
+fn backgroundable_tool(surface: &Arc<RwLock<Surface>>, line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.ends_with('&') {
+        return None;
+    }
+    let word = line.split_whitespace().next()?;
+    if BUILTINS.iter().any(|(name, _)| *name == word) {
+        return None;
+    }
+    let surface = surface.read().ok()?;
+    let tool = surface.tools.iter().find(|tool| tool.name == word)?;
+    tool_tags(tool)
+        .contains(&"task-capable")
+        .then(|| tool.name.clone())
+}
+
 async fn run_cancellable(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
@@ -3345,7 +3366,18 @@ async fn run_cancellable(
             } else {
                 // stderr: an interrupted command produced no result, and in
                 // human --exec mode stdout is the data stream.
-                eprintln!("{} cancelled", paint(Style::new().dimmed(), "^C"));
+                let mut message = format!("{} cancelled", paint(Style::new().dimmed(), "^C"));
+                // Interrupting a long call usually means it should have been
+                // backgrounded. The REPL cannot retrieve this one, since a
+                // plain call leaves no task behind to adopt, but it can say
+                // what to type next time.
+                if let Some(tool) = backgroundable_tool(surface, line) {
+                    message.push_str(&paint(
+                        Style::new().dimmed(),
+                        &format!("  `{tool} ... &` runs it as a task instead"),
+                    ));
+                }
+                eprintln!("{message}");
             }
             Ran::Cancelled
         }
@@ -5347,6 +5379,45 @@ mod tests {
 
     use async_trait::async_trait;
     use tower_mcp::client::ClientTransport;
+
+    fn surface_with_a_task_capable_tool() -> Arc<RwLock<Surface>> {
+        let tool = |name: &str, task: bool| -> ToolDefinition {
+            let mut value = serde_json::json!({
+                "name": name,
+                "description": "",
+                "inputSchema": { "type": "object" },
+            });
+            if task {
+                value["execution"] = serde_json::json!({ "taskSupport": "optional" });
+            }
+            serde_json::from_value(value).expect("tool definition")
+        };
+        Arc::new(RwLock::new(Surface {
+            tools: vec![tool("slow_add", true), tool("echo", false)],
+            ..Default::default()
+        }))
+    }
+
+    /// The hint after an interrupt is only useful where backgrounding is
+    /// actually available, and wrong everywhere else.
+    #[test]
+    fn only_a_task_capable_tool_is_worth_suggesting_backgrounding_for() {
+        let surface = surface_with_a_task_capable_tool();
+        assert_eq!(
+            backgroundable_tool(&surface, "slow_add a=1 b=2").as_deref(),
+            Some("slow_add")
+        );
+        // Not task-capable: `&` would be refused.
+        assert_eq!(backgroundable_tool(&surface, "echo message=hi"), None);
+        // Already a task, so it returned long ago and this interrupt was
+        // something else.
+        assert_eq!(backgroundable_tool(&surface, "slow_add a=1 b=2 &"), None);
+        // A built-in is not a tool, however long it took.
+        assert_eq!(backgroundable_tool(&surface, "wait 1"), None);
+        // Nothing the server offers by that name.
+        assert_eq!(backgroundable_tool(&surface, "nope"), None);
+        assert_eq!(backgroundable_tool(&surface, ""), None);
+    }
 
     #[test]
     fn a_saved_oauth_profile_reports_what_a_script_needs() {
