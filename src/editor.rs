@@ -474,6 +474,15 @@ impl Completer for ReplCompleter {
                     }
                 }
             }
+            // The levels are a fixed scale the server does not choose, so
+            // offering them saves a trip to `help`.
+            "loglevel" => {
+                for level in crate::LOG_LEVELS {
+                    if level.starts_with(word) {
+                        out.push(word_suggestion(*level, None, span));
+                    }
+                }
+            }
             "wire" => {
                 for state in ["on", "off"] {
                     if state.starts_with(word) {

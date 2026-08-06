@@ -548,6 +548,7 @@ pub(crate) const BUILTINS: &[(&str, &str)] = &[
     ("alias", "define, list, or show a command alias"),
     ("unalias", "remove a command alias"),
     ("ping", "check the server is answering"),
+    ("loglevel", "set the server's log verbosity"),
     ("refresh", "re-fetch the server surface"),
     ("info", "replay the connection banner plus capabilities"),
     ("wire", "toggle raw JSON-RPC frame tracing (on|off)"),
@@ -679,6 +680,13 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
         "unalias",
         "unalias [--global] <name>",
         "Remove the alias that is in effect for a name.",
+    ),
+    (
+        "loglevel",
+        "loglevel <debug|info|notice|warning|error|critical|alert|emergency>",
+        "Ask the server to change how much it logs, via `logging/setLevel`. Levels are the \
+         syslog severities the MCP spec uses, least severe first: a level means that one and \
+         everything more severe. Needs the server to declare the `logging` capability.",
     ),
     (
         "ping",
@@ -2629,6 +2637,33 @@ fn resolve_import(args: &Args) -> Option<import_config::ImportedConnection> {
     )
 }
 
+/// The levels `logging/setLevel` accepts, in the spec's order of severity.
+/// Ordered rather than alphabetical, so the completion menu reads as a scale.
+pub(crate) const LOG_LEVELS: &[&str] = &[
+    "debug",
+    "info",
+    "notice",
+    "warning",
+    "error",
+    "critical",
+    "alert",
+    "emergency",
+];
+
+fn parse_log_level(word: &str) -> Option<LogLevel> {
+    match word.to_ascii_lowercase().as_str() {
+        "debug" => Some(LogLevel::Debug),
+        "info" => Some(LogLevel::Info),
+        "notice" => Some(LogLevel::Notice),
+        "warning" => Some(LogLevel::Warning),
+        "error" => Some(LogLevel::Error),
+        "critical" => Some(LogLevel::Critical),
+        "alert" => Some(LogLevel::Alert),
+        "emergency" => Some(LogLevel::Emergency),
+        _ => None,
+    }
+}
+
 fn log_level_style(level: LogLevel) -> Style {
     match level {
         LogLevel::Emergency | LogLevel::Alert | LogLevel::Critical | LogLevel::Error => {
@@ -4100,6 +4135,58 @@ async fn handle_line(
                             "{} {}",
                             paint(Style::new().fg(Color::Green), "ok"),
                             timing(elapsed)
+                        );
+                    }
+                }
+                Err(e) => report_mcp_error(&e),
+            }
+        }
+        "loglevel" => {
+            let Some(typed) = rest.first() else {
+                command_error(&format!("usage: loglevel <{}>", LOG_LEVELS.join("|")));
+                return false;
+            };
+            let Some(level) = parse_log_level(typed) else {
+                // Not `did you mean`: the answer is the whole scale, and the
+                // levels are worth seeing in severity order rather than one
+                // guess at what was meant.
+                report_error(
+                    ExitStatus::Usage,
+                    &format!(
+                        "unknown log level `{}` (levels are {})",
+                        sanitize(typed),
+                        LOG_LEVELS.join(", ")
+                    ),
+                );
+                return false;
+            };
+            // The server said whether it has logging at all. Sending anyway
+            // would earn a "method not found" the operator would have to
+            // interpret; saying so first is the same information, sooner.
+            let declared = connection_info(&client)
+                .await
+                .is_some_and(|info| info.capabilities.logging.is_some());
+            if !declared {
+                report_error(
+                    ExitStatus::Server,
+                    "this server does not declare the `logging` capability, so it has no \
+                     level to set (any notifications it sends arrive regardless)",
+                );
+                return false;
+            }
+            let started = std::time::Instant::now();
+            let params = serde_json::json!({ "level": level });
+            match with_deadline(client.request::<_, serde_json::Value>("logging/setLevel", &params))
+                .await
+            {
+                Ok(_) => {
+                    if json_output() {
+                        print_json(&serde_json::json!({ "level": level }));
+                    } else {
+                        println!(
+                            "log level set to {} {}",
+                            paint(log_level_style(level), &level.to_string()),
+                            timing(started.elapsed())
                         );
                     }
                 }
