@@ -2653,6 +2653,87 @@ fn print_man() {
 /// Discovery on purpose stops at describing. Automatic connection would make
 /// the source of a session invisible, which is the reason `PATH:ENTRY` is
 /// explicit in the first place; this just saves typing the path.
+/// A config path as someone would type it.
+///
+/// `candidate_paths` builds absolute paths, and an absolute path under a
+/// temporary directory is both unreadable and useless to copy. A selector
+/// takes any path, so the shortest one that still resolves is the one worth
+/// printing: relative to here, or under `~`.
+fn typeable_path(
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> String {
+    if let Ok(relative) = path.strip_prefix(cwd) {
+        return relative.display().to_string();
+    }
+    if let Some(relative) = home.and_then(|home| path.strip_prefix(home).ok()) {
+        return format!("~/{}", relative.display());
+    }
+    path.display().to_string()
+}
+
+/// What to say when no server was named.
+///
+/// The usage line alone is a dead end: the commonest way to meet this
+/// program is to type its name, and being told the grammar of an invocation
+/// does not say which server to point it at. The machines that run MCP
+/// clients usually have some configured already, and `--scan` can find them,
+/// so the answer is a list of things that would work.
+fn no_target_message() -> String {
+    const USAGE: &str =
+        "usage: mcp-repl <server command...> | --http <url> | --server <name> | --demo";
+
+    // Discovery reads files and nothing else, so it is safe on the way to an
+    // error. Under --json or --exec the caller wants the usage line and not a
+    // survey of the machine.
+    if json_output() || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return USAGE.to_string();
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let found: Vec<String> =
+        import_config::scan(&import_config::candidate_paths(&cwd, home.as_deref()))
+            .into_iter()
+            .filter_map(|file| {
+                let entries = file.result.ok()?;
+                let path = typeable_path(&file.path, &cwd, home.as_deref());
+                Some(
+                    entries
+                        .into_iter()
+                        .map(|entry| format!("{path}:{}", entry.name))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect();
+
+    if found.is_empty() {
+        return format!("{USAGE}\n\ntry `mcp-repl --demo`, which needs no server at all");
+    }
+
+    // A few, not all of them: this is a nudge rather than the `--scan` report,
+    // which is one command away and says more.
+    const SHOWN: usize = 5;
+    let mut message =
+        String::from("mcp-repl needs a server. These are configured on this machine:");
+    for selector in found.iter().take(SHOWN) {
+        message.push_str(&format!("\n  {}", sanitize(selector)));
+    }
+    if found.len() > SHOWN {
+        message.push_str(&format!(
+            "\n  ... and {} more; `mcp-repl --scan` lists them all",
+            found.len() - SHOWN
+        ));
+    }
+    message.push_str(&format!(
+        "\n\ntry `mcp-repl {}`, or `mcp-repl --demo` for the built-in one",
+        found[0]
+    ));
+    message
+}
+
 fn print_scan() -> ExitStatus {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -3305,11 +3386,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                     .await?
             }
             None => {
-                exit_with_error(
-                    ExitStatus::Usage,
-                    "usage: mcp-repl <server command...> | --http <url> | \
-                     --server <name> | --demo",
-                );
+                exit_with_error(ExitStatus::Usage, &no_target_message());
             }
         }
     };
@@ -5591,6 +5668,49 @@ mod tests {
             value.as_object().map(|object| object.len()),
             Some(3),
             "{value}"
+        );
+    }
+
+    #[test]
+    fn a_config_path_is_shown_the_way_it_would_be_typed() {
+        let cwd = std::path::Path::new("/work/project");
+        let home = std::path::Path::new("/home/ada");
+        // Under the working directory: the relative form is what a selector
+        // takes and what fits on a line.
+        assert_eq!(
+            typeable_path(
+                std::path::Path::new("/work/project/.mcp.json"),
+                cwd,
+                Some(home)
+            ),
+            ".mcp.json"
+        );
+        assert_eq!(
+            typeable_path(
+                std::path::Path::new("/work/project/.vscode/mcp.json"),
+                cwd,
+                Some(home)
+            ),
+            ".vscode/mcp.json"
+        );
+        // Under home: `~` expands in the shell, so it is still typeable.
+        assert_eq!(
+            typeable_path(
+                std::path::Path::new("/home/ada/.claude.json"),
+                cwd,
+                Some(home)
+            ),
+            "~/.claude.json"
+        );
+        // Neither: absolute is the only thing that resolves.
+        assert_eq!(
+            typeable_path(std::path::Path::new("/etc/mcp.json"), cwd, Some(home)),
+            "/etc/mcp.json"
+        );
+        // No home to compare against.
+        assert_eq!(
+            typeable_path(std::path::Path::new("/home/ada/.claude.json"), cwd, None),
+            "/home/ada/.claude.json"
         );
     }
 
