@@ -109,8 +109,14 @@ impl Session {
         };
         let _guard = self.reconnecting.lock().await;
         if self.generation() != seen {
+            tracing::debug!(
+                seen,
+                current = self.generation(),
+                "another command already reconnected; reusing its client"
+            );
             return Ok(());
         }
+        tracing::debug!(generation = seen, "reconnecting");
         // A restarting server is usually a second or two from ready; a short
         // pause makes the retry land after the bind rather than during it.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -118,6 +124,7 @@ impl Session {
         *self.client.write().unwrap() = Arc::new(fresh);
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
+        tracing::debug!(generation, "reconnected");
         Ok(())
     }
 }

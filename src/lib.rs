@@ -2881,6 +2881,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     // in-process demo router cannot lose a session at all.
     let mut connector: Option<Connector> = None;
     let client = if args.demo {
+        tracing::debug!("connecting to the in-process demo server");
         builder
             .connect(
                 TracingTransport::new(ChannelTransport::new(demo_router())),
@@ -2954,6 +2955,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                     )
                     .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
                     if interactive {
+                        tracing::debug!(profile = %name, "OAuth: interactive authorization");
                         flow.authorize(metadata.scopes.clone())
                             .await
                             .map_err(|error| {
@@ -2979,7 +2981,12 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                                  Run `mcp-repl --login {name} --http {url}` to reauthorize"
                             ))
                         })? {
-                            OAuthAuthorizationStart::Authorized { .. } => {}
+                            OAuthAuthorizationStart::Authorized { .. } => {
+                                tracing::debug!(
+                                    profile = %name,
+                                    "OAuth: restored a stored credential"
+                                );
+                            }
                             OAuthAuthorizationStart::Pending(_) => {
                                 return Err(tower_mcp::Error::Transport(format!(
                                     "OAuth login required for profile {name:?}; run \
@@ -3183,6 +3190,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                 // arrived during the wait as covered by this refetch.
                 tokio::time::sleep(SURFACE_REFRESH_DEBOUNCE).await;
                 refresh_rx.mark_unchanged();
+                tracing::debug!("surface change signalled; re-fetching");
                 let fresh = fetch_surface(&session.client()).await;
                 async_output.line(format!("{} {}, {}, {}",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),

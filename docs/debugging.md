@@ -91,17 +91,34 @@ cratesio> bench get_downloads crate=serde --n 50 --concurrency 8
   latency fields are `null` when nothing succeeded, so a failed run cannot be
   read as an instant one.
 
-## Framework logs
+## Logs
 
-`wire on` shows what was sent and received. When the question is what the
-client did *around* those frames, the tower-mcp client library logs through
-[`tracing`], and `RUST_LOG` turns it on:
+`wire on` shows what was sent and received. Some of what mcp-repl does never
+becomes a frame, and that is what logging is for. Both mcp-repl and the
+tower-mcp client library log through [`tracing`], and `RUST_LOG` turns them
+on:
 
 ```bash
+# mcp-repl's own decisions
+RUST_LOG=mcp_repl=debug mcp-repl .mcp.json:prod
+
+# the client library underneath it
 RUST_LOG=tower_mcp=debug mcp-repl --http https://example.invalid/mcp
+
+# both, for one session
+RUST_LOG=mcp_repl=debug,tower_mcp=debug mcp-repl --server prod
 ```
 
-This is off by default, including its warnings. The client narrates failures
+mcp-repl's own records cover the decisions a frame cannot explain: which
+config file and entry a selector resolved to, which approval let a stdio
+child be spawned, which OAuth path a session took, why a reconnect fired and
+which command won the race, and what triggered a surface refresh. If the
+question is "why did it connect to *that*", start here.
+
+Records go to stderr, so `--json` stdout stays one value per command with
+logging on.
+
+The tower-mcp records are off by default, including their warnings. The client narrates failures
 mcp-repl already reports in its own words, and warns about responses to
 requests mcp-repl cancelled deliberately, so leaving it on meant the same
 event arrived twice and framework text landed at a prompt that otherwise
