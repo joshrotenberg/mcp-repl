@@ -162,6 +162,25 @@ Automatic transition lines are interactive-only. `--exec` and `--json`
 suppress them for deterministic scripted output; explicit task commands still
 return their normal text or JSON results.
 
+`loglevel <level>` asks the server to change how much it logs, through
+`logging/setLevel`:
+
+```text
+cratesio> loglevel warning
+log level set to warning [12ms]
+```
+
+The levels are the syslog severities the MCP spec uses, least severe first:
+`debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`,
+`emergency`. Setting one means that level and everything more severe, so
+`warning` silences `info` and `debug` but keeps errors. Tab completion offers
+them in that order rather than alphabetically, so the menu reads as a scale.
+
+A server that does not declare the `logging` capability is reported as such
+rather than sent a request it would only reject. Its notifications, if it
+sends any, arrive regardless: the level is a request, not a filter this end
+applies.
+
 Progress and log notifications print inline as they arrive:
 
 ```text

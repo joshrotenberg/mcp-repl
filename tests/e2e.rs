@@ -842,6 +842,81 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
+/// `loglevel` must actually change what the server sends.
+///
+/// The fixture's `announce` emits one Info log. Asserting only that the
+/// request went out would pass against a server that ignored it, so this
+/// checks the observable consequence: the same call, quiet afterwards.
+async fn exercise_loglevel(fixture: &Path, temp: &TempDir) {
+    let before = run_stdio(
+        fixture,
+        temp,
+        "loglevel-default",
+        &["--no-history", "--color", "never", "--exec", "announce"],
+    )
+    .await;
+    assert_success(&before, "loglevel default");
+    // Notifications go to stderr: stdout is the data stream, and a log line
+    // arriving mid-command is not part of any command's result.
+    assert!(
+        String::from_utf8_lossy(&before.stderr).contains("log info"),
+        "the fixture logs at info by default:\n{}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+
+    let after = run_stdio(
+        fixture,
+        temp,
+        "loglevel-raised",
+        &[
+            "--no-history",
+            "--color",
+            "never",
+            "--exec",
+            "loglevel emergency",
+            "--exec",
+            "announce",
+        ],
+    )
+    .await;
+    assert_success(&after, "loglevel raised");
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    let stderr = String::from_utf8_lossy(&after.stderr);
+    assert!(
+        stdout.contains("announced"),
+        "the tool still runs:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("log info"),
+        "and its log is below the level that was set:\n{stderr}"
+    );
+
+    // A server that never declared the capability is told so, rather than
+    // being sent a request it will only reject.
+    let mut undeclared = repl_command();
+    undeclared
+        .args([
+            "--no-history",
+            "--color",
+            "never",
+            "--exec",
+            "loglevel debug",
+        ])
+        .arg(fixture)
+        .arg("--tools-only")
+        .env(
+            "MCP_REPL_FIXTURE_EXIT_FILE",
+            temp.path().join("loglevel-undeclared.exit"),
+        );
+    let undeclared = run(undeclared, "loglevel undeclared", CASE_TIMEOUT).await;
+    assert_status(&undeclared, 3, "loglevel undeclared");
+    assert!(
+        String::from_utf8_lossy(&undeclared.stderr).contains("does not declare"),
+        "{}",
+        String::from_utf8_lossy(&undeclared.stderr)
+    );
+}
+
 /// A server that serves only tools must not be greeted with warnings.
 ///
 /// Real servers declare exactly this: GitMCP's `initialize` result is
@@ -1328,6 +1403,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_json_contract(&fixture, &temp).await;
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
         exercise_tools_only_server(&fixture, &temp).await;
+        exercise_loglevel(&fixture, &temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
