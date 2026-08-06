@@ -175,7 +175,11 @@ async fn observe_subscription(request: Request, next: Next) -> Response {
 ///
 /// Speaking JSON-RPC directly is the point: this is the shape of a server we
 /// did not write.
-fn serve_raw_tools_only(failing_list: bool, downgrade: bool) -> Result<(), tower_mcp::BoxError> {
+fn serve_raw_tools_only(
+    failing_list: bool,
+    downgrade: bool,
+    strict_cursor: bool,
+) -> Result<(), tower_mcp::BoxError> {
     use std::io::{BufRead, Write};
 
     let stdin = std::io::stdin();
@@ -205,9 +209,48 @@ fn serve_raw_tools_only(failing_list: bool, downgrade: bool) -> Result<(), tower
                     } else {
                         request["params"]["protocolVersion"].clone()
                     },
-                    "capabilities": { "tools": { "listChanged": true } },
+                    // The strict mode also serves resources, since the
+                    // REPL now asks only for what a server declares and the
+                    // null cursor rode on a resource listing.
+                    "capabilities": if strict_cursor {
+                        serde_json::json!({
+                            "tools": { "listChanged": true },
+                            "resources": { "listChanged": false, "subscribe": false },
+                        })
+                    } else {
+                        serde_json::json!({ "tools": { "listChanged": true } })
+                    },
                     "serverInfo": { "name": "raw-tools-only", "version": "1.0.0" },
                 },
+            }),
+            // Context7 and the Hugging Face server both type `cursor` as
+            // `string | undefined` and reject an explicit null, which is
+            // correct of them: absent and null are not the same thing. A
+            // client that sends `"cursor": null` for a first page cannot
+            // list anything from either.
+            //
+            // Applies to every listing, because which one carries the bug is
+            // not the point and has already moved once: the null was on
+            // `resources/templates/list` and never on `tools/list`.
+            _ if strict_cursor
+                && method.ends_with("/list")
+                && request["params"].get("cursor") == Some(&serde_json::Value::Null) =>
+            {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32603,
+                        "message": "Invalid input: expected string, received null at params.cursor",
+                    },
+                })
+            }
+            // Only in the strict-cursor mode, and only so the client has a
+            // reason to send the listing that carried the null.
+            "resources/list" | "resources/templates/list" if strict_cursor => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "resources": [], "resourceTemplates": [] },
             }),
             // Declared the capability, then fails to serve it. That is the
             // shape the REPL must not round down to "this server has no
@@ -259,6 +302,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         serve_raw_tools_only(
             std::env::args().any(|arg| arg == "--failing-list"),
             std::env::args().any(|arg| arg == "--downgrade-protocol"),
+            std::env::args().any(|arg| arg == "--strict-cursor"),
         )?;
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
         return Ok(());

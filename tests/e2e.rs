@@ -1131,6 +1131,41 @@ async fn exercise_downgraded_protocol(fixture: &Path, temp: &TempDir) {
     );
 }
 
+/// An absent pagination cursor must be absent, not null.
+///
+/// `cursor` is optional in the schema, and a server that generates its
+/// validators from that schema types it `string | undefined`. Context7 and
+/// the Hugging Face server both reject an explicit null, correctly: absent
+/// and null are not the same thing. Sending one made every listing they
+/// serve fail.
+///
+/// The fixture rejects a null on any listing rather than a chosen one,
+/// because which method carries it is not the point and has already moved:
+/// the null rode on `resources/templates/list` and never on `tools/list`.
+async fn exercise_absent_cursor(fixture: &Path, temp: &TempDir) {
+    let mut command = repl_command();
+    command
+        .args(["--no-history", "--color", "never", "--exec", "tools"])
+        .arg(fixture)
+        .args(["--tools-only", "--strict-cursor"])
+        .env(
+            "MCP_REPL_FIXTURE_EXIT_FILE",
+            temp.path().join("strict-cursor.exit"),
+        );
+    let output = run(command, "strict cursor", CASE_TIMEOUT).await;
+    assert_success(&output, "strict cursor");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("add"),
+        "the listing survives a server that types cursor as string|undefined:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("cursor"),
+        "and no listing is refused over one:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A listing that could not be read must not be reported as an empty one.
 ///
 /// The same raw server, now declaring the tools capability and then failing
@@ -1559,6 +1594,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_repl_config(&temp).await;
         exercise_login_json(&temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
+        exercise_absent_cursor(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
