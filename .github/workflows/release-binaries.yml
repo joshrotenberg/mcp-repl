@@ -1,0 +1,116 @@
+name: Release binaries
+
+# release-plz already tags, publishes to crates.io, and creates the GitHub
+# release. This attaches prebuilt binaries to the release it made, so
+# installing does not require a Rust toolchain.
+#
+# Triggered by the release rather than the tag: the release has to exist
+# before anything can be uploaded to it, and release-plz creates the two in
+# that order. `workflow_dispatch` takes a tag so a build can be rehearsed
+# against an existing release without cutting a new one.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and upload to"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One target failing should not deprive the release of the others; a
+      # missing archive is visible on the release page.
+      fail-fast: false
+      matrix:
+        include:
+          # Every target builds on its own architecture. `rustls` pulls
+          # `aws-lc-sys`, a C library, so cross-compiling means a cross
+          # toolchain and cmake for each host/target pair. Native runners
+          # exist for all five, and they also let each job run the binary it
+          # just built to generate its completions and man page.
+          - target: x86_64-unknown-linux-gnu
+            # Older than `ubuntu-latest` on purpose: the binary links glibc,
+            # and one built against a newer glibc will not start on an older
+            # distribution. This sets the floor for who can run it.
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.tag || github.event.release.tag_name }}"
+          stage="mcp-repl-${version}-${{ matrix.target }}"
+          mkdir -p "$stage"
+
+          bin="target/${{ matrix.target }}/release/mcp-repl"
+          [ "${{ runner.os }}" = "Windows" ] && bin="${bin}.exe"
+          cp "$bin" "$stage/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$stage/"
+
+          # The binary generates these itself, so they cannot drift from the
+          # flags it actually has. Every job builds for its own architecture,
+          # which is what makes running it here possible.
+          mkdir -p "$stage/completions"
+          for shell in bash zsh fish; do
+            "$bin" --completions "$shell" > "$stage/completions/mcp-repl.$shell"
+          done
+          "$bin" --man > "$stage/mcp-repl.1"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${stage}.zip" "$stage" > /dev/null
+            archive="${stage}.zip"
+          else
+            tar czf "${stage}.tar.gz" "$stage"
+            archive="${stage}.tar.gz"
+          fi
+
+          # Checksums travel with the archive so the install script can
+          # verify what it downloaded without a second source of truth.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "${{ inputs.tag || github.event.release.tag_name }}" \
+            "$ARCHIVE" "$ARCHIVE.sha256" --clobber

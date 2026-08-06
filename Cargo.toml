@@ -16,6 +16,14 @@ categories = ["command-line-utilities", "development-tools"]
 # published crate.
 exclude = ["/examples", "/.github", "/docs", "/deny.toml"]
 
+# Applies to what people download, and to `cargo install`. Symbols are 4 MB
+# of a 20 MB binary and are no use without the matching source. `"debuginfo"`
+# was the first choice, for backtraces that still name functions, but it
+# saves nothing on macOS, where that information lives in a separate .dSYM
+# rather than in the binary.
+[profile.release]
+strip = true
+
 [lib]
 name = "mcp_repl"
 path = "src/lib.rs"

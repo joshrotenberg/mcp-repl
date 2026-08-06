@@ -16,11 +16,25 @@ surface changes.
 
 ## Install
 
+A prebuilt binary for macOS or Linux, on x86_64 or arm64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/install.sh | sh
+```
+
+It verifies the release's published checksum before unpacking, and installs
+to `~/.local/bin` unless `MCP_REPL_INSTALL_DIR` says otherwise. Reading a
+script before piping it to a shell is the better habit, and this one is
+short.
+
+Or from source, which is the only route on other platforms:
+
 ```bash
 cargo install mcp-repl
 ```
 
-Completions and a man page come from the binary itself:
+Completions and a man page come from the binary itself, and ship in the
+release archives:
 
 ```bash
 mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
