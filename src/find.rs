@@ -101,7 +101,7 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 /// The flags follow grep's, since `find` already follows its exit-status
 /// convention: `-m` caps results, `--case-sensitive` stops folding case, and
 /// a kind flag narrows which lists are searched.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Query {
     /// The words to search for, joined, so `find crate info` is one phrase.
     pub text: String,
@@ -111,13 +111,35 @@ pub struct Query {
     pub case_sensitive: bool,
     /// Which lists to search. Empty means all of them.
     pub kinds: Vec<Kind>,
+    /// Compiled when `-E` was given.
+    ///
+    /// Compiled at parse time so a bad pattern is a usage error before any
+    /// searching starts, rather than a surprise partway through.
+    pub regex: Option<regex::Regex>,
 }
+
+/// Compiled patterns compare by the pattern they were built from, which is
+/// the only part a caller wrote. `Regex` implements neither `PartialEq` nor
+/// `Eq`, and deriving them is what the tests want from `Query`.
+impl PartialEq for Query {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.limit == other.limit
+            && self.case_sensitive == other.case_sensitive
+            && self.kinds == other.kinds
+            && self.regex.as_ref().map(regex::Regex::as_str)
+                == other.regex.as_ref().map(regex::Regex::as_str)
+    }
+}
+
+impl Eq for Query {}
 
 /// Parse `find [flags] <words...>`.
 pub fn parse_query(tokens: &[&str]) -> Result<Query, String> {
     let mut text: Vec<String> = Vec::new();
     let mut limit = None;
     let mut case_sensitive = false;
+    let mut regex = false;
     let mut kinds: Vec<Kind> = Vec::new();
     let mut rest = tokens.iter().copied();
 
@@ -129,6 +151,7 @@ pub fn parse_query(tokens: &[&str]) -> Result<Query, String> {
             "--templates" => kinds.push(Kind::Template),
             "--builtins" => kinds.push(Kind::Builtin),
             "--case-sensitive" => case_sensitive = true,
+            "-E" | "--regex" => regex = true,
             "-m" | "--max" => {
                 let raw = rest
                     .next()
@@ -143,8 +166,9 @@ pub fn parse_query(tokens: &[&str]) -> Result<Query, String> {
                     limit = Some(parse_limit("-m", raw)?);
                 } else if token.starts_with('-') && token.len() > 1 {
                     return Err(format!(
-                        "unknown option `{token}` (find takes -m/--max, --case-sensitive, \
-                         and --tools/--prompts/--resources/--templates/--builtins)"
+                        "unknown option `{token}` (find takes -E/--regex, -m/--max, \
+                         --case-sensitive, and \
+                         --tools/--prompts/--resources/--templates/--builtins)"
                     ));
                 } else {
                     text.push(token.to_string());
@@ -155,8 +179,23 @@ pub fn parse_query(tokens: &[&str]) -> Result<Query, String> {
 
     let text = text.join(" ");
     if text.is_empty() {
-        return Err("usage: find [-m N] [--case-sensitive] [--tools|...] <keyword>".to_string());
+        return Err(
+            "usage: find [-E] [-m N] [--case-sensitive] [--tools|...] <keyword>".to_string(),
+        );
     }
+    // `(?i)` rather than a separate flag so one code path handles both, and
+    // so the pattern the user typed is what gets compiled.
+    let regex = regex
+        .then(|| {
+            let pattern = if case_sensitive {
+                text.clone()
+            } else {
+                format!("(?i){text}")
+            };
+            regex::Regex::new(&pattern)
+                .map_err(|error| format!("invalid pattern `{text}`: {error}"))
+        })
+        .transpose()?;
     kinds.sort_by_key(|kind| kind.order());
     kinds.dedup();
     Ok(Query {
@@ -164,6 +203,7 @@ pub fn parse_query(tokens: &[&str]) -> Result<Query, String> {
         limit,
         case_sensitive,
         kinds,
+        regex,
     })
 }
 
@@ -177,7 +217,15 @@ fn parse_limit(flag: &str, raw: &str) -> Result<usize, String> {
 
 /// Every entry of the surface matching the parsed query, best first.
 pub fn search_query(surface: &Surface, query: &Query) -> Vec<Hit> {
-    let mut hits = search_filtered(surface, &query.text, query.case_sensitive, &query.kinds);
+    let matcher = match &query.regex {
+        Some(regex) => Matcher::Pattern(regex),
+        None => Matcher::Text(if query.case_sensitive {
+            query.text.clone()
+        } else {
+            query.text.to_lowercase()
+        }),
+    };
+    let mut hits = search_matching(surface, &matcher, query.case_sensitive, &query.kinds);
     if let Some(limit) = query.limit {
         hits.truncate(limit);
     }
@@ -191,19 +239,42 @@ pub fn search_query(surface: &Surface, query: &Query) -> Vec<Hit> {
 /// order.
 /// The search `find` actually runs: case folding and kind filtering are
 /// options rather than fixed behaviour.
-fn search_filtered(
+/// How a query decides whether an entry matches, and how well.
+///
+/// The two share the ranking so `-E` returns results in the same order the
+/// plain search would: name before description, exact before partial.
+enum Matcher<'a> {
+    /// Already case-folded when the search is insensitive.
+    Text(String),
+    /// Carries its own case handling, via `(?i)`.
+    Pattern(&'a regex::Regex),
+}
+
+impl Matcher<'_> {
+    fn score(&self, name: &str, description: &str) -> Option<u32> {
+        match self {
+            Matcher::Text(query) => score_prepared(query, name, description),
+            Matcher::Pattern(regex) => {
+                if let Some(found) = regex.find(name) {
+                    // A pattern covering the whole name is the same kind of
+                    // answer an exact word match is.
+                    Some(if found.len() == name.len() { 100 } else { 80 })
+                } else if regex.is_match(description) {
+                    Some(40)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn search_matching(
     surface: &Surface,
-    query: &str,
+    matcher: &Matcher<'_>,
     case_sensitive: bool,
     kinds: &[Kind],
 ) -> Vec<Hit> {
-    // Folding both sides is what makes the match case-insensitive; keeping
-    // both as typed is what makes it exact.
-    let query = if case_sensitive {
-        query.to_string()
-    } else {
-        query.to_lowercase()
-    };
     let wanted = |kind: Kind| kinds.is_empty() || kinds.contains(&kind);
     let mut hits = Vec::new();
 
@@ -211,12 +282,13 @@ fn search_filtered(
         if !wanted(kind) {
             return;
         }
-        let (name_key, description_key) = if case_sensitive {
-            (name.to_string(), description.to_string())
-        } else {
-            (name.to_lowercase(), description.to_lowercase())
+        // A pattern folds case itself, so folding here as well would hide
+        // what `--case-sensitive` was asked to preserve.
+        let (name_key, description_key) = match (matcher, case_sensitive) {
+            (Matcher::Pattern(_), _) | (_, true) => (name.to_string(), description.to_string()),
+            _ => (name.to_lowercase(), description.to_lowercase()),
         };
-        if let Some(score) = score_prepared(&query, &name_key, &description_key) {
+        if let Some(score) = matcher.score(&name_key, &description_key) {
             hits.push(Hit {
                 kind,
                 name: name.to_string(),
@@ -406,9 +478,83 @@ mod tests {
         }
     }
 
+    /// A regex search, the way `find -E` runs one.
+    fn regex_hits(surface: &Surface, tokens: &[&str]) -> Vec<String> {
+        let query = parse_query(tokens).expect("parses");
+        search_query(surface, &query)
+            .into_iter()
+            .map(|hit| hit.name)
+            .collect()
+    }
+
+    #[test]
+    fn a_pattern_matches_where_a_substring_would_not() {
+        let s = surface();
+        // Anchors are the point: no substring search can express "ends with".
+        assert_eq!(
+            regex_hits(&s, &["-E", "^get_.*downloads$", "--tools"]),
+            ["get_downloads", "get_version_downloads"]
+        );
+        assert_eq!(
+            regex_hits(&s, &["-E", "^search", "--tools"]),
+            ["search_crates"]
+        );
+    }
+
+    #[test]
+    fn a_pattern_folds_case_unless_told_not_to() {
+        let s = surface();
+        assert_eq!(regex_hits(&s, &["-E", "^GET_OWNERS$"]), ["get_owners"]);
+        assert!(regex_hits(&s, &["-E", "--case-sensitive", "^GET_OWNERS$"]).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_covering_the_whole_name_outranks_a_partial_one() {
+        let s = surface();
+        // `search_crates` matches entirely, `get_owners` only in part. The
+        // alphabetical tie-break would put `get_owners` first, so ranking is
+        // the only thing that can produce this order.
+        let hits = regex_hits(&s, &["-E", "search_crates|owners", "--tools"]);
+        assert_eq!(
+            hits.first().map(String::as_str),
+            Some("search_crates"),
+            "{hits:?}"
+        );
+        assert!(hits.contains(&"get_owners".to_string()), "{hits:?}");
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_a_usage_error_not_a_search() {
+        let error = parse_query(&["-E", "get_("]).unwrap_err();
+        assert!(error.contains("invalid pattern"), "{error}");
+        assert!(error.contains("get_("), "names the pattern: {error}");
+    }
+
+    #[test]
+    fn a_pattern_still_honors_the_result_cap_and_kind_filters() {
+        let s = surface();
+        assert_eq!(
+            regex_hits(&s, &["-E", "get_", "-m", "2", "--tools"]).len(),
+            2
+        );
+        // `--prompts` excludes the tools the same pattern would have matched.
+        assert!(
+            regex_hits(&s, &["-E", "get_", "--prompts"])
+                .iter()
+                .all(|name| name != "get_owners")
+        );
+    }
+
+    /// Without `-E`, a regex metacharacter is just a character.
+    #[test]
+    fn a_plain_search_does_not_interpret_patterns() {
+        assert!(search(&surface(), "^get_.*downloads$").is_empty());
+    }
+
     /// A plain search, the way `find` runs one with no flags.
     fn search(surface: &Surface, query: &str) -> Vec<Hit> {
-        search_filtered(surface, query, false, &[])
+        // Folding the query is what the parse step does for a real search.
+        search_matching(surface, &Matcher::Text(query.to_lowercase()), false, &[])
     }
 
     fn q(tokens: &[&str]) -> Query {

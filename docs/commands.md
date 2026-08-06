@@ -234,11 +234,19 @@ Flags follow grep's, since the exit status already does:
 cratesio> find --tools -m 3 download      # tools only, best three
 cratesio> find --case-sensitive Crate     # stop folding case
 cratesio> find --builtins alias           # the REPL's own commands
+cratesio> find -E '^get_.*downloads$'     # a regular expression
 ```
 
 `--tools`, `--prompts`, `--resources`, `--templates`, and `--builtins` can be
 combined; several narrow to the union of those kinds. `-m N` (also `-mN`,
 `--max N`, `--max=N`) caps the results after ranking, so the best survive.
+
+`-E` (also `--regex`) treats the keyword as a regular expression, which is
+what anchors are for: no substring search can express "ends with". A pattern
+that does not compile is a usage error before any searching starts, and it
+names the pattern. Patterns fold case like everything else here, so
+`--case-sensitive` applies to them too. The other flags apply unchanged: `-E`
+narrows what matches, not how results are ranked or capped.
 
 Matching is case-insensitive unless `--case-sensitive` says otherwise. Results rank an exact name match first, then a
 name prefix, then a name substring, then a description match, and last a
