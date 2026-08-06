@@ -1950,6 +1950,99 @@ fn demo_router() -> tower_mcp::McpRouter {
                 })
                 .build(),
         )
+        // Sampling: the server asks the *client* for a completion. The
+        // README lists it as something this REPL does that others skip, and
+        // until now nothing here could demonstrate it.
+        .tool(
+            ToolBuilder::new("summarize")
+                .description("Ask your client for a one-line summary (sampling demo)")
+                .annotations(local_read_only())
+                // Same shape as `sign_in`, for the same reason: 2026-07-28
+                // has no server-initiated requests, so the question travels
+                // as an input request instead.
+                .mrtr_handler(|ctx: RequestContext, input: SummarizeInput| async move {
+                    if let Some(responses) = ctx.input_responses() {
+                        let answer = responses.values().find_map(|response| match response {
+                            InputResponse::CreateMessage(result) => Some(result.clone()),
+                            _ => None,
+                        });
+                        return Ok(RequestOutcome::Complete(CallToolResult::text(
+                            describe_summary(answer.as_ref()),
+                        )));
+                    }
+                    let params = summarize_request(&input.text);
+                    if !ctx.can_sample() {
+                        let mut requests = InputRequests::new();
+                        requests.insert(
+                            "summary".to_string(),
+                            InputRequest::CreateMessage(params),
+                        );
+                        return Ok(RequestOutcome::input_required(
+                            InputRequiredResult::with_requests(requests),
+                        ));
+                    }
+                    let answer = ctx.sample(params).await?;
+                    Ok(RequestOutcome::Complete(CallToolResult::text(
+                        describe_summary(Some(&answer)),
+                    )))
+                })
+                .build(),
+        )
+}
+
+/// What `summarize` is asked to summarize.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct SummarizeInput {
+    /// The text to summarize.
+    text: String,
+}
+
+/// What the demo asks the client's model for.
+fn summarize_request(text: &str) -> tower_mcp::protocol::CreateMessageParams {
+    use tower_mcp::protocol::{
+        ContentRole, CreateMessageParams, SamplingContent, SamplingContentOrArray, SamplingMessage,
+    };
+    CreateMessageParams {
+        messages: vec![SamplingMessage {
+            role: ContentRole::User,
+            content: SamplingContentOrArray::Single(SamplingContent::Text {
+                text: format!("Summarize this in one line:\n\n{text}"),
+                annotations: None,
+                meta: None,
+            }),
+            meta: None,
+        }],
+        max_tokens: 64,
+        system_prompt: Some("You write single-line summaries.".to_string()),
+        temperature: None,
+        stop_sequences: Vec::new(),
+        model_preferences: None,
+        include_context: None,
+        metadata: None,
+        tools: None,
+        tool_choice: None,
+        task: None,
+        meta: None,
+    }
+}
+
+/// Render what the client's model said, or that it declined to say anything.
+fn describe_summary(answer: Option<&tower_mcp::protocol::CreateMessageResult>) -> String {
+    use tower_mcp::protocol::SamplingContent;
+    let Some(answer) = answer else {
+        return "no summary: the client declined the sampling request".to_string();
+    };
+    let text: String = answer
+        .content
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            SamplingContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("summary ({}): {text}", answer.model)
 }
 
 /// `sign_in` takes no arguments; the values come from the operator.
