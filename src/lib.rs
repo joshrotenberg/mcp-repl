@@ -587,9 +587,10 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "find",
-        "find [-m N] [--case-sensitive] [--tools|--prompts|--resources|--templates|--builtins] <keyword>",
+        "find [-E] [-m N] [--case-sensitive] [--tools|--prompts|--resources|--templates|--builtins] <keyword>",
         "Search names and descriptions across the surface and the built-ins. Kind flags narrow \
-         it, `-m` caps the results, and it exits non-zero when nothing matches, like grep.",
+         it, `-m` caps the results, `-E` treats the keyword as a regular expression, and it \
+         exits non-zero when nothing matches, like grep.",
     ),
     (
         "describe",

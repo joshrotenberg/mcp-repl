@@ -1555,6 +1555,7 @@ dependencies = [
  "keyring",
  "nu-ansi-term",
  "reedline",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

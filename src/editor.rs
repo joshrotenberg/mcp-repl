@@ -435,6 +435,7 @@ impl Completer for ReplCompleter {
             // `find` has its own flags; offer them once a dash is typed.
             "find" if word.starts_with('-') => {
                 for (flag, description) in [
+                    ("-E", "treat the keyword as a regular expression"),
                     ("-m", "cap the number of results"),
                     ("--case-sensitive", "do not fold case"),
                     ("--tools", "search tools only"),
