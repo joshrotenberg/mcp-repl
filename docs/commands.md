@@ -162,6 +162,29 @@ Automatic transition lines are interactive-only. `--exec` and `--json`
 suppress them for deterministic scripted output; explicit task commands still
 return their normal text or JSON results.
 
+Ctrl-C during `wait` stops waiting without stopping the task, which is how a
+long job gets put back in the background:
+
+```text
+demo> slow_add a=2 b=3 &
+demo> wait 1
+^C cancelled
+demo> jobs
+1 (937de478...)  slow_add  working
+```
+
+A plain foreground call cannot be moved to the background after the fact:
+without `&` the server was never asked for a task, so there is nothing to
+hand back to. Interrupting one says so, for next time:
+
+```text
+demo> slow_add a=2 b=3
+^C cancelled  `slow_add ... &` runs it as a task instead
+```
+
+Ctrl-C also tells the server, so the work stops on both ends rather than
+continuing against a client that has stopped listening.
+
 `loglevel <level>` asks the server to change how much it logs, through
 `logging/setLevel`:
 
