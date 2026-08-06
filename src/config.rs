@@ -66,6 +66,14 @@ pub struct Repl {
     /// How many lines of command history to keep. `0` disables persistence
     /// as surely as `--no-history` does.
     pub history_capacity: Option<usize>,
+    /// Seconds to allow a request before giving up, when `--timeout` does not
+    /// say. `0` waits indefinitely, exactly as the flag's `0` does.
+    pub request_timeout: Option<u64>,
+    /// Milliseconds to wait for a server to answer `completion/complete`
+    /// while the user is mid-word. Short on purpose: this runs between
+    /// keystrokes, and a menu that arrives late is worse than one that does
+    /// not arrive.
+    pub completion_timeout_ms: Option<u64>,
 }
 
 /// One `[servers.<name>]` table.
@@ -361,6 +369,53 @@ command = ["cargo", "run", "--example", "getting_started"]
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn the_repl_table_is_optional_and_defaults_to_nothing_set() {
+        // Absent section, absent keys: every consumer falls back to its own
+        // default, so adding a key here cannot change behaviour by itself.
+        let config: Config = toml::from_str(SAMPLE).expect("parses");
+        assert_eq!(config.repl.history_capacity, None);
+        assert_eq!(config.repl.request_timeout, None);
+        assert_eq!(config.repl.completion_timeout_ms, None);
+    }
+
+    #[test]
+    fn the_repl_table_parses_its_tunables() {
+        let config: Config = toml::from_str(
+            r#"
+[repl]
+history_capacity = 50
+request_timeout = 7
+completion_timeout_ms = 250
+"#,
+        )
+        .expect("parses");
+        assert_eq!(config.repl.history_capacity, Some(50));
+        assert_eq!(config.repl.request_timeout, Some(7));
+        assert_eq!(config.repl.completion_timeout_ms, Some(250));
+    }
+
+    /// A silently ignored typo in a config file is worse than a refusal: the
+    /// setting appears to be applied and is not.
+    #[test]
+    fn a_misspelled_repl_key_is_refused_and_names_the_alternatives() {
+        let error = toml::from_str::<Config>("[repl]\nhistory_capacty = 50\n")
+            .expect_err("a typo is an error");
+        let message = error.to_string();
+        assert!(message.contains("history_capacty"), "{message}");
+        assert!(message.contains("history_capacity"), "{message}");
+    }
+
+    /// `0` is a value, not an absence: it means "wait indefinitely" for the
+    /// timeout and "keep no history" for the capacity.
+    #[test]
+    fn zero_is_a_setting_rather_than_an_unset_key() {
+        let config: Config =
+            toml::from_str("[repl]\nhistory_capacity = 0\nrequest_timeout = 0\n").expect("parses");
+        assert_eq!(config.repl.history_capacity, Some(0));
+        assert_eq!(config.repl.request_timeout, Some(0));
     }
 
     #[test]

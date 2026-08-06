@@ -315,8 +315,9 @@ struct Args {
     /// `prompt`, `bench` calls, and surface fetches, over both transports.
     /// `0` waits indefinitely. `wait <id>` is exempt, since outliving the
     /// call is what a task is for; give it its own `--timeout`.
-    #[arg(long, value_name = "SECONDS", default_value_t = 120)]
-    timeout: u64,
+    /// Defaults to `[repl] request_timeout` in the config file, or 120.
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<u64>,
 
     /// Command (and arguments) of a stdio MCP server to spawn.
     command: Vec<String>,
@@ -332,6 +333,9 @@ fn json_output() -> bool {
 /// Whether any user command has been dispatched. Only `last` cares: before
 /// the first one, the newest recorded frame is the REPL's own startup fetch.
 static COMMAND_RAN: AtomicBool = AtomicBool::new(false);
+
+/// What `--timeout` uses when neither the flag nor the config says.
+pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// `--timeout` in seconds; 0 means wait indefinitely.
 static REQUEST_TIMEOUT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2704,7 +2708,6 @@ pub async fn run_cli() {
     style::init(args.color);
     wire::init(args.trace);
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
-    REQUEST_TIMEOUT_SECS.store(args.timeout, Ordering::Relaxed);
 
     if let Err(error) = run(args).await {
         exit_with_error(
@@ -2729,6 +2732,24 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     } else {
         load_config(args.config.as_deref())
     };
+    // Resolved here rather than at startup because the config has to be read
+    // first. The flag wins, then the config, then the built-in default; the
+    // flag stays an `Option` precisely so an explicit `--timeout 0` is
+    // distinguishable from not having asked for one.
+    REQUEST_TIMEOUT_SECS.store(
+        args.timeout
+            .or(profiles.repl.request_timeout)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+        Ordering::Relaxed,
+    );
+    editor::set_completion_timeout(
+        profiles
+            .repl
+            .completion_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(editor::DEFAULT_COMPLETION_TIMEOUT),
+    );
+
     if handle_oauth_profile_action(&args, &profiles, config_file.as_deref()).await {
         return Ok(());
     }
