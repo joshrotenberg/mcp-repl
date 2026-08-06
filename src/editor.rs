@@ -29,6 +29,27 @@ use crate::{BUILTINS, Surface};
 
 const MENU_NAME: &str = "completion_menu";
 
+/// How long a server gets to answer `completion/complete` mid-word.
+///
+/// Short on purpose. This runs between keystrokes on the readline thread, so
+/// a slow server would otherwise make Tab feel broken rather than merely
+/// unhelpful. Overridable with `[repl] completion_timeout_ms`.
+pub const DEFAULT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+
+static COMPLETION_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set once at startup, from the config.
+pub fn set_completion_timeout(timeout: Duration) {
+    COMPLETION_TIMEOUT_MS.store(timeout.as_millis() as u64, Ordering::Relaxed);
+}
+
+fn completion_timeout() -> Duration {
+    match COMPLETION_TIMEOUT_MS.load(Ordering::Relaxed) {
+        0 => DEFAULT_COMPLETION_TIMEOUT,
+        ms => Duration::from_millis(ms),
+    }
+}
+
 /// Keeps reading while the line is unfinished.
 ///
 /// Without this, pasting a pretty-printed JSON body submits it one line at
@@ -192,7 +213,7 @@ impl ReplCompleter {
         self.runtime
             .block_on(async move {
                 tokio::time::timeout(
-                    Duration::from_secs(2),
+                    completion_timeout(),
                     client.complete_prompt_arg(&prompt, &arg, &partial),
                 )
                 .await
@@ -221,7 +242,7 @@ impl ReplCompleter {
         self.runtime
             .block_on(async move {
                 tokio::time::timeout(
-                    Duration::from_secs(2),
+                    completion_timeout(),
                     client.complete_resource_uri(&template, &var, &partial),
                 )
                 .await

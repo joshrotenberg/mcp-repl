@@ -146,6 +146,8 @@ headers = { "X-Api-Key" = "abc" }
 
 [repl]
 history_capacity = 5000            # lines of command history to keep
+request_timeout = 300              # default for --timeout, in seconds
+completion_timeout_ms = 500        # how long Tab waits on the server
 
 [oauth.work]
 url = "https://mcp.example.com/mcp"
@@ -159,6 +161,31 @@ headers = { "X-Tenant" = "acme" }
 [servers.local]
 transport = "stdio"
 command = ["./my-server", "--stdio"]
+```
+
+The `[repl]` table holds settings that are not about any one connection:
+
+| key | default | what it does |
+| --- | --- | --- |
+| `history_capacity` | 1000 | lines of command history kept on disk. `0` keeps none, like `--no-history` |
+| `request_timeout` | 120 | seconds before a request is abandoned, when `--timeout` does not say. `0` waits indefinitely |
+| `completion_timeout_ms` | 2000 | how long Tab waits for a server's `completion/complete`. This runs between keystrokes, so a slow server makes Tab feel broken rather than merely unhelpful; lower it before raising it |
+
+A flag beats the config, and the config beats these defaults. `--timeout 0`
+is a setting, not an absence: it asks to wait indefinitely even when the
+config names a limit.
+
+Unknown keys are refused rather than ignored, here and in every other table,
+because a setting that appears to apply and does not is worse than one that
+fails loudly:
+
+```text
+error: config.toml: TOML parse error at line 2, column 1
+  |
+2 | history_capacty = 50
+  | ^^^^^^^^^^^^^^^
+unknown field `history_capacty`, expected one of `history_capacity`,
+`request_timeout`, `completion_timeout_ms`
 ```
 
 ```bash

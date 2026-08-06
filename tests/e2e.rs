@@ -842,6 +842,76 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
+/// `[repl] request_timeout` supplies the default `--timeout` uses.
+///
+/// The precedence is what matters and what a unit test cannot see: the flag
+/// beats the config, the config beats the built-in default, and an explicit
+/// `--timeout 0` still means "wait indefinitely" rather than "unset".
+async fn exercise_repl_config(temp: &TempDir) {
+    let config = temp.path().join("repl-config.toml");
+    std::fs::write(&config, "[repl]\nrequest_timeout = 1\n").expect("write repl config");
+    let config = config.display().to_string();
+
+    // `slow_add` sleeps three seconds, so a one-second budget must expire.
+    let mut timed_out = repl_command();
+    timed_out.args([
+        "--demo",
+        "--no-history",
+        "--color",
+        "never",
+        "--config",
+        &config,
+        "--exec",
+        "slow_add a=1 b=2",
+    ]);
+    let timed_out = run(timed_out, "config timeout", CASE_TIMEOUT).await;
+    assert_status(&timed_out, 4, "config timeout");
+
+    // The flag overrides it.
+    let mut flag_wins = repl_command();
+    flag_wins.args([
+        "--demo",
+        "--no-history",
+        "--color",
+        "never",
+        "--config",
+        &config,
+        "--timeout",
+        "30",
+        "--exec",
+        "slow_add a=1 b=2",
+    ]);
+    let flag_wins = run(flag_wins, "flag over config", CASE_TIMEOUT).await;
+    assert_success(&flag_wins, "flag over config");
+    assert!(
+        String::from_utf8_lossy(&flag_wins.stdout).contains('3'),
+        "the call completes when the flag allows it"
+    );
+
+    // A typo is refused rather than ignored, since a setting that appears to
+    // apply and does not is worse than one that fails loudly.
+    let typo = temp.path().join("repl-typo.toml");
+    std::fs::write(&typo, "[repl]\nrequest_timeoutt = 1\n").expect("write typo config");
+    let mut refused = repl_command();
+    refused.args([
+        "--demo",
+        "--no-history",
+        "--color",
+        "never",
+        "--config",
+        &typo.display().to_string(),
+        "--exec",
+        "echo message=hi",
+    ]);
+    let refused = run(refused, "config typo", CASE_TIMEOUT).await;
+    assert_status(&refused, 2, "config typo");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("request_timeout"),
+        "the refusal names the key that was meant:\n{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
 /// `loglevel` must actually change what the server sends.
 ///
 /// The fixture's `announce` emits one Info log. Asserting only that the
@@ -1404,6 +1474,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
         exercise_tools_only_server(&fixture, &temp).await;
         exercise_loglevel(&fixture, &temp).await;
+        exercise_repl_config(&temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
