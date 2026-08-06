@@ -21,6 +21,7 @@ mcp-repl-demo> convert value=100 from=celsius to=<Tab>  # completes the enum val
 mcp-repl-demo> slow_add a=2 b=3 &          # runs task-augmented; `jobs`, `wait 1`
 mcp-repl-demo> fail                        # what a tool error looks like
 mcp-repl-demo> sign_in                     # the server asks *you* (elicitation)
+mcp-repl-demo> summarize text="..."        # the server asks your *client* (sampling)
 mcp-repl-demo> find note                   # keyword search across the surface
 mcp-repl-demo> describe convert            # input/output schemas, colored
 mcp-repl-demo> read note://ideas           # a resource template, completed by the server
@@ -448,6 +449,41 @@ unsubscribed note://status
   tagged `(not subscribed here)`.
 - The resource is not re-read on an update: reading may be expensive, and the
   point is to know it moved. Follow with `read <uri>` when you want the content.
+
+## Sampling
+
+Sampling is the other direction: the server asks *your* client to run a
+completion, so a tool can use a model without holding an API key of its own.
+`summarize` in `--demo` does it:
+
+```text
+mcp-repl-demo> summarize text="the quick brown fox jumps over the lazy dog"
+[sampling] server requests a completion (max 64 tokens)
+  system: You write single-line summaries.
+  user: Summarize this in one line:
+
+  the quick brown fox jumps over the lazy dog
+  type the assistant message; `.` on its own line submits, Ctrl-D declines
+```
+
+`--sampling` chooses how these are answered:
+
+| mode | what it does |
+| --- | --- |
+| `prompt` | show the request and read the assistant message on stdin. The default interactively |
+| `canned` | answer every request with a fixed placeholder, naming itself as the model. Useful for exercising a server's sampling path without typing |
+| `decline` | refuse every request. The default under `--exec`, since a script has nobody to ask |
+
+The request is shown in full before anything is typed: the token limit, the
+system prompt, and every message the server wants the model to see. That
+matters more here than for elicitation, because the server is asking for
+model output rather than for your input, and what it puts in the context is
+the part worth reading.
+
+Like elicitation, a request arriving while the editor owns the terminal is
+declined rather than fought over, and both lifecycles are answered the same
+way: the stable one sends `sampling/createMessage` directly, and 2026-07-28
+carries it as an input request in the result.
 
 ## Elicitation
 

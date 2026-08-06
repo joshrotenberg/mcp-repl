@@ -1069,6 +1069,52 @@ async fn exercise_loglevel(fixture: &Path, temp: &TempDir) {
     );
 }
 
+/// Sampling is a feature the README leads with, so something must exercise it.
+///
+/// `canned` rather than `prompt`, so the case is deterministic and needs no
+/// stdin: what is being checked is that the request reaches the client and
+/// the answer reaches the tool, not how a human types.
+async fn exercise_sampling() {
+    let answered = run_demo_answering(
+        "",
+        "sampling canned",
+        &[
+            "--sampling",
+            "canned",
+            "--exec",
+            "summarize text=\"the quick brown fox\"",
+        ],
+    )
+    .await;
+    assert_success(&answered, "sampling canned");
+    let stdout = String::from_utf8_lossy(&answered.stdout);
+    assert!(
+        stdout.contains("summary (mcp-repl/canned)"),
+        "the tool receives what the client answered:\n{stdout}"
+    );
+
+    // Declining is an answer too, and the tool has to cope with it rather
+    // than the REPL pretending it succeeded.
+    let declined = run_demo_answering(
+        "",
+        "sampling declined",
+        &[
+            "--sampling",
+            "decline",
+            "--exec",
+            "summarize text=\"the quick brown fox\"",
+        ],
+    )
+    .await;
+    assert_ne!(
+        declined.status.code(),
+        Some(0),
+        "a declined request is not a success:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&declined.stdout),
+        String::from_utf8_lossy(&declined.stderr)
+    );
+}
+
 /// A server that serves only tools must not be greeted with warnings.
 ///
 /// Real servers declare exactly this: GitMCP's `initialize` result is
@@ -1591,6 +1637,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
         exercise_tools_only_server(&fixture, &temp).await;
         exercise_loglevel(&fixture, &temp).await;
+        exercise_sampling().await;
         exercise_repl_config(&temp).await;
         exercise_login_json(&temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
