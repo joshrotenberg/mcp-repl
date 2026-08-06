@@ -2,14 +2,61 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - 2026-08-04
+## [0.2.0] - 2026-08-06
+
+### Bug Fixes
+
+- Sanitize terminal output and restrict local file permissions (#34)
+- Bound surface fetches and make in-flight commands interruptible (#36)
+- Make listings, errors, and result routing consistent (#40)
+- Widen wire redaction to the names secrets actually use (#53)
+- Report a failed connection once, in the color that was asked for (#62)
+- Ask only for the surface a server declares, and say when a listing fails (#66)
+- Bound frame retention, suggestion cost, and the one-shot exit (#67)
+- Render a server's error as a sentence, not a struct dump (#79)
+
+### Documentation
+
+- Rewrite the README around what the tool does, with recordings (#45)
+- Regenerate the recordings and fix the tapes that silently did not (#80)
+
+### Features
+
+- Harden elicitation and confirm imported server commands (#39)
+- Make the surface and the REPL's own commands discoverable (#41)
+- Give the demo server typed schemas and a fuller surface (#44)
+- Generate shell completions and a man page (#46)
+- Adopt tower-mcp 0.19 and turn on what it unblocks (#47)
+- Move history to the XDG state layout and trim long listings (#49)
+- Give find the flags its exit statuses already implied (#50)
+- Answer elicitation on the 2026-07-28 lifecycle too (#52)
+- Save a resource to a file with read --out (#54)
+- List other clients' configured servers with --scan (#55)
+- Adopt tower-mcp 0.20 and tell the server about a cancelled call (#56)
+- Answer a task parked on input_required with `task <id> respond` (#58)
+- Let an --exec script wait for the tasks it started (#59)
+- Log the decisions that never reach the wire, and pin the negotiated protocol version (#71)
+- Search the surface with a regular expression (#72)
+- Set the server's log verbosity with `loglevel` (#73)
+- Make the request and completion timeouts configurable (#74)
+- Report what --login and --logout did under --json (#75)
+- Say how to background a call that was interrupted (#77)
+- Demonstrate and document sampling (#78)
 
 ### Miscellaneous Tasks
 
 - Move to the standalone [mcp-repl](https://github.com/joshrotenberg/mcp-repl) repository, extracted from [tower-mcp](https://github.com/joshrotenberg/tower-mcp) with full history
-- Replace workspace-inherited manifest fields and dependencies with explicit standalone values; depend on released tower-mcp 0.18.1
+- Replace workspace-inherited manifest fields and dependencies with explicit standalone values
 - Relocate the black-box test fixture into this repository's examples, excluded from the published package
 - Own formatting, lint, test, package, and release workflows independently; add a scheduled compatibility lane against tower-mcp git main
+- Check dependencies for advisories, licenses, and sources (#70)
+- Attach prebuilt binaries and an install script to the release (#83)
+
+### Testing
+
+- Cover quoted key=value arguments end to end (#51)
+- Make the unreadable-listing fixture independent of an upstream bug (#69)
+- Pin that an absent pagination cursor is absent, not null (#76)
 
 ## [0.1.9] - 2026-08-04
 
