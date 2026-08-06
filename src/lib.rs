@@ -2307,7 +2307,6 @@ async fn handle_oauth_profile_action(
     if args.demo
         || !args.command.is_empty()
         || !args.exec.is_empty()
-        || args.json
         || args.list_servers
         || args.bearer.is_some()
         || !args.headers.is_empty()
@@ -2316,7 +2315,8 @@ async fn handle_oauth_profile_action(
         exit_with_error(
             ExitStatus::Usage,
             "--login/--logout are standalone credential operations; do not combine them with \
-             a command, --demo, --exec/--json, --list-servers, --bearer, --header, or --oauth",
+             a command, --demo, --exec, --list-servers, --bearer, --header, or --oauth \
+             (--json is allowed, and reports what was created)",
         );
     }
     let path = config_file.unwrap_or_else(|| {
@@ -2335,7 +2335,14 @@ async fn handle_oauth_profile_action(
             .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
         oauth_profile::remove_metadata(path, name)
             .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
-        println!("removed OAuth profile {name:?} and its stored credentials");
+        if json_output() {
+            print_json(&serde_json::json!({
+                "profile": name,
+                "removed": true,
+            }));
+        } else {
+            println!("removed OAuth profile {name:?} and its stored credentials");
+        }
         return true;
     }
 
@@ -2430,10 +2437,28 @@ async fn handle_oauth_profile_action(
         let _ = store.clear().await;
         exit_with_error(ExitStatus::Usage, &error);
     }
-    println!(
-        "saved OAuth profile {name:?}; credentials are in the operating-system credential store"
-    );
+    if json_output() {
+        print_json(&saved_profile_json(name, &metadata));
+    } else {
+        println!(
+            "saved OAuth profile {name:?}; credentials are in the operating-system credential store"
+        );
+    }
     true
+}
+
+/// What `--login --json` reports about the profile it saved.
+///
+/// The scopes are the ones actually recorded rather than the ones asked for,
+/// which is the point of asking: a provisioning script needs to know what it
+/// ended up with. No secret appears here, and none can: the tokens live in
+/// the operating-system credential store and this side never holds them.
+fn saved_profile_json(name: &str, metadata: &config::OAuthProfile) -> serde_json::Value {
+    serde_json::json!({
+        "profile": name,
+        "serverUrl": metadata.url,
+        "scopes": metadata.scopes,
+    })
 }
 
 /// The binary name a generated script or man page refers to. Taken from the
@@ -5322,6 +5347,29 @@ mod tests {
 
     use async_trait::async_trait;
     use tower_mcp::client::ClientTransport;
+
+    #[test]
+    fn a_saved_oauth_profile_reports_what_a_script_needs() {
+        let metadata = config::OAuthProfile {
+            url: "https://mcp.example.com/mcp".to_string(),
+            scopes: vec!["openid".to_string(), "offline_access".to_string()],
+            client_id_metadata_document: None,
+            authorization_server: None,
+        };
+        let value = saved_profile_json("work", &metadata);
+        assert_eq!(value["profile"], "work");
+        assert_eq!(value["serverUrl"], "https://mcp.example.com/mcp");
+        assert_eq!(value["scopes"][0], "openid");
+        assert_eq!(value["scopes"][1], "offline_access");
+        // Three keys and no more. A credential must never reach stdout, and
+        // the tokens are in the OS store rather than in this struct, so the
+        // guard is that nothing new is added here without thought.
+        assert_eq!(
+            value.as_object().map(|object| object.len()),
+            Some(3),
+            "{value}"
+        );
+    }
 
     #[test]
     fn a_repeated_error_label_is_collapsed_to_one() {

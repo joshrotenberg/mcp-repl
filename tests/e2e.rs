@@ -842,6 +842,88 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
+/// `--login`/`--logout` under `--json` speak the same NDJSON contract.
+///
+/// The success path of `--login` needs a real authorization server, so what
+/// is reachable here is everything around it: that `--json` is accepted at
+/// all, that a failure is the standard envelope rather than prose, and that
+/// `--logout` reports what it removed. The shape of a saved profile is
+/// covered by a unit test.
+async fn exercise_login_json(temp: &TempDir) {
+    let config = temp.path().join("login.toml");
+    std::fs::write(&config, "").expect("write empty config");
+    let config = config.display().to_string();
+
+    // A usage failure is the same envelope every other command emits, on
+    // stdout, so it occupies that invocation's one output line.
+    let mut missing_url = repl_command();
+    missing_url.args(["--login", "work", "--json", "--config", &config]);
+    let missing_url = run(missing_url, "login without a url", CASE_TIMEOUT).await;
+    assert_status(&missing_url, 2, "login without a url");
+    let values = json_lines(&missing_url, "login without a url");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "usage");
+    assert_eq!(values[0]["exitStatus"], 2);
+
+    // `--json` is now allowed, but the genuinely incompatible combinations
+    // are still refused.
+    let mut with_exec = repl_command();
+    with_exec.args([
+        "--login", "work", "--json", "--exec", "tools", "--config", &config,
+    ]);
+    let with_exec = run(with_exec, "login with exec", CASE_TIMEOUT).await;
+    assert_status(&with_exec, 2, "login with exec");
+    assert!(
+        String::from_utf8_lossy(&with_exec.stdout).contains("standalone credential"),
+        "{}",
+        String::from_utf8_lossy(&with_exec.stdout)
+    );
+
+    // Removing a profile touches the operating-system credential store, which
+    // a headless runner does not have. Both outcomes are correct, and the
+    // contract is what this pins: exactly one parseable value either way,
+    // the success shape or the standard auth envelope. The failure branch is
+    // worth covering in its own right, since "a script gets an envelope
+    // rather than prose when it fails" is half the point of the flag.
+    let mut logout = repl_command();
+    logout.args(["--logout", "work", "--json", "--config", &config]);
+    let logout = run(logout, "logout json", CASE_TIMEOUT).await;
+    let values = json_lines(&logout, "logout json");
+    assert_eq!(values.len(), 1, "one value per invocation");
+    match logout.status.code() {
+        Some(0) => {
+            assert_eq!(values[0]["profile"], "work");
+            assert_eq!(values[0]["removed"], true);
+        }
+        Some(5) => {
+            assert_eq!(values[0]["kind"], "auth");
+            assert_eq!(values[0]["exitStatus"], 5);
+        }
+        other => panic!("unexpected logout status {other:?}: {}", values[0]),
+    }
+
+    // Without `--json`, the human wording is unchanged. Same split: the
+    // message goes to stdout on success and stderr on failure, because
+    // stdout is the data stream.
+    let mut human = repl_command();
+    human.args(["--logout", "work", "--config", &config]);
+    let human = run(human, "logout human", CASE_TIMEOUT).await;
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    if human.status.success() {
+        assert!(stdout.contains("removed OAuth profile"), "{stdout}");
+    } else {
+        assert!(
+            stderr.contains("credential store"),
+            "a failure explains itself on stderr:\n{stderr}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "and stdout stays the data stream: {stdout}"
+        );
+    }
+}
+
 /// `[repl] request_timeout` supplies the default `--timeout` uses.
 ///
 /// The precedence is what matters and what a unit test cannot see: the flag
@@ -1475,6 +1557,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_tools_only_server(&fixture, &temp).await;
         exercise_loglevel(&fixture, &temp).await;
         exercise_repl_config(&temp).await;
+        exercise_login_json(&temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
