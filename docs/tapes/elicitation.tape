@@ -42,3 +42,7 @@ Sleep 500ms
 Enter
 Sleep 1.5s
 Screenshot docs/media/elicitation.png
+
+# A trailing frame: vhs writes nothing for a `Screenshot` that is the
+# last line of a tape, and still exits 0.
+Sleep 500ms

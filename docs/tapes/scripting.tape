@@ -37,3 +37,5 @@ Sleep 500ms
 Enter
 Sleep 2s
 Screenshot docs/media/scripting.png
+
+Sleep 500ms

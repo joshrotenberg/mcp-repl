@@ -67,7 +67,9 @@ and run.
 (`completion/complete`), elicitation, and sampling all work here, and
 SEP-2663 tasks run with a shell-style trailing `&`. When a server asks the
 operator a question, the REPL says which server is asking and flags fields
-whose names look like credentials before anything is typed.
+whose names look like credentials before anything is typed. `--demo` has a
+tool for each: `sign_in` asks you a question, `summarize` asks your client's
+model for a completion.
 
 ![the demo server eliciting a username, an environment, and a boolean, each labelled with its declared type](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/elicitation.png)
 
