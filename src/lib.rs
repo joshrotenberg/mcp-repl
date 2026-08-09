@@ -605,6 +605,7 @@ impl Surface {
 /// menu and `help`.
 pub(crate) const BUILTINS: &[(&str, &str)] = &[
     ("help", "list built-ins and the server's tools"),
+    ("connect", "connect to a server or switch servers"),
     ("tool", "call a server tool explicitly"),
     ("builtin", "run a REPL built-in explicitly"),
     ("tools", "list tools"),
@@ -649,6 +650,11 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
         "help",
         "help [command]",
         "With no argument, list the built-ins and the server's tools. With one, explain that command.",
+    ),
+    (
+        "connect",
+        "connect <url|profile|path.json:entry|command...|demo>",
+        "Connect from a disconnected prompt or switch servers without losing history and global aliases. `connect` alone lists available forms and saved profiles.",
     ),
     (
         "tool",
@@ -2272,6 +2278,7 @@ fn watch_task(session: Arc<Session>, jobs: Arc<Jobs>, task_id: String, poll_inte
         return;
     }
     tokio::spawn(async move {
+        let generation = session.generation();
         let client = session.client();
         let _subscription =
             if client.selected_protocol_version().await.as_deref() == Some("2026-07-28") {
@@ -2302,10 +2309,13 @@ fn watch_task(session: Arc<Session>, jobs: Arc<Jobs>, task_id: String, poll_inte
         let mut consecutive_errors = 0;
         loop {
             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            if session.generation() != generation {
+                break;
+            }
             if jobs.is_terminal(&task_id) {
                 break;
             }
-            match session.client().task_get(&task_id).await {
+            match client.task_get(&task_id).await {
                 Ok(task) => {
                     consecutive_errors = 0;
                     interval_ms = task.poll_interval.unwrap_or(1000).clamp(50, 30_000);
@@ -2361,7 +2371,7 @@ fn http_connector(
     make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
     protocol: ProtocolMode,
 ) -> Connector {
-    Box::new(move || {
+    Arc::new(move || {
         let (url, config, oauth, handler) =
             (url.clone(), config.clone(), oauth.clone(), make_handler());
         Box::pin(async move {
@@ -2377,6 +2387,479 @@ fn http_connector(
             Ok(client)
         })
     })
+}
+
+/// Everything an interactive `connect` needs after startup has handed
+/// control to the command loop. CLI auth flags remain defaults for later HTTP
+/// targets, while profiles and imported entries contribute their own values.
+struct ConnectRuntime {
+    profiles: Arc<config::Config>,
+    config_file: Option<std::path::PathBuf>,
+    protocol: ProtocolMode,
+    make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
+    async_output: AsyncOutput,
+    server_label: elicit::ServerLabel,
+    bearer: Option<String>,
+    bearer_from_fd: Option<String>,
+    headers: Vec<String>,
+    oauth: Option<String>,
+    trust_import: bool,
+    no_browser: bool,
+    no_reconnect: bool,
+}
+
+struct ConnectedTarget {
+    client: McpClient,
+    connector: Option<Connector>,
+    info: ConnectionInfo,
+    surface: Surface,
+    profile_name: Option<String>,
+    profile_aliases: std::collections::BTreeMap<String, String>,
+    source_label: Option<String>,
+}
+
+#[derive(Debug)]
+struct ConnectFailure {
+    status: ExitStatus,
+    message: String,
+}
+
+impl ConnectFailure {
+    fn usage(message: impl Into<String>) -> Self {
+        Self {
+            status: ExitStatus::Usage,
+            message: message.into(),
+        }
+    }
+
+    fn mcp(error: tower_mcp::Error) -> Self {
+        Self {
+            status: ExitStatus::from_mcp_error(&error),
+            message: collapse_repeated_label(&error.to_string()).to_string(),
+        }
+    }
+}
+
+impl ConnectRuntime {
+    /// Resolve every target shape accepted at process startup. `--` forces a
+    /// stdio command when its first word happens to be `demo`, a profile, or a
+    /// URL-like string.
+    async fn connect(&self, words: &[&str]) -> Result<ConnectedTarget, ConnectFailure> {
+        if words.is_empty() {
+            return Err(ConnectFailure::usage(self.candidates()));
+        }
+
+        let mut profile_name = None;
+        let mut source_label = None;
+        let mut import_selector = None;
+        let mut import_http_trust = None;
+        let demo = words == ["demo"] || words == ["--demo"];
+        if demo {
+            if self.bearer_from_fd.is_some() {
+                return Err(ConnectFailure::usage(
+                    "--bearer-fd applies only to HTTP servers and cannot be ignored safely",
+                ));
+            }
+            if self.bearer.is_some() || !self.headers.is_empty() {
+                eprintln!(
+                    "warning: --bearer/--header apply only to HTTP servers; ignoring them here"
+                );
+            }
+            if self.oauth.is_some() {
+                return Err(ConnectFailure::usage(
+                    "--oauth applies only to HTTP servers",
+                ));
+            }
+        }
+        let connection = if demo {
+            None
+        } else if let ["--http", url] = words {
+            Some(config::Connection::Http {
+                url: (*url).to_string(),
+                bearer: None,
+                headers: Vec::new(),
+                oauth: None,
+            })
+        } else if let ["--server", name] = words {
+            if let Some(parsed) = import_config::parse_selector(name) {
+                let selector = parsed.map_err(ConnectFailure::usage)?;
+                let imported =
+                    import_config::load_with(selector, |variable| std::env::var(variable).ok())
+                        .map_err(ConnectFailure::usage)?;
+                source_label = Some(format!("import {}", imported.label()));
+                import_selector = Some(imported.selector);
+                import_http_trust = imported.http_trust;
+                Some(imported.connection)
+            } else {
+                let connection = self.resolve_profile(name)?;
+                profile_name = Some((*name).to_string());
+                source_label = Some(format!("profile {name}"));
+                Some(connection)
+            }
+        } else if words.len() == 1 && is_http_url(words[0]) {
+            Some(config::Connection::Http {
+                url: words[0].to_string(),
+                bearer: None,
+                headers: Vec::new(),
+                oauth: None,
+            })
+        } else if words.len() == 1 {
+            if let Some(parsed) = import_config::parse_selector(words[0]) {
+                let selector = parsed.map_err(ConnectFailure::usage)?;
+                let imported = import_config::load_with(selector, |name| std::env::var(name).ok())
+                    .map_err(ConnectFailure::usage)?;
+                source_label = Some(format!("import {}", imported.label()));
+                import_selector = Some(imported.selector);
+                import_http_trust = imported.http_trust;
+                Some(imported.connection)
+            } else if self.profiles.servers.contains_key(words[0]) {
+                let name = words[0];
+                let connection = self.resolve_profile(name)?;
+                profile_name = Some(name.to_string());
+                source_label = Some(format!("profile {name}"));
+                Some(connection)
+            } else {
+                Some(config::Connection::Stdio {
+                    command: vec![words[0].to_string()],
+                    env: std::collections::BTreeMap::new(),
+                    cwd: None,
+                })
+            }
+        } else {
+            let command = words.strip_prefix(&["--"]).unwrap_or(words);
+            if command.is_empty() {
+                return Err(ConnectFailure::usage(
+                    "usage: connect <url|profile|path.json:entry|command...|demo>",
+                ));
+            }
+            Some(config::Connection::Stdio {
+                command: command.iter().map(|word| (*word).to_string()).collect(),
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+            })
+        };
+
+        let mut connector = None;
+        let builder = client_builder(self.protocol)
+            .map_err(|error| ConnectFailure::usage(error.to_string()))?;
+        let client = if demo {
+            builder
+                .connect(
+                    TracingTransport::new(ChannelTransport::new(demo_router())),
+                    (self.make_handler)(),
+                )
+                .await
+                .map_err(ConnectFailure::mcp)?
+        } else {
+            match connection.expect("non-demo targets resolve a connection") {
+                config::Connection::Http {
+                    url,
+                    bearer,
+                    headers,
+                    oauth: profile_oauth,
+                } => {
+                    self.authorize_import_http(
+                        import_selector.as_ref(),
+                        import_http_trust.as_ref(),
+                        &url,
+                    )?;
+                    validate_bearer_fd_exclusive(
+                        self.bearer_from_fd.is_some(),
+                        false,
+                        false,
+                        &[],
+                        bearer.is_some(),
+                        &headers,
+                        false,
+                        profile_oauth.is_some(),
+                    )
+                    .map_err(ConnectFailure::usage)?;
+                    let explicit_bearer =
+                        self.bearer_from_fd.clone().or_else(|| self.bearer.clone());
+                    let oauth_name = selected_oauth_profile(
+                        self.oauth.as_deref(),
+                        profile_oauth.as_deref(),
+                        explicit_bearer.is_some(),
+                        &self.headers,
+                    );
+                    let profile_headers = if oauth_name.is_some() {
+                        headers
+                            .into_iter()
+                            .filter(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+                            .collect::<Vec<_>>()
+                    } else {
+                        headers
+                    };
+                    let http_config = if oauth_name.is_some() {
+                        build_http_config_with_env(
+                            explicit_bearer,
+                            &self.headers,
+                            None,
+                            &profile_headers,
+                            None,
+                        )
+                    } else {
+                        build_http_config(explicit_bearer, &self.headers, bearer, &profile_headers)
+                    }
+                    .map_err(ConnectFailure::usage)?;
+                    let oauth = self.oauth_runtime(oauth_name.as_deref(), &url).await?;
+                    if !self.no_reconnect {
+                        connector = Some(http_connector(
+                            url.clone(),
+                            http_config.clone(),
+                            oauth.clone(),
+                            self.make_handler.clone(),
+                            self.protocol,
+                        ));
+                    }
+                    builder
+                        .connect(
+                            TracingTransport::new(http_transport(url, http_config, oauth)),
+                            (self.make_handler)(),
+                        )
+                        .await
+                        .map_err(ConnectFailure::mcp)?
+                }
+                config::Connection::Stdio { command, env, cwd } => {
+                    if self.bearer_from_fd.is_some() {
+                        return Err(ConnectFailure::usage(
+                            "--bearer-fd applies only to HTTP servers and cannot be ignored safely",
+                        ));
+                    }
+                    if self.bearer.is_some() || !self.headers.is_empty() {
+                        eprintln!(
+                            "warning: --bearer/--header apply only to HTTP servers; ignoring them here"
+                        );
+                    }
+                    if self.oauth.is_some() {
+                        return Err(ConnectFailure::usage(
+                            "--oauth applies only to HTTP servers",
+                        ));
+                    }
+                    if let Some(selector) = import_selector.as_ref() {
+                        let plan = import_trust::ImportPlan::stdio(
+                            &selector.path,
+                            &selector.entry,
+                            &command,
+                            cwd.as_deref(),
+                            &env,
+                        );
+                        self.authorize_import(&plan)?;
+                    }
+                    let Some(program) = command.first() else {
+                        return Err(ConnectFailure::usage("stdio command is empty"));
+                    };
+                    let mut child = tokio::process::Command::new(program);
+                    child.args(&command[1..]);
+                    child.envs(env);
+                    child.env_remove("MCP_BEARER");
+                    if let Some(cwd) = cwd {
+                        child.current_dir(cwd);
+                    }
+                    child.stderr(std::process::Stdio::piped());
+                    let mut transport = StdioClientTransport::spawn_command(&mut child)
+                        .await
+                        .map_err(|error| {
+                            ConnectFailure::mcp(tower_mcp::Error::Transport(format!(
+                                "could not start stdio server {program:?}: {error}"
+                            )))
+                        })?;
+                    if let Some(stderr) = transport.take_stderr() {
+                        forward_child_stderr(stderr, self.async_output.clone());
+                    }
+                    builder
+                        .connect(TracingTransport::new(transport), (self.make_handler)())
+                        .await
+                        .map_err(ConnectFailure::mcp)?
+                }
+            }
+        };
+
+        let info = establish_connection(&client, self.protocol)
+            .await
+            .map_err(ConnectFailure::mcp)?;
+        let surface = fetch_surface_initial(&client).await;
+        let profile_aliases = profile_name
+            .as_ref()
+            .and_then(|name| self.profiles.servers.get(name))
+            .map(|profile| profile.aliases.clone())
+            .unwrap_or_default();
+        Ok(ConnectedTarget {
+            client,
+            connector,
+            info,
+            surface,
+            profile_name,
+            profile_aliases,
+            source_label,
+        })
+    }
+
+    fn resolve_profile(&self, name: &str) -> Result<config::Connection, ConnectFailure> {
+        let profile = self.profiles.profile(name).map_err(ConnectFailure::usage)?;
+        validate_profile_bearer_fd_exclusive(self.bearer_from_fd.is_some(), profile)
+            .map_err(ConnectFailure::usage)?;
+        if profile.bearer.is_some() {
+            eprintln!(
+                "warning: profile {name:?} stores a literal `bearer` token; prefer \
+                 `bearer_env = \"VAR\"` so the token is not kept in the config file"
+            );
+        }
+        self.profiles
+            .resolve_profile_with(name, |variable| std::env::var(variable).ok())
+            .map_err(|error| ConnectFailure::usage(format!("server profile {name:?}: {error}")))
+    }
+
+    fn authorize_import_http(
+        &self,
+        selector: Option<&import_config::Selector>,
+        trust: Option<&import_config::ImportedHttpTrust>,
+        url: &str,
+    ) -> Result<(), ConnectFailure> {
+        let (Some(selector), Some(trust)) = (selector, trust) else {
+            return Ok(());
+        };
+        let plan = import_trust::ImportPlan::http(
+            &selector.path,
+            &selector.entry,
+            url,
+            &trust.header_names,
+            &trust
+                .header_env_keys
+                .iter()
+                .chain(trust.url_env_keys.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .map_err(ConnectFailure::usage)?;
+        self.authorize_import(&plan)
+    }
+
+    fn authorize_import(&self, plan: &import_trust::ImportPlan) -> Result<(), ConnectFailure> {
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        match import_trust::authorize(
+            plan,
+            self.config_file.as_deref(),
+            self.trust_import,
+            interactive,
+        ) {
+            import_trust::Decision::Approved => Ok(()),
+            import_trust::Decision::Refused(reason) => Err(ConnectFailure::usage(reason)),
+        }
+    }
+
+    async fn oauth_runtime(
+        &self,
+        name: Option<&str>,
+        url: &str,
+    ) -> Result<Option<OAuthRuntime>, ConnectFailure> {
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let metadata = self.profiles.oauth.get(name).ok_or_else(|| {
+            ConnectFailure::usage(format!(
+                "no OAuth profile named {name:?}; create it with \
+                 `mcp-repl --login {name} --http {url}`"
+            ))
+        })?;
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let (flow, store) = oauth_profile::build_flow(
+            name,
+            url,
+            metadata,
+            interactive,
+            interactive && !self.no_browser,
+        )
+        .map_err(|error| ConnectFailure {
+            status: ExitStatus::Auth,
+            message: error,
+        })?;
+        if interactive {
+            flow.authorize(metadata.scopes.clone())
+                .await
+                .map_err(|error| ConnectFailure {
+                    status: ExitStatus::Auth,
+                    message: format!("OAuth authorization failed for profile {name:?}: {error}"),
+                })?;
+        } else {
+            let has_tokens = store.has_tokens().await.map_err(|error| ConnectFailure {
+                status: ExitStatus::Auth,
+                message: format!("OAuth credential restore failed for profile {name:?}: {error}"),
+            })?;
+            if !has_tokens {
+                return Err(ConnectFailure {
+                    status: ExitStatus::Auth,
+                    message: format!(
+                        "OAuth login required for profile {name:?}; run \
+                         `mcp-repl --login {name} --http {url}` first"
+                    ),
+                });
+            }
+            match flow
+                .begin(metadata.scopes.clone())
+                .await
+                .map_err(|error| ConnectFailure {
+                    status: ExitStatus::Auth,
+                    message: format!(
+                        "OAuth credential restore failed for profile {name:?}: {error}"
+                    ),
+                })? {
+                OAuthAuthorizationStart::Authorized { .. } => {}
+                _ => {
+                    return Err(ConnectFailure {
+                        status: ExitStatus::Auth,
+                        message: format!(
+                            "OAuth login required for profile {name:?}; run \
+                             `mcp-repl --login {name} --http {url}` first"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(Some(OAuthRuntime {
+            flow,
+            scopes: metadata.scopes.clone(),
+        }))
+    }
+
+    fn candidates(&self) -> String {
+        let profiles = self.profiles.names();
+        let configured = if profiles.is_empty() {
+            "no saved profiles".to_string()
+        } else {
+            format!("saved profiles: {}", profiles.join(", "))
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let directories = directories::Directories::current();
+        let imported =
+            import_config::scan(&import_config::candidate_paths_with(&cwd, &directories))
+                .into_iter()
+                .filter_map(|file| {
+                    let entries = file.result.ok()?;
+                    let path = typeable_path(&file.path, &cwd, directories.home());
+                    Some(
+                        entries
+                            .into_iter()
+                            .map(|entry| format!("{path}:{}", entry.name))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+        let imported = if imported.is_empty() {
+            String::new()
+        } else {
+            format!("\nimported targets: {}", imported.join(", "))
+        };
+        format!(
+            "usage: connect <url|profile|path.json:entry|command...|demo>\n{configured}{imported}\n\
+             examples: connect demo · connect https://example/mcp · connect -- ./server --stdio"
+        )
+    }
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 /// Re-establish the resource subscriptions that belonged to the dead HTTP
@@ -3000,7 +3483,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
     // Server profiles are read up front: both --list-servers and profile
     // resolution need them before anything connects.
     let config_file = config::config_path(args.config.as_deref()).map(|(path, _)| path);
-    let profiles = if args.login.is_some() || args.logout.is_some() {
+    let profiles = Arc::new(if args.login.is_some() || args.logout.is_some() {
         config_file
             .as_deref()
             .map(|path| {
@@ -3010,7 +3493,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
             .unwrap_or_default()
     } else {
         load_config(args.config.as_deref())
-    };
+    });
     // Resolved here rather than at startup because the config has to be read
     // first. The flag wins, then the config, then the built-in default; the
     // flag stays an `Option` precisely so an explicit `--timeout 0` is
@@ -3103,6 +3586,21 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
             )
         })
     };
+    let connect_runtime = Arc::new(ConnectRuntime {
+        profiles: profiles.clone(),
+        config_file: config_file.clone(),
+        protocol: args.protocol,
+        make_handler: make_handler.clone(),
+        async_output: async_output.clone(),
+        server_label: server_label.clone(),
+        bearer: args.bearer.clone(),
+        bearer_from_fd: bearer_from_fd.clone(),
+        headers: args.headers.clone(),
+        oauth: args.oauth.clone(),
+        trust_import: args.trust_import,
+        no_browser: args.no_browser,
+        no_reconnect: args.no_reconnect,
+    });
     // Sampling has no model behind it, so the operator answers. Under --exec
     // there is nobody to ask, so requests are refused unless --sampling says
     // otherwise.
@@ -3189,16 +3687,17 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
     };
 
     let over_http = matches!(connection, Some(config::Connection::Http { .. }));
-    if !over_http && bearer_from_fd.is_some() {
+    let starts_disconnected = connection.is_none() && !args.demo && !one_shot && !args.json;
+    if !over_http && bearer_from_fd.is_some() && !starts_disconnected {
         exit_with_error(
             ExitStatus::Usage,
             "--bearer-fd applies only to HTTP servers and cannot be ignored safely",
         );
     }
-    if !over_http && (args.bearer.is_some() || !args.headers.is_empty()) {
+    if !over_http && !starts_disconnected && (args.bearer.is_some() || !args.headers.is_empty()) {
         eprintln!("warning: --bearer/--header apply only to HTTP servers; ignoring them here");
     }
-    if !over_http && args.oauth.is_some() {
+    if !over_http && args.oauth.is_some() && !starts_disconnected {
         exit_with_error(ExitStatus::Usage, "--oauth applies only to HTTP servers");
     }
     if let Some(name) = &profile_name
@@ -3232,12 +3731,14 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
     let mut connector: Option<Connector> = None;
     let client = if args.demo {
         tracing::debug!("connecting to the in-process demo server");
-        builder
-            .connect(
-                TracingTransport::new(ChannelTransport::new(demo_router())),
-                make_handler(),
-            )
-            .await?
+        Some(
+            builder
+                .connect(
+                    TracingTransport::new(ChannelTransport::new(demo_router())),
+                    make_handler(),
+                )
+                .await?,
+        )
     } else {
         match connection {
             Some(config::Connection::Http {
@@ -3408,12 +3909,14 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                         args.protocol,
                     ));
                 }
-                builder
-                    .connect(
-                        TracingTransport::new(http_transport(url, config, oauth)),
-                        make_handler(),
-                    )
-                    .await?
+                Some(
+                    builder
+                        .connect(
+                            TracingTransport::new(http_transport(url, config, oauth)),
+                            make_handler(),
+                        )
+                        .await?,
+                )
             }
             Some(config::Connection::Stdio { command, env, cwd }) => {
                 // An imported entry is code from somewhere else: show what it
@@ -3457,51 +3960,62 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 if let Some(stderr) = transport.take_stderr() {
                     forward_child_stderr(stderr, async_output.clone());
                 }
-                builder
-                    .connect(TracingTransport::new(transport), make_handler())
-                    .await?
+                Some(
+                    builder
+                        .connect(TracingTransport::new(transport), make_handler())
+                        .await?,
+                )
             }
             None => {
-                exit_with_error(ExitStatus::Usage, &no_target_message());
+                if one_shot || args.json {
+                    exit_with_error(ExitStatus::Usage, &no_target_message());
+                }
+                None
             }
         }
     };
-
-    let info = establish_connection(&client, args.protocol).await?;
-    let server_name = info.server_info.name.clone();
-    if let Ok(mut label) = server_label.write() {
-        label.clone_from(&server_name);
-    }
-    if !quiet {
-        print_banner(&info);
-    }
-    let session = Arc::new(Session::new(client, connector));
-    let client = session.client();
-
-    let surface = Arc::new(RwLock::new(fetch_surface_initial(&client).await));
-    if !quiet {
-        let s = surface.read().unwrap();
-        print_counts(&s);
-        // List the tools at startup so the surface is browsable immediately,
-        // unless the server already enumerated them in its instructions (some
-        // servers dump the whole surface there); then it would just repeat.
-        let instructions_list_tools = info
-            .instructions
-            .as_deref()
-            .is_some_and(|instr| s.tools.first().is_some_and(|t| instr.contains(&t.name)));
-        if !instructions_list_tools {
-            print_tool_overview(&s);
+    let (session, surface) = if let Some(client) = client {
+        let info = establish_connection(&client, args.protocol).await?;
+        if let Ok(mut label) = server_label.write() {
+            label.clone_from(&info.server_info.name);
         }
-        // Only for an interactive session: none of it applies to `--exec`,
-        // and it would be noise ahead of a data stream.
-        if !one_shot {
-            print_first_run_hint();
+        if !quiet {
+            print_banner(&info);
         }
-    }
+        let session = Arc::new(Session::new(client, connector));
+        let surface = Arc::new(RwLock::new(fetch_surface_initial(&session.client()).await));
+        if !quiet {
+            let s = surface.read().unwrap();
+            print_counts(&s);
+            // List the tools at startup so the surface is browsable immediately,
+            // unless the server already enumerated them in its instructions.
+            let instructions_list_tools = info
+                .instructions
+                .as_deref()
+                .is_some_and(|instr| s.tools.first().is_some_and(|t| instr.contains(&t.name)));
+            if !instructions_list_tools {
+                print_tool_overview(&s);
+            }
+            if !one_shot {
+                print_first_run_hint();
+            }
+        }
+        (session, surface)
+    } else {
+        if let Ok(mut label) = server_label.write() {
+            *label = "mcp-repl".to_string();
+        }
+        println!("not connected — run `connect` to see targets, or try `connect demo`");
+        (
+            Arc::new(Session::disconnected()),
+            Arc::new(RwLock::new(Surface::default())),
+        )
+    };
 
     // One-shot: run each --exec command in order, then exit non-zero if any
     // errored. No editor, no event loop.
     if one_shot {
+        let client = session.client();
         for cmd in &args.exec {
             match run_cancellable(
                 &session,
@@ -3509,6 +4023,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 &aliases,
                 &jobs,
                 &schema_contracts,
+                &connect_runtime,
                 cmd.trim(),
             )
             .await
@@ -3555,7 +4070,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);
     let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
     editor::spawn_readline_thread(
-        server_name,
+        server_label.clone(),
         surface.clone(),
         session.clone(),
         aliases.clone(),
@@ -3594,6 +4109,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                     &aliases,
                     &jobs,
                     &schema_contracts,
+                    &connect_runtime,
                     line.trim(),
                 )
                 .await;
@@ -3663,11 +4179,20 @@ async fn run_cancellable(
     aliases: &Arc<RwLock<Aliases>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
+    connect_runtime: &ConnectRuntime,
     line: &str,
 ) -> Ran {
     tokio::select! {
         biased;
-        quit = handle_line(session, surface, aliases, jobs, schema_contracts, line) => {
+        quit = handle_line(
+            session,
+            surface,
+            aliases,
+            jobs,
+            schema_contracts,
+            connect_runtime,
+            line,
+        ) => {
             Ran::Completed(quit)
         }
         _ = tokio::signal::ctrl_c() => {
@@ -3708,6 +4233,7 @@ async fn handle_line(
     aliases: &Arc<RwLock<Aliases>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
+    connect_runtime: &ConnectRuntime,
     line: &str,
 ) -> bool {
     if line.is_empty() {
@@ -3750,7 +4276,6 @@ async fn handle_line(
         }
     };
     let line = command.as_str();
-    let client = session.client();
     let parsed = match command::parse(line) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -3791,6 +4316,13 @@ async fn handle_line(
         let surface = surface.read().unwrap();
         (is_builtin(cmd), is_tool(&surface, cmd))
     };
+    if !session.is_connected() && namespace == CommandNamespace::Tool {
+        report_error(
+            ExitStatus::Usage,
+            "not connected; run `connect` to see targets, or try `connect demo`",
+        );
+        return false;
+    }
     match namespace {
         CommandNamespace::Automatic if is_builtin_command && is_tool_command => {
             report_error(
@@ -3839,6 +4371,84 @@ async fn handle_line(
         );
         return false;
     }
+
+    if cmd == "connect" && namespace != CommandNamespace::Tool {
+        match connect_runtime.connect(rest).await {
+            Ok(connected) => {
+                let previous = session.replace(connected.client, connected.connector).await;
+                if let Some(previous) = previous
+                    && let Ok(previous) = Arc::try_unwrap(previous)
+                    && let Err(error) = previous.shutdown().await
+                {
+                    eprintln!("warning: closing the previous server failed: {error}");
+                }
+                // Clear after the old client is closed: a last notification
+                // from it must not repopulate task or subscription state that
+                // belongs to the server we just left.
+                let cleared_vars = vars::clear();
+                let cleared_jobs = jobs.clear();
+                let cleared_subscriptions = subscribe::clear();
+                aliases
+                    .write()
+                    .unwrap()
+                    .select_profile(connected.profile_name, connected.profile_aliases);
+                *surface.write().unwrap() = connected.surface;
+                if let Ok(mut label) = connect_runtime.server_label.write() {
+                    label.clone_from(&connected.info.server_info.name);
+                }
+                if let Some(label) = connected.source_label {
+                    println!("{}", tag(Style::new().fg(Color::Cyan), &label));
+                }
+                print_banner(&connected.info);
+                let current = surface.read().unwrap();
+                print_counts(&current);
+                print_tool_overview(&current);
+                drop(current);
+                let cleared = [
+                    (cleared_vars, "captured variable"),
+                    (cleared_jobs, "background task"),
+                    (cleared_subscriptions, "resource subscription"),
+                ]
+                .into_iter()
+                .filter(|(count, _)| *count > 0)
+                .map(|(count, noun)| plural(count, noun))
+                .collect::<Vec<_>>();
+                if !cleared.is_empty() {
+                    println!(
+                        "{}",
+                        paint(
+                            Style::new().dimmed(),
+                            &format!("server-scoped state cleared: {}", cleared.join(", ")),
+                        )
+                    );
+                }
+            }
+            Err(error) => report_error(error.status, &error.message),
+        }
+        return false;
+    }
+
+    let usable_disconnected = matches!(
+        cmd,
+        "help"
+            | "alias"
+            | "unalias"
+            | "wire"
+            | "last"
+            | "history"
+            | "vars"
+            | "unset"
+            | "quit"
+            | "exit"
+    );
+    if !session.is_connected() && !usable_disconnected {
+        report_error(
+            ExitStatus::Usage,
+            "not connected; run `connect` to see targets, or try `connect demo`",
+        );
+        return false;
+    }
+    let client = session.try_client();
 
     if namespace == CommandNamespace::Tool {
         dispatch_direct_tool(
@@ -3910,6 +4520,7 @@ async fn handle_line(
                 return false;
             }
             println!("built-ins:");
+            println!("  connect <target>                          connect or switch servers");
             println!("  tools | prompts | resources | templates   list the server surface");
             println!("  find [flags] <keyword>                    search the surface");
             println!("  describe <name>                           schemas and metadata");
@@ -4285,7 +4896,7 @@ async fn handle_line(
                 command_error(&format!("usage: {cmd} <uri>"));
                 return false;
             };
-            handle_subscription(&client, cmd, uri).await;
+            handle_subscription(client.as_ref().expect("connected above"), cmd, uri).await;
         }
         "subscriptions" => {
             let active = subscribe::list();
@@ -4379,7 +4990,14 @@ async fn handle_line(
             .await;
         }
         "bench" => {
-            handle_bench(&client, surface, schema_contracts, rest, background).await;
+            handle_bench(
+                client.as_ref().expect("connected above"),
+                surface,
+                schema_contracts,
+                rest,
+                background,
+            )
+            .await;
         }
         "jobs" => {
             // Every listed job costs a `tasks/get`, so the annotation
@@ -4388,7 +5006,12 @@ async fn handle_line(
             if json_output() {
                 let mut rendered = Vec::new();
                 for job in jobs.list() {
-                    match client.task_get(&job.task_id).await {
+                    match client
+                        .as_deref()
+                        .expect("connected above")
+                        .task_get(&job.task_id)
+                        .await
+                    {
                         Ok(task) => {
                             jobs.sync(&job.task_id, task.status, task.status_message.clone());
                             rendered.push(serde_json::json!({
@@ -4423,7 +5046,12 @@ async fn handle_line(
                 );
             }
             for job in jobs.list() {
-                match client.task_get(&job.task_id).await {
+                match client
+                    .as_deref()
+                    .expect("connected above")
+                    .task_get(&job.task_id)
+                    .await
+                {
                     Ok(task) => {
                         jobs.sync(&job.task_id, task.status, task.status_message.clone());
                         println!(
@@ -4470,7 +5098,13 @@ async fn handle_line(
             // inside an earlier `-e` command, so without this there is no way
             // for one to wait on its own work.
             if cmd == "wait" && rest.is_empty() {
-                wait_for_all(&client, jobs, wait_limit, started).await;
+                wait_for_all(
+                    client.as_deref().expect("connected above"),
+                    jobs,
+                    wait_limit,
+                    started,
+                )
+                .await;
                 return false;
             }
             let Some(typed) = rest.first() else {
@@ -4495,21 +5129,43 @@ async fn handle_line(
             // question was asked while the editor held the terminal, so
             // nothing could answer it at the time.
             if cmd == "task" && rest.get(1).is_some_and(|word| *word == "respond") {
-                respond_to_task(&client, id, &jobs.label_for(id)).await;
+                respond_to_task(
+                    client.as_deref().expect("connected above"),
+                    id,
+                    &jobs.label_for(id),
+                )
+                .await;
                 if !json_output() {
                     println!("{}", timing(started.elapsed()));
                 }
                 return false;
             }
             let outcome = match cmd {
-                "task" => client.task_get(id).await,
-                "wait" => wait_for_one(&client, id, wait_limit).await,
-                _ => match client.task_cancel(id, None).await {
+                "task" => {
+                    client
+                        .as_deref()
+                        .expect("connected above")
+                        .task_get(id)
+                        .await
+                }
+                "wait" => {
+                    wait_for_one(client.as_deref().expect("connected above"), id, wait_limit).await
+                }
+                _ => match client
+                    .as_deref()
+                    .expect("connected above")
+                    .task_cancel(id, None)
+                    .await
+                {
                     Ok(()) => {
                         if !json_output() {
                             println!("cancel acknowledged");
                         }
-                        client.task_get(id).await
+                        client
+                            .as_deref()
+                            .expect("connected above")
+                            .task_get(id)
+                            .await
                     }
                     Err(e) => Err(e),
                 },
@@ -4608,7 +5264,7 @@ async fn handle_line(
         },
         "ping" => {
             let started = std::time::Instant::now();
-            match with_deadline(client.ping()).await {
+            match with_deadline(client.as_deref().expect("connected above").ping()).await {
                 Ok(()) => {
                     let elapsed = started.elapsed();
                     if json_output() {
@@ -4649,7 +5305,7 @@ async fn handle_line(
             // The server said whether it has logging at all. Sending anyway
             // would earn a "method not found" the operator would have to
             // interpret; saying so first is the same information, sooner.
-            let declared = connection_info(&client)
+            let declared = connection_info(client.as_deref().expect("connected above"))
                 .await
                 .is_some_and(|info| info.capabilities.logging.is_some());
             if !declared {
@@ -4662,8 +5318,13 @@ async fn handle_line(
             }
             let started = std::time::Instant::now();
             let params = serde_json::json!({ "level": level });
-            match with_deadline(client.request::<_, serde_json::Value>("logging/setLevel", &params))
-                .await
+            match with_deadline(
+                client
+                    .as_deref()
+                    .expect("connected above")
+                    .request::<_, serde_json::Value>("logging/setLevel", &params),
+            )
+            .await
             {
                 Ok(_) => {
                     if json_output() {
@@ -4703,7 +5364,7 @@ async fn handle_line(
             }
             *surface.write().unwrap() = fresh;
         }
-        "info" => match connection_info(&client).await {
+        "info" => match connection_info(client.as_deref().expect("connected above")).await {
             Some(info) => {
                 if !output.is_plain() || json_output() {
                     emit_value(
@@ -7084,7 +7745,7 @@ world",
     async fn demo_session() -> (Arc<Session>, Arc<std::sync::atomic::AtomicUsize>) {
         let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = connects.clone();
-        let connector: Connector = Box::new(move || {
+        let connector: Connector = Arc::new(move || {
             let counter = counter.clone();
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);

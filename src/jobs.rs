@@ -223,6 +223,14 @@ impl Jobs {
         self.state.lock().unwrap().jobs.is_empty()
     }
 
+    /// Drop task ids owned by the server being left.
+    pub fn clear(&self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let count = state.jobs.len();
+        *state = State::default();
+        count
+    }
+
     pub fn is_terminal(&self, task_id: &str) -> bool {
         self.state
             .lock()
@@ -502,5 +510,15 @@ mod tests {
         );
         jobs.observe("task-1".into(), TaskStatus::Cancelled, None);
         assert!(printer.get_line().is_none());
+    }
+
+    #[test]
+    fn clearing_tasks_starts_the_new_server_at_job_one() {
+        let (jobs, _printer) = fixture();
+        jobs.register("old".into(), "slow".into(), TaskStatus::Working, None);
+        assert_eq!(jobs.clear(), 1);
+        assert!(jobs.is_empty());
+        jobs.register("new".into(), "slow".into(), TaskStatus::Working, None);
+        assert_eq!(jobs.resolve("1").as_deref(), Some("new"));
     }
 }

@@ -24,7 +24,7 @@ use tower_mcp::client::McpClient;
 
 /// Builds a fully connected and initialized client. Called once per
 /// reconnect, so it must construct a new transport each time.
-pub type Connector = Box<
+pub type Connector = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<McpClient, tower_mcp::Error>> + Send>>
         + Send
         + Sync,
@@ -33,8 +33,8 @@ pub type Connector = Box<
 /// The live client plus, when the transport supports it, the means to
 /// re-establish it.
 pub struct Session {
-    client: RwLock<Arc<McpClient>>,
-    connector: Option<Connector>,
+    client: RwLock<Option<Arc<McpClient>>>,
+    connector: RwLock<Option<Connector>>,
     /// Serializes reconnects so two failing commands do not both rebuild.
     reconnecting: tokio::sync::Mutex<()>,
     /// Bumped on every successful reconnect. A caller that saw generation N
@@ -54,8 +54,20 @@ impl Session {
     pub fn new(client: McpClient, connector: Option<Connector>) -> Self {
         let (generation_tx, _) = tokio::sync::watch::channel(0);
         Self {
-            client: RwLock::new(Arc::new(client)),
-            connector,
+            client: RwLock::new(Some(Arc::new(client))),
+            connector: RwLock::new(connector),
+            reconnecting: tokio::sync::Mutex::new(()),
+            generation: AtomicU64::new(0),
+            generation_tx,
+        }
+    }
+
+    /// A REPL session before its first `connect` command.
+    pub fn disconnected() -> Self {
+        let (generation_tx, _) = tokio::sync::watch::channel(0);
+        Self {
+            client: RwLock::new(None),
+            connector: RwLock::new(None),
             reconnecting: tokio::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
             generation_tx,
@@ -65,11 +77,22 @@ impl Session {
     /// The client to issue the next request on. Cloned out rather than
     /// borrowed so a reconnect can swap the slot without waiting on callers.
     pub fn client(&self) -> Arc<McpClient> {
+        self.try_client().expect("MCP session is not connected")
+    }
+
+    /// The current client, or `None` while the interactive REPL is
+    /// disconnected. Completion and long-lived listeners use this rather
+    /// than manufacturing requests before the first `connect`.
+    pub fn try_client(&self) -> Option<Arc<McpClient>> {
         self.client.read().unwrap().clone()
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.client.read().unwrap().is_some()
+    }
+
     pub fn can_reconnect(&self) -> bool {
-        self.connector.is_some()
+        self.connector.read().unwrap().is_some()
     }
 
     pub fn generation(&self) -> u64 {
@@ -86,10 +109,13 @@ impl Session {
     /// shared by command work. One-shot mode uses this before applying its
     /// process exit status so stdio children see EOF and are reaped cleanly.
     pub async fn shutdown(self) -> Result<(), tower_mcp::Error> {
-        let client = self
+        let Some(client) = self
             .client
             .into_inner()
-            .expect("session client lock poisoned");
+            .expect("session client lock poisoned")
+        else {
+            return Ok(());
+        };
         let client = Arc::try_unwrap(client).map_err(|_| {
             tower_mcp::Error::Transport(
                 "cannot shut down an MCP session while its client is still in use".to_string(),
@@ -102,7 +128,7 @@ impl Session {
     /// `seen` was read. Returns `Ok(())` either way; the caller should
     /// re-read [`Session::client`] afterwards.
     pub async fn reconnect(&self, seen: u64) -> Result<(), tower_mcp::Error> {
-        let Some(connector) = &self.connector else {
+        let Some(connector) = self.connector.read().unwrap().clone() else {
             return Err(tower_mcp::Error::Transport(
                 "this transport cannot be reconnected".to_string(),
             ));
@@ -121,11 +147,31 @@ impl Session {
         // pause makes the retry land after the bind rather than during it.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let fresh = connector().await?;
-        *self.client.write().unwrap() = Arc::new(fresh);
+        *self.client.write().unwrap() = Some(Arc::new(fresh));
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
         tracing::debug!(generation, "reconnected");
         Ok(())
+    }
+
+    /// Publish a fully initialized replacement connection. Callers build and
+    /// inspect the candidate first, so a failed switch leaves the current
+    /// server usable.
+    pub async fn replace(
+        &self,
+        client: McpClient,
+        connector: Option<Connector>,
+    ) -> Option<Arc<McpClient>> {
+        // Serialize an explicit switch with transparent HTTP recovery. A
+        // reconnect already in flight finishes first; a reconnect waiting on
+        // this lock observes the bumped generation and reuses this client.
+        let _guard = self.reconnecting.lock().await;
+        *self.connector.write().unwrap() = connector;
+        let previous = self.client.write().unwrap().replace(Arc::new(client));
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_tx.send_replace(generation);
+        tracing::debug!(generation, "replaced session connection");
+        previous
     }
 }
 
@@ -211,6 +257,15 @@ mod tests {
             message: message.to_string(),
             data: None,
         })
+    }
+
+    #[test]
+    fn disconnected_session_has_no_client_or_reconnect_recipe() {
+        let session = Session::disconnected();
+        assert!(!session.is_connected());
+        assert!(session.try_client().is_none());
+        assert!(!session.can_reconnect());
+        assert_eq!(session.generation(), 0);
     }
 
     #[test]

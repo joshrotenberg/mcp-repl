@@ -8,7 +8,8 @@ on top of it.
 
 ## What to try
 
-`--demo` needs no server at all, and its tools are typed so the features
+Start with `mcp-repl`, then run `connect demo` (or start directly with
+`mcp-repl --demo`). The demo needs no external server, and its tools are typed so the features
 that depend on a schema are all reachable:
 
 ```text

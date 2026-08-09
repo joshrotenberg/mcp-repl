@@ -38,6 +38,16 @@ pub fn list() -> Vec<(String, Value)> {
     vars
 }
 
+/// Clear values captured from the current server, returning how many were
+/// dropped. A value's shape and meaning belong to that server's surface, so
+/// carrying it through `connect` would make later substitutions misleading.
+pub fn clear() -> usize {
+    let mut store = store().lock().unwrap();
+    let count = store.len();
+    store.clear();
+    count
+}
+
 /// Where a command's result should go, parsed from the line.
 #[derive(Default)]
 pub struct Output {
