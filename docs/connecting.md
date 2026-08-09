@@ -404,6 +404,12 @@ and removes only that stale entry from `subscriptions`. Task ids do not survive
 a reconnect (they belong to the session that created them), so `task`, `wait`,
 and `cancel` never trigger one.
 
+An HTTP 404 while initially connecting still means the endpoint path is wrong
+and is reported with path guidance, without a reconnect. If 404 arrives on a
+request after a successful handshake, the HTTP client cannot distinguish an
+expired session from an endpoint that disappeared; the REPL makes one bounded
+reconnect attempt and then surfaces the status if it persists.
+
 Pass `--no-reconnect` to turn this off and see session-loss errors as they
 arrive. stdio children and `--demo` are never reconnected: there, a lost
 session means the server process itself is gone.

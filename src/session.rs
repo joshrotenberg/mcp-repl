@@ -156,26 +156,49 @@ pub fn is_not_initialized(e: &tower_mcp::Error) -> bool {
 ///   (restart, OOM, redeploy, or a request scattered to another instance).
 /// - a closed transport, from the client's message loop shutting down.
 /// - HTTP 410 Gone, and 502/503 from an edge in front of a restarting server.
-///   These arrive as `Transport` strings, since the transport only maps 404
-///   to a typed variant.
+///   A request issued after the handshake can arrive as a synthesized
+///   JSON-RPC `-32000` error even though its cause is transport-level.
 ///
 /// Everything else, including 4xx auth failures and tool errors, is a real
 /// error and must surface unchanged: reconnecting would hide it behind a
 /// second identical failure.
 pub fn is_session_lost(e: &tower_mcp::Error) -> bool {
-    if matches!(e, tower_mcp::Error::SessionExpired) || is_not_initialized(e) {
+    if matches!(e, tower_mcp::Error::SessionExpired)
+        || is_not_initialized(e)
+        || is_reconnectable_http_error(e)
+    {
         return true;
     }
     match e {
         tower_mcp::Error::Transport(msg) => {
-            msg.contains("Transport closed")
-                || msg.contains("Connection closed")
-                || msg.contains("HTTP 410")
-                || msg.contains("HTTP 502")
-                || msg.contains("HTTP 503")
+            msg.contains("Transport closed") || msg.contains("Connection closed")
         }
         _ => false,
     }
+}
+
+/// True for an HTTP status that reached the request waiter as either a direct
+/// transport error or tower-mcp's synthesized JSON-RPC transport frame.
+///
+/// A JSON-RPC 404 can only take this path after a successful handshake. The
+/// initial wrong-endpoint 404 remains a direct, actionable `Transport` error
+/// and is deliberately not reconnectable. Requiring both `-32000` and the
+/// exact generated prefix keeps ordinary protocol/tool errors out even when
+/// their own message happens to mention an HTTP status.
+pub(crate) fn is_reconnectable_http_error(e: &tower_mcp::Error) -> bool {
+    match e {
+        tower_mcp::Error::Transport(message) => status_after(message, "HTTP ")
+            .is_some_and(|status| matches!(status, "410" | "502" | "503")),
+        tower_mcp::Error::JsonRpc(error) if error.code == -32000 => {
+            status_after(&error.message, "server returned HTTP ")
+                .is_some_and(|status| matches!(status, "404" | "410" | "502" | "503"))
+        }
+        _ => false,
+    }
+}
+
+fn status_after<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
+    message.strip_prefix(prefix)?.split_whitespace().next()
 }
 
 #[cfg(test)]
@@ -211,6 +234,17 @@ mod tests {
                 "{status} should count as session loss"
             );
         }
+        for status in [
+            "404 Not Found",
+            "410 Gone",
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+        ] {
+            assert!(
+                is_session_lost(&jsonrpc(-32000, &format!("server returned HTTP {status}"))),
+                "live HTTP {status} should count as session loss"
+            );
+        }
     }
 
     #[test]
@@ -223,6 +257,20 @@ mod tests {
             "HTTP 404 from http://x/mcp: MCP endpoint not found".into()
         )));
         assert!(!is_session_lost(&jsonrpc(-32602, "Invalid params")));
+        assert!(!is_session_lost(&jsonrpc(
+            -32000,
+            "tool reported HTTP 503 Service Unavailable"
+        )));
+        assert!(!is_session_lost(&jsonrpc(
+            -32603,
+            "server returned HTTP 503 Service Unavailable"
+        )));
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            assert!(!is_session_lost(&jsonrpc(
+                -32000,
+                &format!("server returned HTTP {status}")
+            )));
+        }
         assert!(!is_session_lost(&tower_mcp::Error::tool("boom")));
     }
 

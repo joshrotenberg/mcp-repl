@@ -223,21 +223,13 @@ async fn observe_subscription(request: Request, next: Next) -> Response {
         Some("resources/subscribe") => {
             increment_marker("MCP_REPL_FIXTURE_RESOURCE_SUBSCRIPTIONS_FILE");
         }
-        Some("tools/call") if claim_marker("MCP_REPL_FIXTURE_RECONNECT_ONCE_FILE") => {
-            let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-                .await
-                .expect("read reconnect fixture request");
-            let request: serde_json::Value =
-                serde_json::from_slice(&body).expect("decode reconnect fixture request");
-            return axum::Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request["id"],
-                "error": {
-                    "code": -32600,
-                    "message": "Client must send notifications/initialized before making requests"
-                }
-            }))
-            .into_response();
+        Some("tools/call") => {
+            increment_marker("MCP_REPL_FIXTURE_TOOL_CALLS_FILE");
+            let fail_once = claim_marker("MCP_REPL_FIXTURE_HTTP_503_ONCE_FILE");
+            let fail_always = std::env::var_os("MCP_REPL_FIXTURE_HTTP_503_ALWAYS").is_some();
+            if fail_once || fail_always {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
         }
         _ => {}
     }
