@@ -85,9 +85,9 @@ jobs:
         run: ./actionlint
       - name: Lint release and installer scripts
         run: |
-          shellcheck install.sh scripts/package-release.sh
+          shellcheck install.sh scripts/*.sh
           sh -n install.sh
-          bash -n scripts/package-release.sh
+          for script in scripts/*.sh; do bash -n "$script"; done
 
   windows-directories:
     name: Windows directories

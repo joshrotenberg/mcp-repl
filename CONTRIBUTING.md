@@ -25,6 +25,21 @@ The generated case count and seed live in `src/property.rs`. A fixed seed
 keeps CI time and failures reproducible; add the smallest reproducer to the
 matching regression corpus whenever one of these boundaries is fixed.
 
+## Coverage
+
+Install `cargo-llvm-cov`, then generate the navigable report with:
+
+```bash
+cargo install cargo-llvm-cov
+./scripts/coverage.sh
+```
+
+The report starts at `target/llvm-cov/html/index.html`. For a compact baseline
+without opening or generating a browser report, run
+`./scripts/coverage.sh --summary-only`. Coverage is a map to untested branches,
+not a merge threshold: prioritize security boundaries, state restoration, and
+editor behavior over a repository-wide vanity percentage.
+
 Adding or updating a dependency also needs:
 
 ```bash

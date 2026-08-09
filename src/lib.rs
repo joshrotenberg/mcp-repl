@@ -45,6 +45,7 @@ mod bearer_fd;
 mod bench;
 mod command;
 pub mod config;
+mod connection_auth;
 mod directories;
 mod editor;
 mod elicit;
@@ -65,19 +66,24 @@ mod session;
 mod style;
 mod subscribe;
 mod surface_subscription;
+mod tool_args;
 mod vars;
 mod wire;
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+use connection_auth::{
+    raw_header_is_authorization, selected_oauth_profile, validate_bearer_fd_exclusive,
+    validate_profile_bearer_fd_exclusive,
+};
 use nu_ansi_term::{Color, Style};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tool_args::{parse_kv_args, parse_prompt_args};
 use tower_mcp::client::{
     ChannelTransport, HttpClientConfig, HttpClientTransport, McpClient, McpClientBuilder,
     NotificationHandler, OAuthAuthorizationFlow, OAuthAuthorizationStart, OAuthClientError,
@@ -832,74 +838,6 @@ pub(crate) fn is_tool(surface: &Surface, name: &str) -> bool {
 
 pub(crate) fn is_ambiguous_command(surface: &Surface, name: &str) -> bool {
     is_builtin(name) && is_tool(surface, name)
-}
-
-/// Coerce a `key=value` string according to the tool's inputSchema.
-fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::Value {
-    let ty = schema
-        .get("properties")
-        .and_then(|p| p.get(key))
-        .and_then(|s| s.get("type"))
-        .and_then(|t| t.as_str());
-    match ty {
-        Some("integer") => raw
-            .parse::<i64>()
-            .map(Into::into)
-            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
-        Some("number") => raw
-            .parse::<f64>()
-            .ok()
-            .and_then(|n| serde_json::Number::from_f64(n).map(serde_json::Value::Number))
-            .unwrap_or_else(|| serde_json::Value::String(raw.to_string())),
-        Some("boolean") => raw
-            .parse::<bool>()
-            .map(serde_json::Value::Bool)
-            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
-        Some("array") | Some("object") => {
-            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
-        }
-        _ => {
-            // No schema type: accept JSON literals, fall back to string.
-            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
-        }
-    }
-}
-
-fn parse_kv_args(schema: &serde_json::Value, tokens: &[&str]) -> Result<serde_json::Value, String> {
-    // A single JSON object literal wins.
-    if tokens.len() == 1 && tokens[0].starts_with('{') {
-        let value: serde_json::Value = serde_json::from_str(tokens[0])
-            .map_err(|error| format!("invalid JSON object argument: {error}"))?;
-        if !value.is_object() {
-            return Err("the JSON argument must be an object".to_string());
-        }
-        return Ok(value);
-    }
-    let mut map = serde_json::Map::new();
-    for token in tokens {
-        let (key, value) = split_kv_arg(token)?;
-        map.insert(key.to_string(), coerce_arg(schema, key, value));
-    }
-    Ok(serde_json::Value::Object(map))
-}
-
-fn parse_prompt_args(tokens: &[&str]) -> Result<HashMap<String, String>, String> {
-    let mut arguments = HashMap::new();
-    for token in tokens {
-        let (key, value) = split_kv_arg(token)?;
-        arguments.insert(key.to_string(), value.to_string());
-    }
-    Ok(arguments)
-}
-
-fn split_kv_arg(token: &str) -> Result<(&str, &str), String> {
-    let Some((key, value)) = token.split_once('=') else {
-        return Err(format!("argument {token:?} must use `key=value` syntax"));
-    };
-    if key.is_empty() {
-        return Err(format!("argument {token:?} has an empty name"));
-    }
-    Ok((key, value))
 }
 
 fn render_content(content: &[Content]) {
@@ -1735,140 +1673,14 @@ fn build_http_config_with_env(
     profile_headers: &[(String, String)],
     env_bearer: Option<String>,
 ) -> Result<HttpClientConfig, String> {
-    let mut config = HttpClientConfig::default();
-    for (name, value) in profile_headers {
-        config = config.header(name.as_str(), value.as_str());
-    }
-    let selected_has_authorization = profile_headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
-    if let Some(token) = bearer.or(profile_bearer).or_else(|| {
-        (!selected_has_authorization)
-            .then_some(env_bearer)
-            .flatten()
-    }) {
-        config = config.bearer_token(token);
-    }
-    for raw in headers {
-        let (name, value) = raw
-            .split_once(':')
-            .ok_or_else(|| format!("invalid --header {raw:?}: expected `Name: Value`"))?;
-        config = config.header(name.trim(), value.trim());
-    }
-    // The framework applies its own 30s HTTP request timeout. Leaving it in
-    // place would make `--timeout 300` a lie on HTTP and `--timeout 0` still
-    // give up at 30s, so the transport is told the same deadline the REPL is
-    // using. "Indefinitely" becomes a year, which no interactive session
-    // outlives, because the transport requires some duration.
-    config.request_timeout = request_timeout().unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
-    Ok(config)
-}
-
-fn raw_header_is_authorization(header: &str) -> bool {
-    header
-        .split_once(':')
-        .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
-}
-
-fn selected_header_is_authorization((name, _): &(String, String)) -> bool {
-    name.eq_ignore_ascii_case("authorization")
-}
-
-fn bearer_fd_conflict_result(conflicts: Vec<&'static str>) -> Result<(), String> {
-    if conflicts.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "--bearer-fd cannot be combined with other authorization sources: {}. Remove the other source instead of relying on credential precedence",
-        conflicts.join(", ")
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_bearer_fd_exclusive(
-    enabled: bool,
-    cli_bearer: bool,
-    env_bearer: bool,
-    cli_headers: &[String],
-    selected_bearer: bool,
-    selected_headers: &[(String, String)],
-    cli_oauth: bool,
-    selected_oauth: bool,
-) -> Result<(), String> {
-    if !enabled {
-        return Ok(());
-    }
-    let mut conflicts = Vec::new();
-    if cli_bearer {
-        conflicts.push("--bearer");
-    }
-    if env_bearer {
-        conflicts.push("MCP_BEARER");
-    }
-    if selected_bearer {
-        conflicts.push("profile `bearer`/`bearer_env`");
-    }
-    if cli_headers
-        .iter()
-        .any(|header| raw_header_is_authorization(header))
-    {
-        conflicts.push("--header Authorization");
-    }
-    if selected_headers
-        .iter()
-        .any(selected_header_is_authorization)
-    {
-        conflicts.push("profile/import Authorization header");
-    }
-    if cli_oauth {
-        conflicts.push("--oauth");
-    }
-    if selected_oauth {
-        conflicts.push("profile OAuth");
-    }
-    bearer_fd_conflict_result(conflicts)
-}
-
-fn validate_profile_bearer_fd_exclusive(
-    enabled: bool,
-    profile: &config::Profile,
-) -> Result<(), String> {
-    if !enabled {
-        return Ok(());
-    }
-    let mut conflicts = Vec::new();
-    if profile.bearer.is_some() {
-        conflicts.push("profile `bearer`");
-    }
-    if profile.bearer_env.is_some() {
-        conflicts.push("profile `bearer_env`");
-    }
-    if profile.oauth.is_some() {
-        conflicts.push("profile OAuth");
-    }
-    if profile
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-    {
-        conflicts.push("profile Authorization header");
-    }
-    bearer_fd_conflict_result(conflicts)
-}
-
-fn selected_oauth_profile(
-    cli_oauth: Option<&str>,
-    profile_oauth: Option<&str>,
-    cli_bearer: bool,
-    cli_headers: &[String],
-) -> Option<String> {
-    let explicit_authorization = cli_bearer
-        || cli_headers
-            .iter()
-            .any(|header| raw_header_is_authorization(header));
-    (!explicit_authorization)
-        .then(|| cli_oauth.or(profile_oauth).map(str::to_string))
-        .flatten()
+    connection_auth::build_http_config(
+        bearer,
+        headers,
+        profile_bearer,
+        profile_headers,
+        env_bearer,
+        request_timeout(),
+    )
 }
 
 fn demo_router() -> tower_mcp::McpRouter {
@@ -6035,6 +5847,7 @@ fn render_value(value: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
