@@ -105,37 +105,26 @@ pub fn load_with(
 /// that is the config the user means. Paths that do not exist are dropped by
 /// [`scan`], so this can list every location worth trying.
 pub fn candidate_paths(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let directories = crate::directories::Directories::current()
+        .with_home(home.map(std::path::Path::to_path_buf));
+    candidate_paths_with(cwd, &directories)
+}
+
+pub(crate) fn candidate_paths_with(
+    cwd: &Path,
+    directories: &crate::directories::Directories,
+) -> Vec<PathBuf> {
     let mut paths = vec![
         cwd.join(".mcp.json"),
         cwd.join(".vscode").join("mcp.json"),
         cwd.join(".cursor").join("mcp.json"),
     ];
-    let Some(home) = home else {
-        return paths;
-    };
-    paths.push(home.join(".claude.json"));
-    paths.push(home.join(".cursor").join("mcp.json"));
-    // Claude Desktop, per platform.
-    #[cfg(target_os = "macos")]
-    paths.push(
-        home.join("Library")
-            .join("Application Support")
-            .join("Claude")
-            .join("claude_desktop_config.json"),
-    );
-    #[cfg(target_os = "linux")]
-    paths.push(
-        home.join(".config")
-            .join("Claude")
-            .join("claude_desktop_config.json"),
-    );
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        paths.push(
-            PathBuf::from(appdata)
-                .join("Claude")
-                .join("claude_desktop_config.json"),
-        );
+    if let Some(home) = directories.home() {
+        paths.push(home.join(".claude.json"));
+        paths.push(home.join(".cursor").join("mcp.json"));
+    }
+    if let Some(path) = directories.claude_desktop_config() {
+        paths.push(path);
     }
     paths
 }
@@ -535,6 +524,8 @@ fn expand_recording(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directories::{Directories, Platform};
+    use std::ffi::OsString;
 
     fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
@@ -626,7 +617,10 @@ mod tests {
     fn candidates_cover_the_project_files_and_the_home_ones() {
         let cwd = std::path::Path::new("/work/api");
         let home = std::path::Path::new("/home/dev");
-        let paths = candidate_paths(cwd, Some(home));
+        let directories = Directories::from_lookup(Platform::Unix, |name| {
+            (name == "HOME").then(|| home.as_os_str().to_owned())
+        });
+        let paths = candidate_paths_with(cwd, &directories);
         for expected in [
             cwd.join(".mcp.json"),
             cwd.join(".vscode").join("mcp.json"),
@@ -638,7 +632,26 @@ mod tests {
         // Project files come first: a scan run in a repo means that repo.
         assert!(paths[0].starts_with(cwd));
         // Without a home directory it still offers the project files.
-        assert_eq!(candidate_paths(cwd, None).len(), 3);
+        let no_home = Directories::from_lookup(Platform::Unix, |_| None);
+        assert_eq!(candidate_paths_with(cwd, &no_home).len(), 3);
+    }
+
+    #[test]
+    fn windows_directories_find_appdata_candidates_without_a_home() {
+        let cwd = std::path::Path::new("workspace");
+        let directories = Directories::from_lookup(Platform::Windows, |name| {
+            (name == "APPDATA").then(|| OsString::from(r"C:\Users\Ada\AppData\Roaming"))
+        });
+        let paths = candidate_paths_with(cwd, &directories);
+        assert!(
+            paths.contains(
+                &PathBuf::from(r"C:\Users\Ada\AppData\Roaming")
+                    .join("Claude")
+                    .join("claude_desktop_config.json")
+            ),
+            "{paths:?}"
+        );
+        assert_eq!(paths.len(), 4, "only project and APPDATA paths are known");
     }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {

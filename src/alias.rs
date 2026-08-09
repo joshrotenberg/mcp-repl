@@ -224,15 +224,15 @@ impl Aliases {
     }
 
     /// Apply `edit` to the config file, read-modify-write. A REPL with no
-    /// config path (no `$HOME`, no `--config`) keeps its aliases in memory
-    /// for the session and says so.
+    /// platform config path and no `--config` keeps its aliases in memory for
+    /// the session and says so.
     fn persist(
         &self,
         edit: impl FnOnce(&mut DocumentMut) -> Result<(), String>,
     ) -> Result<(), String> {
         let Some(path) = &self.path else {
             return Err(
-                "no config file location (set $HOME or pass --config), so the alias applies to \
+                "no platform config directory (pass --config), so the alias applies to \
                  this session only"
                     .to_string(),
             );

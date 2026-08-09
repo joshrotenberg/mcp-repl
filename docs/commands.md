@@ -107,11 +107,12 @@ cratesio> tools
 `--json` output is a data stream and is never trimmed.
 
 `history` lists recent commands from previous sessions, and Ctrl-R searches
-them. History lives at `$XDG_STATE_HOME/mcp-repl/history` (falling back to
-`~/.local/state/mcp-repl/history`), owner-readable only, holding the last
-1000 lines. Set `[repl] history_capacity` in the config file to change that,
-or `--no-history` to keep it in memory. A pre-0.3 `~/.mcp-repl_history` is
-moved to the new location once, automatically.
+them. On Unix, history lives at `$XDG_STATE_HOME/mcp-repl/history` (falling
+back to `~/.local/state/mcp-repl/history`); on Windows it lives at
+`%LOCALAPPDATA%\mcp-repl\history`. It holds the last 1000 lines. Set
+`history_capacity` in the `[repl]` config table to change that, or
+`--no-history` to keep it in memory. A pre-0.3 `~/.mcp-repl_history` is moved
+to the new location once, automatically.
 
 `read <uri> --out <path>` writes the content to a file instead of printing
 it, decoding a binary resource back to bytes:
@@ -396,8 +397,8 @@ t = "tools"
 dl = "get_downloads"
 ```
 
-With no config file location at all (no `$HOME`, no `--config`), aliases
-still work for the session and the REPL says they were not saved.
+With no platform config directory and no `--config`, aliases still work for
+the session and the REPL says they were not saved.
 
 ## Capture and filtering
 

@@ -171,8 +171,9 @@ commands fail immediately with the same login guidance.
 
 A config file names servers so a connection is `mcp-repl <name>` instead of a
 URL plus repeated auth flags, and tokens stay out of shell history. The file
-lives at `$XDG_CONFIG_HOME/mcp-repl/config.toml`, falling back to
-`~/.config/mcp-repl/config.toml`; `--config <path>` reads a different one.
+lives at `$XDG_CONFIG_HOME/mcp-repl/config.toml` on Unix, falling back to
+`~/.config/mcp-repl/config.toml`. On Windows it lives at
+`%APPDATA%\mcp-repl\config.toml`. `--config <path>` reads a different one.
 
 ```toml
 [servers.cratesio]

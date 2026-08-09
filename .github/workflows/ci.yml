@@ -50,6 +50,17 @@ jobs:
       - name: Verify publishable package
         run: cargo package
 
+  windows-directories:
+    name: Windows directories
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test native config, state, and discovery paths
+        run: cargo test --lib windows_directories
+
   deny:
     name: Dependencies
     # Runs on the schedule too, unlike the other default jobs: an advisory is
