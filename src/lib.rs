@@ -3891,6 +3891,12 @@ async fn handle_line(
     // every command sees resolved arguments. Capture and pipe act on tool
     // results.
     let (output, routed) = vars::route(line);
+    if let Some(path) = &output.filter
+        && let Err(error) = vars::validate_path(path)
+    {
+        report_error(ExitStatus::Usage, &error);
+        return false;
+    }
     let command = match vars::substitute(routed) {
         Ok(c) => c,
         Err(e) => {
@@ -5945,9 +5951,13 @@ fn emit_value(value: serde_json::Value, output: &vars::Output, human: impl FnOnc
 fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
     if let Some(path) = &output.filter {
         match vars::get_path(&value, path) {
-            Some(selected) => value = selected,
-            None => {
+            Ok(Some(selected)) => value = selected,
+            Ok(None) => {
                 command_error(&format!("path `{path}` not found in result"));
+                return;
+            }
+            Err(error) => {
+                report_error(ExitStatus::Usage, &error);
                 return;
             }
         }
