@@ -118,19 +118,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reads_and_closes_the_owned_descriptor() {
-        use std::io::Write;
+    fn reads_and_closes_the_owned_stream() {
+        use std::io::{Read, Write};
         use std::net::Shutdown;
         use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
+        use std::time::Duration;
 
         let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         writer.write_all(b"ephemeral\n").unwrap();
         writer.shutdown(Shutdown::Write).unwrap();
         let fd = reader.into_raw_fd();
 
         assert_eq!(read(fd).unwrap(), "ephemeral");
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+
+        // Observe the owned endpoint's close through the peer. Probing the
+        // numeric descriptor after `read` returns is racy: any parallel test
+        // can reuse that number before the probe runs. EOF is tied to this
+        // socket pair, so it proves the endpoint was closed without relying
+        // on process-global descriptor allocation.
+        let mut byte = [0_u8; 1];
+        assert_eq!(writer.read(&mut byte).unwrap(), 0);
     }
 
     #[cfg(unix)]
