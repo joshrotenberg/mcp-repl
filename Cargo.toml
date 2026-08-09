@@ -63,6 +63,12 @@ clap_complete = "4"
 clap_mangen = "0.2"
 crossterm = { version = "0.29", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+# `--bearer-fd` has to validate that an inherited descriptor is open before
+# claiming ownership with `File::from_raw_fd`. The standard library exposes
+# ownership, but not the validating `fcntl(F_GETFD)` probe.
+libc = "0.2"
+
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's
 # server-side features and the fixture's own HTTP dependencies.
