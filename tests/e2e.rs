@@ -775,6 +775,23 @@ async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
 }
 
 async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
+    let malformed = run_stdio(
+        fixture,
+        temp,
+        "malformed direct tool arguments",
+        &["--json", "--exec", "add forgot-the-equals"],
+    )
+    .await;
+    assert_status(&malformed, 2, "malformed direct tool arguments");
+    let values = json_lines(&malformed, "malformed direct tool arguments");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "usage");
+    assert!(
+        values[0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("key=value"))
+    );
+
     let stable = run_stdio(
         fixture,
         temp,

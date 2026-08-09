@@ -862,21 +862,41 @@ fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::V
     }
 }
 
-fn parse_kv_args(schema: &serde_json::Value, tokens: &[&str]) -> serde_json::Value {
+fn parse_kv_args(schema: &serde_json::Value, tokens: &[&str]) -> Result<serde_json::Value, String> {
     // A single JSON object literal wins.
-    if tokens.len() == 1
-        && tokens[0].starts_with('{')
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(tokens[0])
-    {
-        return v;
+    if tokens.len() == 1 && tokens[0].starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(tokens[0])
+            .map_err(|error| format!("invalid JSON object argument: {error}"))?;
+        if !value.is_object() {
+            return Err("the JSON argument must be an object".to_string());
+        }
+        return Ok(value);
     }
     let mut map = serde_json::Map::new();
-    for t in tokens {
-        if let Some((k, v)) = t.split_once('=') {
-            map.insert(k.to_string(), coerce_arg(schema, k, v));
-        }
+    for token in tokens {
+        let (key, value) = split_kv_arg(token)?;
+        map.insert(key.to_string(), coerce_arg(schema, key, value));
     }
-    serde_json::Value::Object(map)
+    Ok(serde_json::Value::Object(map))
+}
+
+fn parse_prompt_args(tokens: &[&str]) -> Result<HashMap<String, String>, String> {
+    let mut arguments = HashMap::new();
+    for token in tokens {
+        let (key, value) = split_kv_arg(token)?;
+        arguments.insert(key.to_string(), value.to_string());
+    }
+    Ok(arguments)
+}
+
+fn split_kv_arg(token: &str) -> Result<(&str, &str), String> {
+    let Some((key, value)) = token.split_once('=') else {
+        return Err(format!("argument {token:?} must use `key=value` syntax"));
+    };
+    if key.is_empty() {
+        return Err(format!("argument {token:?} has an empty name"));
+    }
+    Ok((key, value))
 }
 
 fn render_content(content: &[Content]) {
@@ -4438,12 +4458,16 @@ async fn handle_line(
             if !enforce_prompt_contract(schema_contracts, surface, name) {
                 return false;
             }
-            let mut prompt_args = HashMap::new();
-            for t in &rest[1..] {
-                if let Some((k, v)) = t.split_once('=') {
-                    prompt_args.insert(k.to_string(), v.to_string());
+            let prompt_args = match parse_prompt_args(&rest[1..]) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    report_error(
+                        ExitStatus::Usage,
+                        &format!("invalid arguments for prompt {name:?}: {error}"),
+                    );
+                    return false;
                 }
-            }
+            };
             let started = std::time::Instant::now();
             match with_reconnect(session, surface, |c| {
                 let prompt_args = prompt_args.clone();
@@ -4985,7 +5009,16 @@ async fn dispatch_direct_tool(
         report_error_with_hint(ExitStatus::Usage, &message, suggestion.as_deref());
         return;
     };
-    let arguments = parse_kv_args(&schema, rest);
+    let arguments = match parse_kv_args(&schema, rest) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            report_error(
+                ExitStatus::Usage,
+                &format!("invalid arguments for tool {tool_name:?}: {error}"),
+            );
+            return;
+        }
+    };
     run_tool(
         session,
         surface,
@@ -5044,7 +5077,16 @@ async fn handle_bench(
         return;
     }
     let arg_tokens: Vec<&str> = plan.args.iter().map(String::as_str).collect();
-    let arguments = parse_kv_args(&schema, &arg_tokens);
+    let arguments = match parse_kv_args(&schema, &arg_tokens) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            report_error(
+                ExitStatus::Usage,
+                &format!("invalid arguments for tool {:?}: {error}", plan.tool),
+            );
+            return;
+        }
+    };
 
     let outcome = bench::run(client, &plan.tool, arguments, plan.n, plan.concurrency).await;
     // A run with failures in it exits non-zero, like any other failing
@@ -6768,7 +6810,7 @@ mod tests {
         let arguments = |line: &str| -> serde_json::Value {
             let parsed = command::parse(line).expect("parses");
             let tokens: Vec<&str> = parsed.words[1..].iter().map(String::as_str).collect();
-            parse_kv_args(&schema, &tokens)
+            parse_kv_args(&schema, &tokens).unwrap()
         };
 
         assert_eq!(
@@ -7065,11 +7107,46 @@ world",
 
         assert!(parsed.background);
         assert_eq!(
-            parse_kv_args(&schema, &tokens),
+            parse_kv_args(&schema, &tokens).unwrap(),
             serde_json::json!({
                 "instruction": "Reply with exactly hello",
                 "mode": "interactive"
             })
+        );
+    }
+
+    #[test]
+    fn malformed_schema_coerced_arguments_are_errors() {
+        let schema = serde_json::json!({"type": "object"});
+        let positional = parse_kv_args(&schema, &["forgot-the-equals"]).unwrap_err();
+        assert!(positional.contains("key=value"), "{positional}");
+
+        let empty = parse_kv_args(&schema, &["=value"]).unwrap_err();
+        assert!(empty.contains("empty name"), "{empty}");
+
+        let malformed_json = parse_kv_args(&schema, &[r#"{"a":}"#]).unwrap_err();
+        assert!(
+            malformed_json.contains("invalid JSON object"),
+            "{malformed_json}"
+        );
+
+        assert_eq!(
+            parse_kv_args(&schema, &[r#"{"a":1}"#]).unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            parse_kv_args(&schema, &["empty="]).unwrap(),
+            serde_json::json!({"empty": ""})
+        );
+    }
+
+    #[test]
+    fn malformed_prompt_arguments_are_errors() {
+        assert!(parse_prompt_args(&["missing"]).is_err());
+        assert!(parse_prompt_args(&["=value"]).is_err());
+        assert_eq!(
+            parse_prompt_args(&["name=Ada"]).unwrap(),
+            HashMap::from([("name".to_string(), "Ada".to_string())])
         );
     }
 

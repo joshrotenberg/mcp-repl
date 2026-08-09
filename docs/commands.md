@@ -44,6 +44,11 @@ mcp-repl-demo> echo message="hello world"
 mcp-repl-demo> call echo {"message": "hello world"}
 ```
 
+Schema-coerced tool calls, `bench`, and `prompt` require every argument to use
+`key=value` syntax (or one valid JSON object for a direct tool call). A bare
+token, an empty key such as `=value`, or malformed object JSON is a local usage
+error; it is never dropped from a request silently.
+
 A line that is merely unfinished keeps the editor reading instead of failing:
 pasting a pretty-printed JSON body works, and the `::: ` continuation prompt
 shows while the quotes or braces are still open. A delimiter that can never
