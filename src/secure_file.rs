@@ -134,18 +134,16 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
-    #[cfg(unix)]
     fn written_files_are_owner_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.toml");
@@ -155,7 +153,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn rewriting_keeps_permissions_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -172,7 +169,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_existing_permissive_file_is_tightened() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -186,7 +182,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_new_history_file_is_created_owner_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state").join("history");
