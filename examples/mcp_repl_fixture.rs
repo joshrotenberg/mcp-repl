@@ -40,6 +40,38 @@ fn fixture_router() -> McpRouter {
                 })
                 .build(),
         )
+        // Deliberately collide with a REPL built-in. The black-box suite uses
+        // this to prove that neither namespace can silently win.
+        .tool(
+            ToolBuilder::new("wait")
+                .description("Wait in the fixture server")
+                .task_support(TaskSupportMode::Optional)
+                .handler(|input: AddInput| async move {
+                    Ok(CallToolResult::text(format!(
+                        "server wait: {}",
+                        input.a + input.b
+                    )))
+                })
+                .build(),
+        )
+        // The namespace words themselves remain usable as server tool names
+        // through `tool tool` and `tool builtin`.
+        .tool(
+            ToolBuilder::new("tool")
+                .description("A server tool named tool")
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    Ok(CallToolResult::text("server tool: tool"))
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("builtin")
+                .description("A server tool named builtin")
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    Ok(CallToolResult::text("server tool: builtin"))
+                })
+                .build(),
+        )
         .tool(
             ToolBuilder::new("slow_add")
                 .description("Add two integers in a final-protocol task")

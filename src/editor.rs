@@ -20,6 +20,7 @@ use reedline::{
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
     Suggestion, ValidationResult, Validator, default_emacs_keybindings,
 };
+use tower_mcp::protocol::ToolDefinition;
 
 use crate::session::Session;
 
@@ -363,6 +364,79 @@ impl ReplCompleter {
         out
     }
 
+    fn tool_description(tool: &ToolDefinition) -> Option<String> {
+        let tags = crate::tool_tags(tool);
+        match (tool.description.as_deref(), tags.is_empty()) {
+            (_, false) => Some(format!(
+                "{}{}[{}]",
+                tool.description.as_deref().unwrap_or(""),
+                if tool.description.is_some() { "  " } else { "" },
+                tags.join(" ")
+            )),
+            (description, true) => description.map(str::to_string),
+        }
+    }
+
+    fn complete_tool_name_word(surface: &Surface, word: &str, span: Span) -> Vec<Suggestion> {
+        surface
+            .tools
+            .iter()
+            .filter(|tool| tool.name.starts_with(word))
+            .map(|tool| word_suggestion(&tool.name, Self::tool_description(tool), span))
+            .collect()
+    }
+
+    fn complete_builtin_name_word(word: &str, span: Span) -> Vec<Suggestion> {
+        BUILTINS
+            .iter()
+            .filter(|(name, _)| name.starts_with(word))
+            .map(|(name, description)| {
+                word_suggestion(*name, Some((*description).to_string()), span)
+            })
+            .collect()
+    }
+
+    fn complete_command_word(
+        surface: &Surface,
+        aliases: &Aliases,
+        word: &str,
+        span: Span,
+    ) -> Vec<Suggestion> {
+        let mut out = Vec::new();
+        for (name, description) in BUILTINS {
+            if !name.starts_with(word) {
+                continue;
+            }
+            let description = if crate::is_ambiguous_command(surface, name) {
+                format!("ambiguous; use `tool {name}` or `builtin {name}`")
+            } else {
+                (*description).to_string()
+            };
+            out.push(word_suggestion(*name, Some(description), span));
+        }
+        for entry in aliases.entries() {
+            if entry.name.starts_with(word) {
+                out.push(word_suggestion(
+                    entry.name,
+                    Some(format!("alias for `{}`", entry.expansion)),
+                    span,
+                ));
+            }
+        }
+        // A colliding bare spelling is represented once above as ambiguous,
+        // rather than twice as though either duplicate would be runnable.
+        for tool in &surface.tools {
+            if tool.name.starts_with(word) && !crate::is_builtin(&tool.name) {
+                out.push(word_suggestion(
+                    &tool.name,
+                    Self::tool_description(tool),
+                    span,
+                ));
+            }
+        }
+        out
+    }
+
     /// Completions for `describe <name>`: every named thing on the surface.
     fn complete_describe_word(surface: &Surface, word: &str, span: Span) -> Vec<Suggestion> {
         let mut out = Vec::new();
@@ -390,6 +464,25 @@ impl ReplCompleter {
                 ));
             }
         }
+        for (name, description) in BUILTINS {
+            let already_named = surface.tools.iter().any(|tool| tool.name == *name)
+                || surface.prompts.iter().any(|prompt| prompt.name == *name)
+                || surface
+                    .resources
+                    .iter()
+                    .any(|resource| resource.name == *name || resource.uri == *name)
+                || surface
+                    .templates
+                    .iter()
+                    .any(|template| template.name == *name || template.uri_template == *name);
+            if name.starts_with(word) && !already_named {
+                out.push(word_suggestion(
+                    *name,
+                    Some(format!("built-in: {description}")),
+                    span,
+                ));
+            }
+        }
         out
     }
 }
@@ -410,20 +503,12 @@ impl Completer for ReplCompleter {
 
         if completing_first {
             // First word: built-ins, every alias, and every tool name.
-            for (name, desc) in BUILTINS {
-                if name.starts_with(word) {
-                    out.push(word_suggestion(*name, Some(desc.to_string()), span));
-                }
-            }
-            for entry in self.aliases.read().unwrap().entries() {
-                if entry.name.starts_with(word) {
-                    out.push(word_suggestion(
-                        entry.name,
-                        Some(format!("alias for `{}`", entry.expansion)),
-                        span,
-                    ));
-                }
-            }
+            out.extend(Self::complete_command_word(
+                &surface,
+                &self.aliases.read().unwrap(),
+                word,
+                span,
+            ));
             // The listings take one flag; offer it once the user types a dash.
             if word.starts_with('-') && "--full".starts_with(word) {
                 out.push(word_suggestion(
@@ -432,27 +517,28 @@ impl Completer for ReplCompleter {
                     span,
                 ));
             }
-            for t in &surface.tools {
-                if t.name.starts_with(word) {
-                    // The menu is where an unfamiliar tool is picked, so the
-                    // safety tags belong here as much as in a listing.
-                    let tags = crate::tool_tags(t);
-                    let description = match (t.description.as_deref(), tags.is_empty()) {
-                        (_, false) => Some(format!(
-                            "{}{}[{}]",
-                            t.description.as_deref().unwrap_or(""),
-                            if t.description.is_some() { "  " } else { "" },
-                            tags.join(" ")
-                        )),
-                        (description, true) => description.map(str::to_string),
-                    };
-                    out.push(word_suggestion(&t.name, description, span));
-                }
-            }
             return out;
         }
 
         match first {
+            "tool" => {
+                let words = head.split_whitespace().count();
+                let naming_tool = words == 1 || (words == 2 && !head.ends_with(' '));
+                if naming_tool {
+                    out.extend(Self::complete_tool_name_word(&surface, word, span));
+                } else if let Some(tool_name) = head.split_whitespace().nth(1) {
+                    out.extend(Self::complete_tool_arg_word(
+                        &surface, tool_name, word, span,
+                    ));
+                }
+            }
+            "builtin" => {
+                let words = head.split_whitespace().count();
+                let naming_builtin = words == 1 || (words == 2 && !head.ends_with(' '));
+                if naming_builtin {
+                    out.extend(Self::complete_builtin_name_word(word, span));
+                }
+            }
             // `find` has its own flags; offer them once a dash is typed.
             "find" if word.starts_with('-') => {
                 for (flag, description) in [
@@ -642,9 +728,14 @@ impl ReplHighlighter {
     }
 
     fn command_style(&self, word: &str) -> Style {
-        if BUILTINS.iter().any(|(name, _)| *name == word) {
+        let surface = self.surface.read().unwrap();
+        if crate::is_ambiguous_command(&surface, word) {
+            return Style::new().fg(Color::Yellow).bold();
+        }
+        if crate::is_builtin(word) {
             return Style::new().fg(Color::Cyan).bold();
         }
+        drop(surface);
         // An alias resolves to a command, so it reads as one: same style as a
         // built-in, since that is what it behaves like at the prompt.
         let aliases = self.aliases.read().unwrap();
@@ -663,6 +754,24 @@ impl ReplHighlighter {
             Style::new()
         } else {
             Style::new().fg(Color::Red)
+        }
+    }
+
+    fn qualified_name_style(&self, qualifier: &str, word: &str) -> Style {
+        match qualifier {
+            "tool" => {
+                let surface = self.surface.read().unwrap();
+                if crate::is_tool(&surface, word) {
+                    Style::new().fg(Color::Green).bold()
+                } else if surface.tools.iter().any(|tool| tool.name.starts_with(word)) {
+                    Style::new()
+                } else {
+                    Style::new().fg(Color::Red)
+                }
+            }
+            "builtin" if crate::is_builtin(word) => Style::new().fg(Color::Cyan).bold(),
+            "builtin" if BUILTINS.iter().any(|(name, _)| name.starts_with(word)) => Style::new(),
+            _ => Style::new().fg(Color::Red),
         }
     }
 }
@@ -688,6 +797,8 @@ impl Highlighter for ReplHighlighter {
         }
 
         let mut seen_command = false;
+        let mut qualifier = None;
+        let mut seen_qualified_name = false;
         let mut rest = line;
         while !rest.is_empty() {
             let token_start = match rest.find(|c: char| !c.is_whitespace()) {
@@ -709,6 +820,17 @@ impl Highlighter for ReplHighlighter {
             if !seen_command {
                 styled.push((self.command_style(token), token.to_string()));
                 seen_command = true;
+                if matches!(token, "tool" | "builtin") {
+                    qualifier = Some(token);
+                }
+            } else if let Some(namespace) = qualifier
+                && !seen_qualified_name
+            {
+                styled.push((
+                    self.qualified_name_style(namespace, token),
+                    token.to_string(),
+                ));
+                seen_qualified_name = true;
             } else if token == "&" {
                 styled.push((Style::new().fg(Color::Purple).bold(), token.to_string()));
             } else if let Some((key, value)) = token.split_once('=') {
@@ -985,6 +1107,23 @@ fn run_interactive(
 mod tests {
     use super::*;
 
+    fn surface_with_colliding_wait() -> Surface {
+        Surface {
+            tools: vec![
+                serde_json::from_value(serde_json::json!({
+                    "name": "wait",
+                    "description": "Wait on the server",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer"}},
+                    },
+                }))
+                .expect("tool definition"),
+            ],
+            ..Default::default()
+        }
+    }
+
     /// A schema shaped the way a generator emits one: named types hoisted
     /// into `$defs`, referenced from each property.
     fn schema_with_defs() -> serde_json::Value {
@@ -1113,5 +1252,55 @@ fourth
         });
         let reference = serde_json::json!({"$ref": "#/$defs/a~1b~0c"});
         assert_eq!(resolve_ref(&root, &reference)["type"], "integer");
+    }
+
+    #[test]
+    fn a_colliding_command_completion_is_truthful_and_not_duplicated() {
+        let surface = surface_with_colliding_wait();
+        let aliases = Aliases::default();
+        let suggestions =
+            ReplCompleter::complete_command_word(&surface, &aliases, "wai", Span::new(0, 3));
+        assert_eq!(
+            suggestions
+                .iter()
+                .filter(|suggestion| suggestion.value == "wait")
+                .count(),
+            1
+        );
+        let wait = suggestions
+            .iter()
+            .find(|suggestion| suggestion.value == "wait")
+            .expect("wait completion");
+        let description = wait.description.as_deref().unwrap_or_default();
+        assert!(description.contains("tool wait"), "{description}");
+        assert!(description.contains("builtin wait"), "{description}");
+    }
+
+    #[test]
+    fn both_explicit_namespaces_complete_their_own_names() {
+        let surface = surface_with_colliding_wait();
+        let tools = ReplCompleter::complete_tool_name_word(&surface, "wai", Span::new(5, 8));
+        assert!(tools.iter().any(|suggestion| suggestion.value == "wait"));
+
+        let builtins = ReplCompleter::complete_builtin_name_word("wai", Span::new(8, 11));
+        assert!(builtins.iter().any(|suggestion| suggestion.value == "wait"));
+    }
+
+    #[test]
+    fn highlighting_marks_ambiguity_and_the_qualified_target() {
+        let surface = Arc::new(RwLock::new(surface_with_colliding_wait()));
+        let highlighter = ReplHighlighter::new(surface, Arc::new(RwLock::new(Aliases::default())));
+        assert_eq!(
+            highlighter.command_style("wait"),
+            Style::new().fg(Color::Yellow).bold()
+        );
+        assert_eq!(
+            highlighter.qualified_name_style("tool", "wait"),
+            Style::new().fg(Color::Green).bold()
+        );
+        assert_eq!(
+            highlighter.qualified_name_style("builtin", "wait"),
+            Style::new().fg(Color::Cyan).bold()
+        );
     }
 }
