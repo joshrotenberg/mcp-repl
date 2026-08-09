@@ -111,8 +111,8 @@ model for a completion.
 
 **A shell, not just a viewer.** Capture a result into a variable, reference it
 in a later command, filter it with a path, alias a command you type often, and
-time a tool with `bench`. `wire on` prints the raw JSON-RPC frames, and `last`
-reprints the previous exchange whether or not tracing was on.
+time a tool with `bench`. `wire on` traces redacted JSON-RPC frames to stderr,
+and `last` reprints the previous exchange whether or not tracing was on.
 
 **Scriptable.** `-e/--exec` runs commands and exits; `--json` makes stdout
 [NDJSON](https://github.com/ndjson/ndjson-spec), one value per command, with
@@ -132,19 +132,23 @@ typed exit statuses so a failure is distinguishable from an empty result.
 
 ## Other MCP clients
 
-mcp-repl is an interactive shell for driving one server. The neighbours are
-shaped differently, and which one fits depends on what you are doing:
+mcp-repl is an interactive shell for driving one server at a time, with
+`connect` switching the live target without leaving the prompt. The neighbours
+are shaped differently, and which one fits depends on what you are doing:
 
 | | | |
 | --- | --- | --- |
-| [mcpc](https://github.com/apify/mcpc) | TypeScript | One-shot commands against persistent named sessions, aimed at agents driving MCP through a shell. Sessions outlive the process; no interactive prompt. |
-| [MCP Inspector](https://github.com/modelcontextprotocol/inspector) | TypeScript | The official inspector: a web UI, plus a `--cli` mode for scripted calls. |
-| [mcp-probe](https://github.com/conikeec/mcp-probe) | Rust | A ratatui debugging dashboard: protocol analysis, timing, compliance checks. |
-| [mcptools](https://github.com/f/mcptools) | Go | One-shot tool, resource, and prompt calls from the shell. |
+| [mcpc](https://github.com/apify/mcpc) | TypeScript | A shell-oriented client built around named sessions that persist across invocations, with broad protocol and OAuth support for automation and agents. |
+| [MCP Inspector](https://github.com/modelcontextprotocol/inspector) | TypeScript | The official developer tool, with web, scriptable CLI, and interactive TUI surfaces backed by one client core. |
+| [mcp-probe](https://github.com/conikeec/mcp-probe) | Rust | A ratatui debugging dashboard for interactive execution, protocol analysis, validation, and timing. |
+| [mcptools](https://github.com/f/mcptools) | Go | A broader toolkit with one-shot commands, an interactive shell and web UI, plus mock, proxy, and guard modes. |
 
-What mcp-repl has that the others largely do not: a real line editor with
-schema-driven completion, plus elicitation, sampling, server-driven
-completion, and SEP-2663 tasks on the 2026-07-28 protocol.
+mcp-repl's particular shape is the line editor: the connected server's live
+tool surface becomes top-level commands with schema-driven completion and
+coercion. The same prompt handles prompts, resources, capture and filtering,
+aliases, elicitation, sampling, server-driven completion, and SEP-2663 tasks;
+the clients above overlap with different parts of that protocol surface but
+organize the workflow differently.
 
 ## Protocol versions
 
