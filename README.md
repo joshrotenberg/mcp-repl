@@ -12,7 +12,7 @@ resources get built-ins, tab completion is powered by the server itself where
 the protocol allows, and the command table refreshes live when the server's
 surface changes.
 
-![mcp-repl completing arguments from a tool's schema, converting a value through an enum argument, reporting progress from a slow tool, and running a tool as a background task](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/hero.gif)
+![mcp-repl starting disconnected, connecting to the demo server, completing schema-driven arguments, reporting progress, and running a tool as a background task](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/hero.gif)
 
 ## Install
 
@@ -118,7 +118,7 @@ and `last` reprints the previous exchange whether or not tracing was on.
 [NDJSON](https://github.com/ndjson/ndjson-spec), one value per command, with
 typed exit statuses so a failure is distinguishable from an empty result.
 
-![three one-shot invocations piped through jq, and a schema violation exiting with status 3](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/scripting.png)
+![two JSON invocations piped through jq, followed by a schema violation exiting with status 3](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/scripting.png)
 
 ## Documentation
 
@@ -171,7 +171,7 @@ The recordings above are generated with
 [docs/tapes](docs/tapes):
 
 ```bash
-cargo build --release && vhs docs/tapes/hero.tape
+./scripts/recordings.sh
 ```
 
 ## License

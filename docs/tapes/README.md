@@ -4,16 +4,22 @@ The images in the top-level README are generated from the tapes here with
 [vhs](https://github.com/charmbracelet/vhs), so they can be regenerated
 rather than re-staged by hand when the output changes.
 
+Run every recording from the repository root with one command:
+
 ```bash
-cargo build --release
-vhs docs/tapes/hero.tape
+./scripts/recordings.sh
 ```
 
-Each tape drives the release binary against `--demo`, which needs no
-external server. They pass `--no-history`: without it reedline offers
-fish-style hints from whatever the author last typed, which makes the
-recording depend on the machine it was made on and can pre-fill lines the
-tape means to type out.
+The script checks for `cargo`, `vhs`, and `jq`, builds the release binary,
+then runs every tape in the order below. The interactive tapes call that
+binary as `./target/release/mcp-repl`. `scripting.tape` keeps the shorter
+commands visible in its screenshot, but prepends and verifies the same binary
+inside VHS's login shell before recording anything.
+
+Each tape uses the bundled demo, which needs no external server. Interactive
+tapes pass `--no-history`: without it reedline offers fish-style hints from
+whatever the author last typed, which makes the recording depend on the
+machine it was made on and can pre-fill lines the tape means to type out.
 
 | Tape | Produces |
 | --- | --- |
@@ -21,12 +27,6 @@ tape means to type out.
 | `describe.tape` | `docs/media/describe.png` |
 | `elicitation.tape` | `docs/media/elicitation.png` |
 | `scripting.tape` | `docs/media/scripting.png` |
-
-`scripting.tape` expects `mcp-repl` and `jq` on `PATH`:
-
-```bash
-PATH="$PWD/target/release:$PATH" vhs docs/tapes/scripting.tape
-```
 
 Three details worth knowing before editing a tape, all of which fail
 silently rather than loudly.
@@ -42,9 +42,7 @@ looks like it worked, which is exactly how `scripting.png` went stale.
 `Type` cannot parse escaped quotes, so a line containing double quotes has to
 be wrapped in single ones.
 
-A tape that shells out to `mcp-repl` by name runs whatever `PATH` resolves,
-and vhs starts a login shell that re-reads your profile. An older
-`cargo install`ed copy in `~/.cargo/bin` will win, and the recording will
-show a version of the tool that is not the one you built. Check with
-`bash -lc 'command -v mcp-repl'` if a recording shows something you do not
-recognise.
+Elapsed times and generated task ids are deliberately live output. They make
+the assets differ byte-for-byte across correct regenerations, so review the
+visible commands and results rather than treating a binary diff as a
+freshness test.

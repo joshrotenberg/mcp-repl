@@ -1,8 +1,8 @@
 # `describe` on a tool: annotations, the schema with its field
 # descriptions, and a ready-to-run example line.
 #
-# Regenerate with:
-#   cargo build --release && vhs docs/tapes/describe.tape
+# Regenerate all README media with:
+#   ./scripts/recordings.sh
 # VHS writes a frame *directory* when Output ends in .png, which would
 # collide with the Screenshot below. Send the recording to a throwaway
 # GIF and keep only the still.

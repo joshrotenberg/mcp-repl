@@ -1,7 +1,7 @@
 # The front-page recording: the server's surface is the command set.
 #
-# Regenerate with:
-#   cargo build --release && vhs docs/tapes/hero.tape
+# Regenerate all README media with:
+#   ./scripts/recordings.sh
 #
 # --no-history keeps the recording deterministic: without it reedline offers
 # fish-style hints from whatever the author happened to type before, which
@@ -17,10 +17,17 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 55ms
 
 Hide
-Type "clear && ./target/release/mcp-repl --demo --no-history"
+Type "clear && ./target/release/mcp-repl --no-history"
+Enter
+Sleep 1.5s
+Show
+
+# The first-run path begins at a useful disconnected prompt. `connect` can
+# select or switch a server without throwing away the line-editor session.
+Type "connect demo"
+Sleep 500ms
 Enter
 Sleep 2.5s
-Show
 
 # The command word completes from the server's tools, with descriptions and
 # the safety annotations it declared.
