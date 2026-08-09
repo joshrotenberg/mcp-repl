@@ -73,25 +73,14 @@ cratesio> bench get_downloads crate=serde --n 50 --concurrency 8
 [892ms]
 ```
 
-- `bench <tool> [k=v...] [--n N] [--concurrency C]`. Arguments are coerced
-  against the tool's `inputSchema` exactly as a direct call is, so
-  `bench <tool> a=1` benchmarks the request `<tool> a=1` would send. Flags may
-  appear anywhere after the tool name, in either spelling (`--n 50`,
-  `--n=50`).
-- `--n` defaults to 20 and is capped at 100000; `--concurrency` defaults to 1
-  (serial) and never exceeds `--n`. Workers pull from a shared counter, so one
-  slow call does not leave a worker's remaining share queued behind it.
-- Percentiles are nearest-rank over the calls that succeeded, so every number
-  reported is a latency that actually happened. Failures are counted
-  separately, with the first message shown, rather than folded into the
-  distribution: a fast rejection is not a fast call.
-- A tool result with `isError` counts as a failure, and any failure makes the
-  command exit non-zero, so `mcp-repl -e "bench <tool> --n 20" <server>` works
-  as a scripted health check.
-- Under `--json`, an object with `calls`, `ok`, `errors`, `concurrency`,
-  `firstError`, and `minMs` / `p50Ms` / `p95Ms` / `maxMs` / `totalMs`. The
-  latency fields are `null` when nothing succeeded, so a failed run cannot be
-  read as an instant one.
+`help bench` is the flag reference. The reporting choices are intentional:
+percentiles are nearest-rank over successful calls, so every latency shown
+actually happened; failures are counted separately because a fast rejection
+is not a fast call. Any failure, including an `isError` tool result, sets a
+non-zero status, making the same command usable as a scripted health check.
+JSON carries the counts, first error, concurrency, and latency fields; latency
+is `null` when nothing succeeded rather than pretending the failed run was
+instant.
 
 ## Logs
 

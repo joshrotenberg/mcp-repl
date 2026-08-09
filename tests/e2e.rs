@@ -1347,6 +1347,11 @@ async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir
         stdout.matches("connect <url|profile").count() >= 2,
         "global aliases and help survive switches:\n{stdout}"
     );
+    assert!(
+        stdout.contains("A candidate is initialized")
+            && stdout.contains("connect -- ./my-server --stdio"),
+        "rich help carries explanation and examples:\n{stdout}"
+    );
     assert!(stdout.contains("no variables"), "{stdout}");
     assert!(
         stderr.contains("missing-mcp-server"),
@@ -2335,10 +2340,32 @@ async fn exercise_generators() {
     let output = run(command, "man page", CASE_TIMEOUT).await;
     assert_success(&output, "man page");
     let roff = String::from_utf8_lossy(&output.stdout);
-    for section in [".SH NAME", ".SH SYNOPSIS", ".SH DESCRIPTION", ".SH OPTIONS"] {
+    for section in [
+        ".SH NAME",
+        ".SH SYNOPSIS",
+        ".SH DESCRIPTION",
+        ".SH OPTIONS",
+        ".SH \"REPL BUILT-INS\"",
+    ] {
         assert!(roff.contains(section), "man page has no {section}");
     }
     assert!(roff.contains("mcp-repl"));
+    assert!(roff.contains("connect demo"));
+    assert!(roff.contains("bench get_downloads"));
+
+    let mut command = repl_command();
+    command.args(["--demo", "--json", "--exec", "help wait"]);
+    let output = run(command, "JSON built-in help", CASE_TIMEOUT).await;
+    assert_success(&output, "JSON built-in help");
+    let values = json_lines(&output, "JSON built-in help");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["name"], "wait");
+    assert!(
+        values[0]["details"]
+            .as_array()
+            .is_some_and(|details| !details.is_empty())
+    );
+    assert_eq!(values[0]["examples"][1], "wait --timeout 30");
 }
 
 #[tokio::test(flavor = "multi_thread")]

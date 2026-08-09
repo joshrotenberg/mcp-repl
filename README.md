@@ -36,7 +36,8 @@ cargo install mcp-repl
 ```
 
 Completions and a man page come from the binary itself, and ship in the
-release archives:
+release archives. The man page includes both startup options and the same
+REPL built-in reference shown by `help <command>`:
 
 ```bash
 mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
@@ -78,8 +79,9 @@ mcp-repl .mcp.json:local                        # one entry from a client config
 mcp-repl --server prod                          # a saved profile
 ```
 
-Inside, `help` lists the built-ins, `help <command>` explains one, and
-`find <word>` searches the server's surface *and* the REPL's own commands.
+Inside, `help` lists the built-ins, `help <command>` gives usage, detail, and
+runnable examples, and `find <word>` searches the server's surface *and* the
+REPL's own commands.
 If a tool and built-in share a name, the bare spelling is rejected as
 ambiguous; `tool <name>` selects the server tool and `builtin <name>` selects
 the REPL command.
