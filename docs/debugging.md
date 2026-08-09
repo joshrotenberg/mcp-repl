@@ -41,14 +41,16 @@ trace is still there. Under `--json` it prints a
 Frames print to stderr, so `--json` output on stdout stays pipeable with
 tracing on.
 
-Secrets are masked before a frame is stored, so nothing unmasked reaches the
-trace or `last`. Masking is by key name, normalized so `X-Api-Key`,
+Recognized secrets are masked before a frame is stored, so only the scrubbed
+form reaches the trace or `last`. Masking is by key name, normalized so `X-Api-Key`,
 `x_api_key`, and `apiKey` all match: the enumerated names (authorization,
 cookie, password, client secret, and the rest), plus anything ending in
 `token`, `secret`, `password`, `passphrase`, or `credential`, plus `*key`
 next to a qualifier like `api`, `access`, or `private`. A credential inside
 a string is masked by its scheme, covering `Bearer`, `Basic`, `Digest`, and
-`token`.
+`token`. If a frame is malformed JSON, recognizable secret key/value pairs
+and HTTP header lines are scrubbed conservatively as raw text; the remaining
+malformed content stays visible for diagnosis.
 
 Names that only look like credentials stay readable, because a trace with
 its correlation ids blanked is hard to follow: `taskToken`,
