@@ -238,9 +238,10 @@ pub fn render(dir: Direction, frame: &Frame) -> String {
 }
 
 /// A frame that is not valid JSON still deserves to be seen: it is exactly
-/// the case where the trace is the answer.
+/// the case where the trace is the answer. Scrub its raw shape first: the
+/// structured redactor cannot see keys inside a string fallback.
 fn parse(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(scrub_malformed(raw)))
 }
 
 /// The JSON-RPC id as a lookup key. Numbers and strings both appear in the
@@ -411,14 +412,187 @@ fn redact(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
-        Value::String(s) => Value::String(mask_bearer(s)),
+        Value::String(s) => Value::String(mask_auth_schemes(s)),
         other => other.clone(),
     }
 }
 
+/// Scrub credential-shaped fragments without assuming the frame is valid
+/// JSON. Each pass is deliberately conservative and linear: recognizable
+/// JSON key/value pairs first, then plain HTTP header lines, then auth schemes
+/// embedded anywhere in the remaining diagnostic text.
+fn scrub_malformed(raw: &str) -> String {
+    let keyed = scrub_json_like_secrets(raw);
+    let headers = scrub_header_lines(&keyed);
+    mask_auth_schemes(&headers)
+}
+
+/// Mask values following quoted, credential-shaped JSON keys even when the
+/// surrounding object or array is truncated. The scanner understands string
+/// escapes and balanced containers only far enough to find the value's end;
+/// an unterminated secret value consumes the rest of the malformed frame.
+fn scrub_json_like_secrets(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut output = String::with_capacity(raw.len());
+    let mut copied = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'"' {
+            cursor += 1;
+            continue;
+        }
+        let Some(key_end) = quoted_end(bytes, cursor) else {
+            break;
+        };
+        let mut colon = key_end + 1;
+        while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
+            colon += 1;
+        }
+        if bytes.get(colon) != Some(&b':') {
+            cursor = key_end + 1;
+            continue;
+        }
+
+        let key = serde_json::from_str::<String>(&raw[cursor..=key_end]).ok();
+        if !key.as_deref().is_some_and(is_secret_key) {
+            cursor = key_end + 1;
+            continue;
+        }
+
+        let mut value_start = colon + 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let value_end = malformed_value_end(bytes, value_start);
+        if value_end > value_start {
+            output.push_str(&raw[copied..value_start]);
+            output.push('"');
+            output.push_str(REDACTED);
+            output.push('"');
+            copied = value_end;
+            cursor = value_end;
+        } else {
+            cursor = value_start.max(key_end + 1);
+        }
+    }
+
+    if copied == 0 {
+        raw.to_string()
+    } else {
+        output.push_str(&raw[copied..]);
+        output
+    }
+}
+
+fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, byte) in bytes[start + 1..].iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if *byte == b'"' {
+            return Some(start + 1 + offset);
+        }
+    }
+    None
+}
+
+fn malformed_value_end(bytes: &[u8], start: usize) -> usize {
+    let Some(first) = bytes.get(start) else {
+        return start;
+    };
+    match first {
+        b'"' => quoted_end(bytes, start).map_or(bytes.len(), |end| end + 1),
+        b'{' | b'[' => balanced_end(bytes, start).unwrap_or(bytes.len()),
+        _ => {
+            let mut end = start;
+            while end < bytes.len() && !matches!(bytes[end], b',' | b'}' | b']' | b'\r' | b'\n') {
+                end += 1;
+            }
+            while end > start && bytes[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+            end
+        }
+    }
+}
+
+fn balanced_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut stack = vec![bytes[start]];
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' => cursor = quoted_end(bytes, cursor)? + 1,
+            b'{' | b'[' => {
+                stack.push(bytes[cursor]);
+                cursor += 1;
+            }
+            b'}' if stack.last() == Some(&b'{') => {
+                stack.pop();
+                cursor += 1;
+                if stack.is_empty() {
+                    return Some(cursor);
+                }
+            }
+            b']' if stack.last() == Some(&b'[') => {
+                stack.pop();
+                cursor += 1;
+                if stack.is_empty() {
+                    return Some(cursor);
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+/// Mask a plain `Header-Name: value` line when the name itself is secret.
+/// Line boundaries keep one malformed header from hiding the diagnostics and
+/// additional secrets that follow it.
+fn scrub_header_lines(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    for segment in raw.split_inclusive('\n') {
+        let line_end = segment.trim_end_matches(['\r', '\n']);
+        let leading = line_end.len() - line_end.trim_start_matches([' ', '\t']).len();
+        let line = &line_end[leading..];
+        let Some(colon) = line.find(':') else {
+            output.push_str(segment);
+            continue;
+        };
+        let name = line[..colon].trim_end();
+        let header_shaped = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        if !header_shaped || !is_secret_key(name) {
+            output.push_str(segment);
+            continue;
+        }
+
+        let value_offset = leading + colon + 1;
+        let whitespace = segment[value_offset..]
+            .bytes()
+            .take_while(u8::is_ascii_whitespace)
+            .take_while(|byte| !matches!(byte, b'\r' | b'\n'))
+            .count();
+        let value_start = value_offset + whitespace;
+        output.push_str(&segment[..value_start]);
+        output.push_str(REDACTED);
+        if segment.ends_with("\r\n") {
+            output.push_str("\r\n");
+        } else if segment.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
+}
+
 /// A header line echoed inside a string value (`"Authorization: Bearer abc"`
 /// in an error message, say) carries a live token where the key-name rule
-/// cannot see it. Everything after the scheme goes.
+/// cannot see it.
 /// HTTP authentication schemes whose credential follows the scheme name.
 /// `Basic` carries `user:password`, and `token` is what several APIs use
 /// where others say `Bearer`.
@@ -427,20 +601,59 @@ const AUTH_SCHEMES: &[&str] = &["bearer ", "basic ", "digest ", "token "];
 /// Mask a credential embedded in a string value.
 ///
 /// A key-based rule cannot catch `"Authorization: Bearer abc"` arriving as
-/// one string, so the scheme name is found inside the value and everything
-/// after it is dropped. The earliest scheme wins, so a value carrying two
-/// cannot leak the second.
-fn mask_bearer(s: &str) -> String {
+/// one string. Bearer, Basic, and token credentials end at header/token
+/// delimiters; Digest parameters consume the rest of their line. Scanning
+/// continues afterward so multiple credentials are masked without hiding
+/// unrelated diagnostic context.
+fn mask_auth_schemes(s: &str) -> String {
     // ASCII-only lowercasing leaves byte offsets aligned with the original.
     let lowered = s.to_ascii_lowercase();
-    let earliest = AUTH_SCHEMES
-        .iter()
-        .filter_map(|scheme| lowered.find(scheme).map(|at| at + scheme.len()))
-        .min();
-    match earliest {
-        Some(end) => format!("{}{REDACTED}", &s[..end]),
-        None => s.to_string(),
+    let mut output = String::with_capacity(s.len());
+    let mut copied = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor < s.len() {
+        let Some((scheme_start, scheme)) = next_auth_scheme(lowered.as_bytes(), cursor) else {
+            break;
+        };
+        let credential_start = scheme_start + scheme.len();
+        let credential_end = if scheme == "digest " {
+            s[credential_start..]
+                .find(['\r', '\n'])
+                .map_or(s.len(), |offset| credential_start + offset)
+        } else {
+            s[credential_start..]
+                .find(|character: char| {
+                    character.is_ascii_whitespace()
+                        || matches!(character, '"' | '\'' | ',' | ';' | '}' | ']' | ')' | '&')
+                })
+                .map_or(s.len(), |offset| credential_start + offset)
+        };
+        if credential_end == credential_start {
+            cursor = credential_start;
+            continue;
+        }
+        output.push_str(&s[copied..credential_start]);
+        output.push_str(REDACTED);
+        copied = credential_end;
+        cursor = credential_end;
     }
+
+    if copied == 0 {
+        s.to_string()
+    } else {
+        output.push_str(&s[copied..]);
+        output
+    }
+}
+
+fn next_auth_scheme(lowered: &[u8], start: usize) -> Option<(usize, &'static str)> {
+    (start..lowered.len()).find_map(|at| {
+        AUTH_SCHEMES
+            .iter()
+            .find(|scheme| lowered[at..].starts_with(scheme.as_bytes()))
+            .map(|scheme| (at, *scheme))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +755,19 @@ mod tests {
         assert!(
             serde_json::to_string(&response.json).unwrap().len() < 1024,
             "the summary is small"
+        );
+
+        let malformed = format!(
+            "{{\"password\":\"do-not-retain{}",
+            "x".repeat(MAX_FRAME_BYTES)
+        );
+        let frame = wire.record(Direction::Received, &malformed);
+        let rendered = render(Direction::Received, &frame);
+        assert!(frame.json.get("mcp-repl/truncated").is_some());
+        assert!(!rendered.contains("do-not-retain"), "{rendered}");
+        assert!(
+            rendered.len() < 1024,
+            "malformed oversize frame was retained"
         );
     }
 
@@ -657,6 +883,58 @@ mod tests {
     }
 
     #[test]
+    fn malformed_objects_and_arrays_scrub_secret_keys_but_keep_context() {
+        for raw in [
+            r#"{"params":{"password":"hunter2","taskToken":"visible"}"#,
+            r#"[{"api_token":"ghp_one"},{"clientSecret":"stripe_two"},{"note":"keep me"}"#,
+        ] {
+            let scrubbed = parse(raw);
+            let scrubbed = scrubbed.as_str().expect("malformed frames stay strings");
+            for secret in ["hunter2", "ghp_one", "stripe_two"] {
+                assert!(!scrubbed.contains(secret), "{secret} leaked: {scrubbed}");
+            }
+            assert!(scrubbed.contains(REDACTED), "{scrubbed}");
+            if raw.contains("taskToken") {
+                assert!(scrubbed.contains("\"taskToken\":\"visible\""), "{scrubbed}");
+            }
+        }
+
+        let object =
+            scrub_malformed("{\"password\":\"line one\nline two\",\"note\":\"still visible\"");
+        assert!(!object.contains("line one"), "{object}");
+        assert!(!object.contains("line two"), "{object}");
+        assert!(object.contains("still visible"), "{object}");
+    }
+
+    #[test]
+    fn malformed_header_lines_scrub_multiple_secrets_and_preserve_other_lines() {
+        let raw = "Authorization: Bearer first\nX-Api-Key: second\r\nCookie: third\nContent-Type: application/json\n<broken>";
+        let scrubbed = scrub_malformed(raw);
+        for secret in ["first", "second", "third"] {
+            assert!(!scrubbed.contains(secret), "{secret} leaked: {scrubbed}");
+        }
+        for context in [
+            "Authorization:",
+            "X-Api-Key:",
+            "Cookie:",
+            "Content-Type: application/json",
+            "<broken>",
+        ] {
+            assert!(
+                scrubbed.contains(context),
+                "missing {context:?}: {scrubbed}"
+            );
+        }
+        assert_eq!(scrubbed.matches(REDACTED).count(), 3, "{scrubbed}");
+    }
+
+    #[test]
+    fn ordinary_malformed_text_is_unchanged() {
+        let raw = "<html>502 Bad Gateway</html>\nupstream reset {";
+        assert_eq!(scrub_malformed(raw), raw);
+    }
+
+    #[test]
     fn secrets_are_masked_by_key_name() {
         let frame = redact(&serde_json::json!({
             "params": {
@@ -753,25 +1031,24 @@ mod tests {
             ("token ghp_xxx", "token "),
             ("Authorization: Bearer abc", "Authorization: Bearer "),
         ] {
-            let masked = mask_bearer(value);
+            let masked = mask_auth_schemes(value);
             assert_eq!(masked, format!("{kept}{REDACTED}"), "{value:?}");
         }
     }
 
     #[test]
-    fn the_earliest_scheme_wins_so_nothing_trails_it() {
-        // Two credentials in one string: masking only the first would leave
-        // the second in the clear.
-        let masked = mask_bearer("Bearer aaa and Basic bbb");
+    fn multiple_auth_schemes_are_masked_without_hiding_context() {
+        let masked = mask_auth_schemes("Bearer aaa and Basic bbb");
         assert!(!masked.contains("aaa"), "{masked}");
         assert!(!masked.contains("bbb"), "{masked}");
+        assert_eq!(masked, "Bearer <redacted> and Basic <redacted>");
     }
 
     #[test]
     fn a_value_without_a_scheme_is_untouched() {
-        assert_eq!(mask_bearer("just a sentence"), "just a sentence");
+        assert_eq!(mask_auth_schemes("just a sentence"), "just a sentence");
         // The word alone, with no credential after it, is not a match.
-        assert_eq!(mask_bearer("bearer"), "bearer");
+        assert_eq!(mask_auth_schemes("bearer"), "bearer");
     }
 
     // -- the transport wrapper ------------------------------------------------
