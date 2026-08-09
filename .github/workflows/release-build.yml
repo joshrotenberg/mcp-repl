@@ -1,0 +1,85 @@
+name: Native release build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref or commit to build
+        required: true
+        type: string
+      version:
+        description: Version label used in archive names
+        required: true
+        type: string
+      upload:
+        description: Preserve packages as workflow artifacts
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # The caller must see every failed target, but the reusable workflow
+      # itself fails if even one native build or package fails.
+      fail-fast: false
+      matrix:
+        include:
+          # Every target builds on its own architecture. rustls pulls
+          # aws-lc-sys, so a native runner also avoids maintaining five C
+          # cross-toolchains and lets each job execute the binary it ships.
+          - target: x86_64-unknown-linux-gnu
+            # This runner establishes the oldest glibc used by the release.
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build native binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Rehearse release package
+        id: package
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          archive=$(scripts/package-release.sh "$RELEASE_TARGET" "$RELEASE_VERSION")
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve release package
+        if: inputs.upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 7

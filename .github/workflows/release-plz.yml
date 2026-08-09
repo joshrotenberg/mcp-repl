@@ -1,28 +1,101 @@
 name: Release-plz
 
-permissions:
-  pull-requests: write
-  contents: write
-
 on:
   push:
     branches:
       - main
   workflow_dispatch:
 
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  release-plz:
-    name: Release-plz
+  release-pr:
+    name: Update release PR
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz
+      - name: Update release PR
         uses: release-plz/action@v0.5
+        with:
+          command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Dispatch required CI on release-plz branches
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr list \
+            --state open \
+            --json headRefName,isCrossRepository \
+            --jq '.[] | select(.isCrossRepository == false and (.headRefName | startswith("release-plz-"))) | .headRefName' |
+            while IFS= read -r branch; do
+              echo "Dispatching required CI for $branch"
+              gh workflow run ci.yml --ref "$branch"
+            done
+
+  release:
+    name: Publish crate and stage GitHub release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Dispatch binary publication for a release merge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_pr_count=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+            --jq '[.[] | select(.head.ref | startswith("release-plz-"))] | length')
+
+          if [[ "$release_pr_count" == 0 ]]; then
+            echo "This commit did not merge a release-plz PR; nothing to publish"
+            exit 0
+          fi
+
+          git fetch --force --tags
+          dispatched=false
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            if [[ $(gh release view "$tag" --json isDraft --jq .isDraft) == true ]]; then
+              echo "Dispatching native publication for $tag"
+              gh workflow run release-binaries.yml --ref main -f "tag=$tag"
+              dispatched=true
+            fi
+          done < <(git tag --points-at "$GITHUB_SHA")
+
+          if [[ "$dispatched" != true ]]; then
+            echo "Release merge produced no draft release at $GITHUB_SHA" >&2
+            exit 1
+          fi

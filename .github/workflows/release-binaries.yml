@@ -1,119 +1,88 @@
 name: Release binaries
 
-# release-plz already tags, publishes to crates.io, and creates the GitHub
-# release. This attaches prebuilt binaries to the release it made, so
-# installing does not require a Rust toolchain.
-#
-# Triggered by the release rather than the tag: the release has to exist
-# before anything can be uploaded to it, and release-plz creates the two in
-# that order. `workflow_dispatch` takes a tag so a build can be rehearsed
-# against an existing release without cutting a new one.
+# release-plz creates a draft GitHub release before dispatching this workflow.
+# Every native target must build and package successfully before this workflow
+# uploads any public asset. The release is published only after all ten files
+# are present and their checksums verify, so a failed target cannot expose a
+# partial binary release.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and upload to"
+        description: Existing draft release tag to build and publish
         required: true
+        type: string
 
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
+concurrency:
+  group: release-binaries-${{ inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      # One target failing should not deprive the release of the others; a
-      # missing archive is visible on the release page.
-      fail-fast: false
-      matrix:
-        include:
-          # Every target builds on its own architecture. `rustls` pulls
-          # `aws-lc-sys`, a C library, so cross-compiling means a cross
-          # toolchain and cmake for each host/target pair. Native runners
-          # exist for all five, and they also let each job run the binary it
-          # just built to generate its completions and man page.
-          - target: x86_64-unknown-linux-gnu
-            # Older than `ubuntu-latest` on purpose: the binary links glibc,
-            # and one built against a newer glibc will not start on an older
-            # distribution. This sets the floor for who can run it.
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
-          - target: x86_64-apple-darwin
-            # `macos-13` was retired in December 2025. Keep this on GitHub's
-            # standard Intel runner so the archive is built and exercised on
-            # the same architecture it ships for.
-            os: macos-15-intel
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+    name: Build and package every target
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/release-build.yml
+    with:
+      ref: ${{ inputs.tag }}
+      version: ${{ inputs.tag }}
+      upload: true
 
+  publish:
+    name: Publish complete binary release
+    needs: build
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Download every native package
+        uses: actions/download-artifact@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          pattern: release-*
+          path: dist
+          merge-multiple: true
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package
+      - name: Verify and publish the complete asset set
         shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ inputs.tag || github.event.release.tag_name }}"
-          stage="mcp-repl-${version}-${{ matrix.target }}"
-          mkdir -p "$stage"
-
-          bin="target/${{ matrix.target }}/release/mcp-repl"
-          [ "${{ runner.os }}" = "Windows" ] && bin="${bin}.exe"
-          cp "$bin" "$stage/"
-          cp README.md LICENSE-APACHE LICENSE-MIT "$stage/"
-
-          # The binary generates these itself, so they cannot drift from the
-          # flags it actually has. Every job builds for its own architecture,
-          # which is what makes running it here possible.
-          mkdir -p "$stage/completions"
-          for shell in bash zsh fish; do
-            "$bin" --completions "$shell" > "$stage/completions/mcp-repl.$shell"
-          done
-          "$bin" --man > "$stage/mcp-repl.1"
-
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "${stage}.zip" "$stage" > /dev/null
-            archive="${stage}.zip"
-          else
-            tar czf "${stage}.tar.gz" "$stage"
-            archive="${stage}.tar.gz"
-          fi
-
-          # Checksums travel with the archive so the install script can
-          # verify what it downloaded without a second source of truth.
-          if command -v sha256sum > /dev/null; then
-            sha256sum "$archive" > "${archive}.sha256"
-          else
-            shasum -a 256 "$archive" > "${archive}.sha256"
-          fi
-          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
-
-      - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          gh release upload "${{ inputs.tag || github.event.release.tag_name }}" \
-            "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          set -euo pipefail
+
+          if [[ $(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft) != true ]]; then
+            echo "Release $RELEASE_TAG must exist and remain a draft" >&2
+            exit 1
+          fi
+
+          targets=(
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+            x86_64-pc-windows-msvc
+          )
+          assets=()
+          for target in "${targets[@]}"; do
+            extension=tar.gz
+            [[ "$target" == x86_64-pc-windows-msvc ]] && extension=zip
+            archive="dist/mcp-repl-${RELEASE_TAG}-${target}.${extension}"
+            [[ -f "$archive" && -f "$archive.sha256" ]]
+            assets+=("$archive" "$archive.sha256")
+          done
+
+          file_count=$(find dist -type f | wc -l | tr -d ' ')
+          if [[ "$file_count" != 10 ]]; then
+            echo "Expected exactly 10 release files, found $file_count" >&2
+            exit 1
+          fi
+
+          (
+            cd dist
+            sha256sum --check --strict ./*.sha256
+          )
+
+          # If an upload fails, the release stays private and a rerun safely
+          # replaces any assets that reached the draft before the failure.
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest

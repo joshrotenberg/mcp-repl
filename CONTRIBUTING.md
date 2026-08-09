@@ -30,6 +30,10 @@ Use conventional-commit prefixes (`feat:`, `fix:`, `docs:`, `test:`,
 `chore:`). release-plz generates the changelog and picks the next version from
 them.
 
+Maintainers should follow the gated, all-target release process in
+[docs/releases.md](docs/releases.md). A release PR is not safe to merge until
+its `Release gate` check succeeds.
+
 ## Relationship to tower-mcp
 
 mcp-repl is built on [tower-mcp](https://github.com/joshrotenberg/tower-mcp)

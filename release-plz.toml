@@ -11,8 +11,13 @@ pr_draft = false
 
 # Publish to crates.io
 publish = true
+# Only a merged release-plz PR may publish; ordinary main commits just update
+# the pending release PR.
+release_always = false
 
 # Git settings
 git_release_enable = true
-git_release_draft = false
+# Native artifacts are attached while the release is private. The binary
+# workflow publishes it only after every target has succeeded.
+git_release_draft = true
 git_tag_enable = true

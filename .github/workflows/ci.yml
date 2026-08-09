@@ -48,7 +48,44 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Verify publishable package
-        run: cargo package
+        run: cargo package --locked
+
+  msrv:
+    name: Rust 1.90 MSRV
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check every target and feature at the declared MSRV
+        run: cargo check --all-targets --all-features --locked
+
+  workflow-lint:
+    name: Workflow and installer lint
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install actionlint 1.7.12
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          archive="actionlint_${version}_linux_amd64.tar.gz"
+          checksums="actionlint_${version}_checksums.txt"
+          base="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          curl --fail --silent --show-error --location --remote-name "$base/$archive"
+          curl --fail --silent --show-error --location --remote-name "$base/$checksums"
+          grep "  $archive\$" "$checksums" | sha256sum --check --strict
+          tar xzf "$archive" actionlint
+      - name: Lint workflows
+        run: ./actionlint
+      - name: Lint release and installer scripts
+        run: |
+          shellcheck install.sh scripts/package-release.sh
+          sh -n install.sh
+          bash -n scripts/package-release.sh
 
   windows-directories:
     name: Windows directories
@@ -60,6 +97,72 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test native config, state, and discovery paths
         run: cargo test --lib windows_directories
+
+  release-native:
+    name: Native release rehearsal
+    if: >-
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.head_ref, 'release-plz-')) ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'release-plz-'))
+    uses: ./.github/workflows/release-build.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      version: ci-${{ github.run_id }}
+      upload: false
+
+  release-gate:
+    name: Release gate
+    if: >-
+      always() &&
+      (github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'release-plz-')))
+    needs:
+      - quality
+      - package
+      - msrv
+      - workflow-lint
+      - windows-directories
+      - deny
+      - release-native
+    runs-on: ubuntu-latest
+    env:
+      QUALITY: ${{ needs.quality.result }}
+      PACKAGE: ${{ needs.package.result }}
+      MSRV: ${{ needs.msrv.result }}
+      WORKFLOW_LINT: ${{ needs.workflow-lint.result }}
+      WINDOWS_DIRECTORIES: ${{ needs.windows-directories.result }}
+      DEPENDENCIES: ${{ needs.deny.result }}
+      NATIVE_RELEASE: ${{ needs.release-native.result }}
+      IS_RELEASE_BRANCH: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')) || (github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'release-plz-')) }}
+    steps:
+      - name: Require every release prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+          for result in \
+            "$QUALITY" \
+            "$PACKAGE" \
+            "$MSRV" \
+            "$WORKFLOW_LINT" \
+            "$WINDOWS_DIRECTORIES" \
+            "$DEPENDENCIES"
+          do
+            if [[ "$result" != success ]]; then
+              echo "A required check finished with status: $result" >&2
+              exit 1
+            fi
+          done
+
+          if [[ "$IS_RELEASE_BRANCH" == true && "$NATIVE_RELEASE" != success ]]; then
+            echo "Native release rehearsal finished with status: $NATIVE_RELEASE" >&2
+            exit 1
+          fi
+
+          if [[ "$IS_RELEASE_BRANCH" != true && "$NATIVE_RELEASE" != skipped ]]; then
+            echo "Unexpected native release rehearsal status: $NATIVE_RELEASE" >&2
+            exit 1
+          fi
 
   deny:
     name: Dependencies
@@ -81,7 +184,9 @@ jobs:
     # reproduces in this job means tower-mcp main moved, not that mcp-repl
     # regressed. The patch stops applying if main's version leaves the
     # declared semver range; that failure mode is the intended signal too.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && !startsWith(github.ref_name, 'release-plz-'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
