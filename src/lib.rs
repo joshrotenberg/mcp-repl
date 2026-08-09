@@ -295,10 +295,10 @@ struct Args {
     #[arg(long, value_enum, value_name = "STRATEGY")]
     elicitation: Option<elicit::ElicitationMode>,
 
-    /// Spawn a server named by an imported client config without asking
-    /// first. The imported file chooses the program, its arguments, and
-    /// which of your environment variables it receives, so approval is
-    /// interactive by default and remembered per entry.
+    /// Use a server named by an imported client config without asking first.
+    /// Imported stdio entries choose a process to run; imported HTTP entries
+    /// choose a remote origin and headers. Approval is interactive by default
+    /// and remembered per entry without storing credential values.
     #[arg(long)]
     trust_import: bool,
 
@@ -3249,17 +3249,19 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
     // Explicit flags override imported or native profile fields: --http
     // retargets the URL while keeping HTTP auth, and --bearer/--header are
     // layered on in build_http_config.
-    let (profile_name, import_label, import_selector, connection) = match (imported, profile) {
-        (Some(imported), _) => (
-            None,
-            Some(imported.label()),
-            Some(imported.selector),
-            Some(imported.connection),
-        ),
-        (None, Some((name, connection))) => (Some(name), None, None, Some(connection)),
-        (None, None) => (None, None, None, None),
-    };
-    // Spawning an imported entry needs the config location for the approval
+    let (profile_name, import_label, import_selector, import_http_trust, connection) =
+        match (imported, profile) {
+            (Some(imported), _) => (
+                None,
+                Some(imported.label()),
+                Some(imported.selector),
+                imported.http_trust,
+                Some(imported.connection),
+            ),
+            (None, Some((name, connection))) => (Some(name), None, None, None, Some(connection)),
+            (None, None) => (None, None, None, None, None),
+        };
+    // Using an imported entry needs the config location for the approval
     // store, and the alias table takes ownership of it below.
     let trust_store_config = config_file.clone();
 
@@ -3379,6 +3381,36 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 headers,
                 oauth: profile_oauth,
             }) => {
+                // An imported HTTP entry can choose both a remote destination
+                // and credentials to forward. Gate it before OAuth setup or
+                // transport construction can make any network request.
+                if let (Some(selector), Some(trust)) = (&import_selector, &import_http_trust) {
+                    let mut env_keys = trust.header_env_keys.clone();
+                    if args.http.is_none() {
+                        env_keys.extend(trust.url_env_keys.iter().cloned());
+                    }
+                    let plan = import_trust::ImportPlan::http(
+                        &selector.path,
+                        &selector.entry,
+                        &url,
+                        &trust.header_names,
+                        &env_keys,
+                    )
+                    .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+                    let interactive =
+                        !one_shot && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                    match import_trust::authorize(
+                        &plan,
+                        trust_store_config.as_deref(),
+                        args.trust_import,
+                        interactive,
+                    ) {
+                        import_trust::Decision::Approved => {}
+                        import_trust::Decision::Refused(reason) => {
+                            exit_with_error(ExitStatus::Usage, &reason);
+                        }
+                    }
+                }
                 validate_bearer_fd_exclusive(
                     bearer_from_fd.is_some(),
                     false,
@@ -3523,7 +3555,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 // resolved to and get approval before running it. A native
                 // profile is the user's own config file, so it is not gated.
                 if let Some(selector) = &import_selector {
-                    let plan = import_trust::SpawnPlan::new(
+                    let plan = import_trust::ImportPlan::stdio(
                         &selector.path,
                         &selector.entry,
                         &command,

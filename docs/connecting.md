@@ -335,7 +335,7 @@ mcp-repl --server "$HOME/Library/Application Support/Claude/claude_desktop_confi
   files do not define mcp-repl aliases, so aliases created while using one are
   global.
 
-#### Approving an imported command
+#### Approving an imported connection
 
 Selecting an imported `stdio` entry runs its command, and the same file
 chooses which of your environment variables that command receives. It is
@@ -350,7 +350,7 @@ is used the REPL shows what it resolved to and asks:
   warning: GITHUB_TOKEN looks like a credential, and its value goes to this program
 The imported file chooses the program and which of your environment variables
 it receives. Approve it only if you trust that file.
-  start it? [y/N]>
+  approve it? [y/N]>
 ```
 
 Approving records the entry in `approved-imports.toml` beside the config
@@ -373,6 +373,13 @@ still secrets at rest.
 
 `MCP_BEARER` is removed from every spawned stdio child's environment. It
 is an HTTP credential, and nothing reached over stdio has a use for it.
+
+Imported HTTP entries are gated too, before OAuth setup or the transport can
+make a request. The prompt shows the effective destination origin, imported
+header names, and referenced environment-variable names, but never a URL path,
+query, header value, or environment value. Approval records use the same
+non-secret identity, so changing the origin or forwarded credential set asks
+again. If `--http` retargets the entry, the prompt shows that effective origin.
 
 ### Reconnecting
 
