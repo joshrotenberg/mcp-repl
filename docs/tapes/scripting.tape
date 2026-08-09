@@ -24,17 +24,17 @@ Sleep 500ms
 Ctrl+L
 Show
 
-Type "mcp-repl --demo --json -e 'convert value=100 from=celsius to=kelvin' | jq -r '.content[0].text'"
+Type "mcp-repl --demo --json -e 'convert value=100 from=celsius to=kelvin' | jq -C -r '.content[0].text'"
 Sleep 500ms
 Enter
 Sleep 2s
 
-Type "mcp-repl --demo --json -e tools | jq -c '[.[].name]'"
+Type "mcp-repl --demo --json -e tools | jq -C -c '[.[].name]'"
 Sleep 500ms
 Enter
 Sleep 2s
 
-Type "mcp-repl --demo -e 'echo msg=hi'; echo exit=$?"
+Type "mcp-repl --demo --color always -e 'echo msg=hi'; echo exit=$?"
 Sleep 500ms
 Enter
 Sleep 2s

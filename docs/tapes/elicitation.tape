@@ -17,7 +17,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 60ms
 
 Hide
-Type "clear && ./target/release/mcp-repl --demo --no-history"
+Type "clear && ./target/release/mcp-repl --demo --no-history --color always"
 Enter
 Sleep 2.5s
 Ctrl+L

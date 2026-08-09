@@ -20,6 +20,10 @@ Each tape uses the bundled demo, which needs no external server. Interactive
 tapes pass `--no-history`: without it reedline offers fish-style hints from
 whatever the author last typed, which makes the recording depend on the
 machine it was made on and can pre-fill lines the tape means to type out.
+Human-readable invocations also pass `--color always`, so a contributor's
+`NO_COLOR` or terminal detection cannot remove semantic colors from committed
+media. JSON stays uncolored until a successful parse; `jq -C` owns color in
+those pipelines.
 
 | Tape | Produces |
 | --- | --- |
