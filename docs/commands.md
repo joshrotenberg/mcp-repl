@@ -420,8 +420,11 @@ demo> get_crate_info name=serde | crates[0].downloads
 - **Filter:** `<command> | <path>` prints just the selected value. A scalar
   prints bare; an object or array prints as JSON.
 - **Paths** are a small selector: `.field`, `[index]`, chained (`crates[0].name`).
-  An undefined variable or a missing path is an error, so a typo fails an `-e`
-  chain rather than passing silently. JMESPath is a possible future addition.
+  The whole selector must be valid: empty filters, unmatched brackets, invalid
+  indices, empty field segments, and trailing junk are local errors. An
+  undefined variable or a missing path is also an error, so a typo fails an
+  `-e` chain rather than passing silently. JMESPath is a possible future
+  addition.
 - **`vars`** lists what is bound; **`unset <name>`** clears one. Variables live
   for the session, so they persist across an `-e` chain:
 
