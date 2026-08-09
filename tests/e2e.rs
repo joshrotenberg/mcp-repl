@@ -842,6 +842,38 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
+/// Naming no server is a usage error, and a script must still get the usage
+/// line rather than a survey of the machine.
+///
+/// The interactive form, which lists what was discovered, needs a terminal
+/// and is exercised by hand: `is_terminal` is exactly what this test cannot
+/// give it.
+async fn exercise_no_target(temp: &TempDir) {
+    let mut command = repl_command();
+    command.current_dir(temp.path());
+    let output = run(command, "no target", CASE_TIMEOUT).await;
+    assert_status(&output, 2, "no target");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("usage: mcp-repl"),
+        "a pipe gets the usage line:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("configured on this machine"),
+        "and not the discovery listing, which is for a person:\n{stderr}"
+    );
+
+    // Under --json it is the standard envelope, on stdout, like every other
+    // usage failure.
+    let mut as_json = repl_command();
+    as_json.arg("--json").current_dir(temp.path());
+    let as_json = run(as_json, "no target json", CASE_TIMEOUT).await;
+    assert_status(&as_json, 2, "no target json");
+    let values = json_lines(&as_json, "no target json");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "usage");
+}
+
 /// `--login`/`--logout` under `--json` speak the same NDJSON contract.
 ///
 /// The success path of `--login` needs a real authorization server, so what
@@ -1649,6 +1681,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_sampling().await;
         exercise_repl_config(&temp).await;
         exercise_login_json(&temp).await;
+        exercise_no_target(&temp).await;
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_absent_cursor(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
