@@ -589,6 +589,8 @@ impl Surface {
 /// menu and `help`.
 pub(crate) const BUILTINS: &[(&str, &str)] = &[
     ("help", "list built-ins and the server's tools"),
+    ("tool", "call a server tool explicitly"),
+    ("builtin", "run a REPL built-in explicitly"),
     ("tools", "list tools"),
     ("prompts", "list prompts"),
     ("resources", "list resources"),
@@ -631,6 +633,16 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
         "help",
         "help [command]",
         "With no argument, list the built-ins and the server's tools. With one, explain that command.",
+    ),
+    (
+        "tool",
+        "tool <name> [k=v...]",
+        "Call a server tool explicitly. Use this when its name also belongs to a built-in.",
+    ),
+    (
+        "builtin",
+        "builtin <name> [args...]",
+        "Run a REPL built-in explicitly. Use this when a server tool has the same name.",
     ),
     (
         "tools",
@@ -798,6 +810,18 @@ fn builtin_help(name: &str) -> Option<(&'static str, &'static str)> {
         .iter()
         .find(|(builtin, _, _)| *builtin == name)
         .map(|(_, usage, detail)| (*usage, *detail))
+}
+
+pub(crate) fn is_builtin(name: &str) -> bool {
+    BUILTINS.iter().any(|(builtin, _)| *builtin == name)
+}
+
+pub(crate) fn is_tool(surface: &Surface, name: &str) -> bool {
+    surface.tools.iter().any(|tool| tool.name == name)
+}
+
+pub(crate) fn is_ambiguous_command(surface: &Surface, name: &str) -> bool {
+    is_builtin(name) && is_tool(surface, name)
 }
 
 /// Coerce a `key=value` string according to the tool's inputSchema.
@@ -3564,8 +3588,14 @@ fn backgroundable_tool(surface: &Arc<RwLock<Surface>>, line: &str) -> Option<Str
     if line.ends_with('&') {
         return None;
     }
-    let word = line.split_whitespace().next()?;
-    if BUILTINS.iter().any(|(name, _)| *name == word) {
+    let mut words = line.split_whitespace();
+    let first = words.next()?;
+    let (word, forced_tool) = match first {
+        "tool" => (words.next()?, true),
+        "builtin" => return None,
+        word => (word, false),
+    };
+    if !forced_tool && is_builtin(word) {
         return None;
     }
     let surface = surface.read().ok()?;
@@ -3611,6 +3641,13 @@ async fn run_cancellable(
             Ran::Cancelled
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandNamespace {
+    Automatic,
+    Tool,
+    Builtin,
 }
 
 async fn handle_line(
@@ -3671,15 +3708,65 @@ async fn handle_line(
         }
         return false;
     }
-    let cmd = tokens[0];
-    let rest = &tokens[1..];
+    let mut cmd = tokens[0];
+    let mut rest = &tokens[1..];
+    let namespace = match cmd {
+        "tool" => CommandNamespace::Tool,
+        "builtin" => CommandNamespace::Builtin,
+        _ => CommandNamespace::Automatic,
+    };
+    if namespace != CommandNamespace::Automatic {
+        let Some((name, arguments)) = rest.split_first() else {
+            command_error(match namespace {
+                CommandNamespace::Tool => "usage: tool <name> [k=v...]",
+                CommandNamespace::Builtin => "usage: builtin <name> [args...]",
+                CommandNamespace::Automatic => unreachable!(),
+            });
+            return false;
+        };
+        cmd = name;
+        rest = arguments;
+    }
     COMMAND_RAN.store(true, Ordering::Relaxed);
+
+    let (is_builtin_command, is_tool_command) = {
+        let surface = surface.read().unwrap();
+        (is_builtin(cmd), is_tool(&surface, cmd))
+    };
+    match namespace {
+        CommandNamespace::Automatic if is_builtin_command && is_tool_command => {
+            report_error(
+                ExitStatus::Usage,
+                &format!(
+                    "ambiguous command `{cmd}`: both a server tool and a built-in use that name; \
+                     use `tool {cmd} ...` for the server tool or `builtin {cmd} ...` for the \
+                     built-in"
+                ),
+            );
+            return false;
+        }
+        CommandNamespace::Tool if !is_tool_command => {
+            report_error(
+                ExitStatus::NoMatch,
+                &format!("no server tool named `{cmd}` (try `tools`)"),
+            );
+            return false;
+        }
+        CommandNamespace::Builtin if !is_builtin_command => {
+            report_error(
+                ExitStatus::NoMatch,
+                &format!("no built-in named `{cmd}` (try `help`)"),
+            );
+            return false;
+        }
+        _ => {}
+    }
 
     // Routing that cannot be honored is an error, not a silent no-op: in an
     // `-e` chain a dropped capture leaves a later `$name` undefined, and the
     // failure surfaces far from its cause.
-    let is_builtin = BUILTINS.iter().any(|(name, _)| *name == cmd);
-    if !output.is_plain() && is_builtin && !ROUTABLE_BUILTINS.contains(&cmd) {
+    let dispatches_builtin = namespace != CommandNamespace::Tool && is_builtin_command;
+    if !output.is_plain() && dispatches_builtin && !ROUTABLE_BUILTINS.contains(&cmd) {
         let what = match (&output.capture, &output.filter) {
             (Some(_), _) => "capture",
             _ => "filter",
@@ -3695,7 +3782,29 @@ async fn handle_line(
         return false;
     }
 
+    if namespace == CommandNamespace::Tool {
+        dispatch_direct_tool(
+            session,
+            surface,
+            jobs,
+            schema_contracts,
+            cmd,
+            rest,
+            background,
+            &output,
+        )
+        .await;
+        return false;
+    }
+
     match cmd {
+        "tool" | "builtin" => {
+            command_error(if cmd == "tool" {
+                "usage: tool <name> [k=v...]"
+            } else {
+                "usage: builtin <name> [args...]"
+            });
+        }
         "quit" | "exit" => {
             if json_output() {
                 print_json(&serde_json::json!({ "exit": true }));
@@ -3755,6 +3864,8 @@ async fn handle_line(
             println!("  call <tool> <json>                        call a tool with raw JSON");
             println!("  bench <tool> [k=v...] [--n N] [--concurrency C]  time repeated calls");
             println!("  <tool> [k=v...]                           call a tool (schema-coerced)");
+            println!("  tool <name> [k=v...]                      force a server tool");
+            println!("  builtin <name> [args...]                  force a REPL built-in");
             println!("  <tool> [k=v...] &                         run task-augmented (SEP-2663)");
             println!("  jobs | task <id> | wait <id> | cancel <id>  manage tasks");
             println!("  alias [<name>=<expansion>] | unalias <name>  command aliases");
@@ -4365,7 +4476,12 @@ async fn handle_line(
         "alias" | "unalias" => {
             // Everything after the command word is taken raw: an expansion is
             // a command line, so its spacing and any `=` belong to it.
-            let raw = line.strip_prefix(cmd).unwrap_or("").trim();
+            let command_line = if namespace == CommandNamespace::Builtin {
+                line.strip_prefix("builtin").unwrap_or(line).trim_start()
+            } else {
+                line
+            };
+            let raw = command_line.strip_prefix(cmd).unwrap_or("").trim();
             handle_alias(aliases, surface, cmd, raw);
         }
         "wire" => {
@@ -4636,35 +4752,13 @@ async fn handle_line(
             None => command_error("usage: unset <name>"),
         },
         tool_name => {
-            let schema = {
-                let s = surface.read().unwrap();
-                s.tools
-                    .iter()
-                    .find(|t| t.name == tool_name)
-                    .map(|t| t.input_schema.clone())
-            };
-            let Some(schema) = schema else {
-                // The command word itself did not resolve, so the line could
-                // not be dispatched at all: a usage error, the way a shell
-                // treats "command not found". A *name argument* that is
-                // absent from the surface is the other case, and reports
-                // NoMatch (see `describe` and `bench`).
-                let suggestion = find::did_you_mean(&surface.read().unwrap(), tool_name);
-                let message = match suggestion {
-                    Some(_) => format!("unknown command: {tool_name}"),
-                    None => format!("unknown command: {tool_name} (try `help`)"),
-                };
-                report_error_with_hint(ExitStatus::Usage, &message, suggestion.as_deref());
-                return false;
-            };
-            let arguments = parse_kv_args(&schema, rest);
-            run_tool(
+            dispatch_direct_tool(
                 session,
                 surface,
                 jobs,
                 schema_contracts,
                 tool_name,
-                arguments,
+                rest,
                 background,
                 &output,
             )
@@ -4672,6 +4766,50 @@ async fn handle_line(
         }
     }
     false
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_direct_tool(
+    session: &Arc<Session>,
+    surface: &Arc<RwLock<Surface>>,
+    jobs: &Arc<Jobs>,
+    schema_contracts: &schema_contract::ContractSet,
+    tool_name: &str,
+    rest: &[&str],
+    background: bool,
+    output: &vars::Output,
+) {
+    let schema = {
+        let surface = surface.read().unwrap();
+        surface
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .map(|tool| tool.input_schema.clone())
+    };
+    let Some(schema) = schema else {
+        // A bare command word did not resolve at all. Explicit `tool <name>`
+        // is checked before reaching here and reports the narrower NoMatch.
+        let suggestion = find::did_you_mean(&surface.read().unwrap(), tool_name);
+        let message = match suggestion {
+            Some(_) => format!("unknown command: {tool_name}"),
+            None => format!("unknown command: {tool_name} (try `help`)"),
+        };
+        report_error_with_hint(ExitStatus::Usage, &message, suggestion.as_deref());
+        return;
+    };
+    let arguments = parse_kv_args(&schema, rest);
+    run_tool(
+        session,
+        surface,
+        jobs,
+        schema_contracts,
+        tool_name,
+        arguments,
+        background,
+        output,
+    )
+    .await;
 }
 
 /// The `bench` built-in: issue one tool call repeatedly and report how long
@@ -5066,6 +5204,16 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
                     })
                 })
         })
+        .or_else(|| {
+            builtin_help(name).map(|(usage, description)| {
+                serde_json::json!({
+                    "kind": "builtin",
+                    "name": name,
+                    "usage": usage,
+                    "description": description,
+                })
+            })
+        })
 }
 
 /// Pull an optional `--timeout <secs>` out of a task command's arguments,
@@ -5271,9 +5419,20 @@ fn example_invocation(name: &str, schema: &serde_json::Value) -> String {
 /// The `describe` built-in: schemas for a tool, the argument table for a
 /// prompt, metadata for a resource or template.
 fn describe(surface: &Surface, name: &str) {
-    // A built-in is a command too, so asking about one should answer rather
-    // than report that the server does not offer it.
-    if let Some((usage, detail)) = builtin_help(name) {
+    // `describe` is surface-first while `help` is built-in-only. That gives a
+    // colliding server name a useful schema view without making the built-in
+    // hard to inspect (`help <name>` still reaches it).
+    let surface_has_name = surface.tools.iter().any(|tool| tool.name == name)
+        || surface.prompts.iter().any(|prompt| prompt.name == name)
+        || surface
+            .resources
+            .iter()
+            .any(|resource| resource.name == name || resource.uri == name)
+        || surface
+            .templates
+            .iter()
+            .any(|template| template.name == name || template.uri_template == name);
+    if !surface_has_name && let Some((usage, detail)) = builtin_help(name) {
         println!(
             "built-in {}",
             paint(Style::new().fg(Color::Cyan).bold(), name)
@@ -5622,7 +5781,11 @@ mod tests {
             serde_json::from_value(value).expect("tool definition")
         };
         Arc::new(RwLock::new(Surface {
-            tools: vec![tool("slow_add", true), tool("echo", false)],
+            tools: vec![
+                tool("slow_add", true),
+                tool("echo", false),
+                tool("wait", true),
+            ],
             ..Default::default()
         }))
     }
@@ -5643,9 +5806,32 @@ mod tests {
         assert_eq!(backgroundable_tool(&surface, "slow_add a=1 b=2 &"), None);
         // A built-in is not a tool, however long it took.
         assert_eq!(backgroundable_tool(&surface, "wait 1"), None);
+        // The explicit namespace makes the colliding server tool reachable.
+        assert_eq!(
+            backgroundable_tool(&surface, "tool wait id=1").as_deref(),
+            Some("wait")
+        );
+        assert_eq!(backgroundable_tool(&surface, "builtin wait 1"), None);
         // Nothing the server offers by that name.
         assert_eq!(backgroundable_tool(&surface, "nope"), None);
         assert_eq!(backgroundable_tool(&surface, ""), None);
+    }
+
+    #[test]
+    fn command_collisions_are_detected_from_the_live_surface() {
+        let surface = surface_with_a_task_capable_tool();
+        let surface = surface.read().unwrap();
+        assert!(is_ambiguous_command(&surface, "wait"));
+        assert!(!is_ambiguous_command(&surface, "slow_add"));
+        assert!(!is_ambiguous_command(&surface, "jobs"));
+    }
+
+    #[test]
+    fn describe_is_surface_first_and_can_still_render_builtins_as_json() {
+        let surface = surface_with_a_task_capable_tool();
+        let surface = surface.read().unwrap();
+        assert_eq!(describe_value(&surface, "wait").unwrap()["kind"], "tool");
+        assert_eq!(describe_value(&surface, "jobs").unwrap()["kind"], "builtin");
     }
 
     #[test]

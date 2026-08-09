@@ -52,6 +52,23 @@ help. An unmatched quote, trailing escape, or unclosed JSON argument in
 `--exec` is reported locally without calling the server. A quoted or escaped `&` is ordinary input;
 only a plain trailing `&` requests task-augmented execution.
 
+If a server tool has the same name as a REPL built-in, the bare name is
+deliberately ambiguous and runs neither one. Choose the namespace explicitly:
+
+```text
+ciacola> wait agent_id=01K... seq=1
+error: ambiguous command `wait`: both a server tool and a built-in use that name; use `tool wait ...` for the server tool or `builtin wait ...` for the built-in
+ciacola> tool wait agent_id=01K... seq=1
+...
+ciacola> builtin wait
+...
+```
+
+`tool <name> [k=v...]` keeps the normal schema coercion, capture/filtering,
+and trailing-`&` task support. `builtin <name> [args...]` runs only a REPL
+built-in. The qualifier words can themselves be server tool names; spell
+those `tool tool` or `tool builtin`.
+
 Tool listings and the completion menu carry the server's safety annotations,
 so what a tool does to the world is visible while choosing it rather than one
 `describe` later:
@@ -238,7 +255,9 @@ so `--json` stdout contains only command results.
 Tab opens a columnar menu. What gets completed:
 
 - The command word: built-ins, aliases (shown with what they expand to), and
-  every tool, each with its description.
+  every tool, each with its description. A colliding bare name is labeled
+  ambiguous; after `tool ` only server tools complete, and after `builtin `
+  only REPL built-ins complete.
 - Tool argument names from the tool's `inputSchema` properties (with type,
   required flag, and description), and enum values after `key=` when the
   property declares an `enum`.
@@ -314,7 +333,10 @@ enough, the message points at `help` as before.
 
 ## describe
 
-`describe <name>` looks up a tool, prompt, resource, or template by name:
+`describe <name>` looks up a tool, prompt, resource, or template by name,
+falling back to a built-in when the server surface has no such name. That
+makes `describe wait` show a colliding server tool while `help wait` remains
+the built-in-only view:
 
 - Tools: behavior hints, task support, the input/output schemas as
   syntax-colored JSON, and an `example:` line showing what to type.
@@ -345,6 +367,9 @@ removed dl (profile cratesio)
   runs `get_downloads crate=serde`. An expansion that itself starts with an
   alias expands again; a cycle is reported rather than looped.
 - An expansion can end in `&`, so an alias can run its tool task-augmented.
+- An alias can make a collision convenient by expanding to the explicit
+  spelling, for example `alias w=tool wait`. An alias that expands to bare
+  `wait` remains ambiguous rather than silently choosing a namespace.
 - Scope: an alias defined while connected through a profile belongs to that
   profile; otherwise it is global. `alias --global <name>=<expansion>` forces
   the file-level table. A profile alias shadows a global one of the same

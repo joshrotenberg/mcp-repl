@@ -138,6 +138,12 @@ impl Aliases {
                 Some(i) => (&trimmed[..i], trimmed[i..].trim_start()),
                 None => (trimmed, ""),
             };
+            // These are escape hatches for a command-name collision. Keep
+            // them reachable even when an older or hand-edited config file
+            // contains an alias that now uses one of the reserved names.
+            if matches!(first, "tool" | "builtin") {
+                break;
+            }
             let Some((expansion, _)) = self.lookup(first) else {
                 break;
             };
@@ -473,9 +479,21 @@ mod tests {
     #[test]
     fn a_name_that_would_hide_a_builtin_is_refused() {
         let mut a = aliases(&[], &[]);
-        let err = a.define("help", "tools", false).unwrap_err();
-        assert!(err.contains("built-in"), "{err}");
+        for reserved in ["help", "tool", "builtin"] {
+            let err = a.define(reserved, "tools", false).unwrap_err();
+            assert!(err.contains("built-in"), "{err}");
+        }
         assert!(a.entries().is_empty());
+    }
+
+    #[test]
+    fn an_alias_can_expand_to_an_explicit_namespace() {
+        let a = aliases(&[("w", "tool wait"), ("tool", "tools")], &[]);
+        assert_eq!(
+            a.expand("w id=42").unwrap().as_deref(),
+            Some("tool wait id=42")
+        );
+        assert_eq!(a.expand("tool wait id=42").unwrap(), None);
     }
 
     #[test]

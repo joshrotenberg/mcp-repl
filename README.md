@@ -63,6 +63,9 @@ mcp-repl --server prod                          # a saved profile
 
 Inside, `help` lists the built-ins, `help <command>` explains one, and
 `find <word>` searches the server's surface *and* the REPL's own commands.
+If a tool and built-in share a name, the bare spelling is rejected as
+ambiguous; `tool <name>` selects the server tool and `builtin <name>` selects
+the REPL command.
 
 See [docs/connecting.md](docs/connecting.md) for auth, OAuth, profiles, and
 config imports.
