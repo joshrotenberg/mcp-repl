@@ -209,6 +209,61 @@ fn finish_word(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::property::{COMMAND_REGRESSIONS, GENERATED_CASES, Generator};
+
+    fn quote_word(word: &str) -> String {
+        let mut quoted = String::from("\"");
+        for character in word.chars() {
+            if matches!(character, '\\' | '"') {
+                quoted.push('\\');
+            }
+            quoted.push(character);
+        }
+        quoted.push('"');
+        quoted
+    }
+
+    fn canonical(parsed: &ParsedCommand) -> String {
+        let mut line = parsed
+            .words
+            .iter()
+            .map(|word| quote_word(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if parsed.background {
+            line.push_str(" &");
+        }
+        line
+    }
+
+    fn assert_command_property(line: &str) {
+        match parse(line) {
+            Ok(parsed) => {
+                let reparsed = parse(&canonical(&parsed))
+                    .unwrap_or_else(|error| panic!("canonical form failed: {error}; {line:?}"));
+                assert_eq!(
+                    reparsed, parsed,
+                    "accepted input did not round-trip: {line:?}"
+                );
+            }
+            Err(error) => {
+                assert!(!error.is_empty(), "rejection must explain itself: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn property_command_parser_round_trips_or_rejects_whole_input() {
+        for line in COMMAND_REGRESSIONS {
+            assert_command_property(line);
+        }
+
+        let mut generator = Generator::new(0x01);
+        for _ in 0..GENERATED_CASES {
+            let line = generator.text(128);
+            assert_command_property(&line);
+        }
+    }
 
     #[test]
     fn unfinished_input_asks_for_more() {

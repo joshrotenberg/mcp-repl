@@ -290,7 +290,65 @@ fn render_scalar(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::property::{
+        GENERATED_CASES, Generator, INVALID_PATH_REGRESSIONS, ROUTING_REGRESSIONS,
+    };
     use serde_json::json;
+
+    #[test]
+    fn property_routing_and_paths_are_total_and_never_select_malformed_prefixes() {
+        for line in ROUTING_REGRESSIONS {
+            let (output, command) = route(line);
+            assert!(
+                line.contains(command),
+                "route returned foreign text for {line:?}"
+            );
+            if let Some(capture) = output.capture {
+                assert!(is_ident(&capture), "invalid capture from {line:?}");
+            }
+        }
+        for path in INVALID_PATH_REGRESSIONS {
+            assert!(validate_path(path).is_err(), "accepted regression {path:?}");
+            assert!(get_path(&json!({"items": [{"name": "first"}]}), path).is_err());
+        }
+
+        let fields = ["a", "field_1", "name", "result"];
+        let mut generator = Generator::new(0x02);
+        for _ in 0..GENERATED_CASES {
+            let line = generator.text(128);
+            let (output, command) = route(&line);
+            assert!(line.contains(command));
+            if let Some(capture) = output.capture {
+                assert!(is_ident(&capture));
+            }
+            if let Some(filter) = output.filter {
+                let _ = validate_path(&filter);
+            }
+
+            let mut path = fields[generator.index(fields.len())].to_string();
+            for _ in 0..generator.index(5) {
+                if generator.next() & 1 == 0 {
+                    path.push_str(&format!("[{}]", generator.index(32)));
+                } else {
+                    path.push('.');
+                    path.push_str(fields[generator.index(fields.len())]);
+                }
+            }
+            assert!(
+                validate_path(&path).is_ok(),
+                "generated valid path {path:?}"
+            );
+            for malformed in [
+                format!("{path}."),
+                format!("{path}]"),
+                format!("{path}["),
+                format!("{path}[nope]"),
+            ] {
+                assert!(validate_path(&malformed).is_err(), "accepted {malformed:?}");
+                assert!(get_path(&json!({}), &malformed).is_err());
+            }
+        }
+    }
 
     #[test]
     fn path_selects_keys_and_indices() {

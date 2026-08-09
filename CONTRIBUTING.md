@@ -13,6 +13,18 @@ All of these must pass before submitting a PR. The black-box tests build and
 spawn the fixture server in `examples/mcp_repl_fixture.rs`, so the first run
 compiles tower-mcp's server features as dev-dependencies.
 
+The command, routing/path, imported-config, wire-redaction, and alias
+boundaries also have a dependency-free deterministic property corpus. Run it
+on its own with:
+
+```bash
+cargo test --lib property_
+```
+
+The generated case count and seed live in `src/property.rs`. A fixed seed
+keeps CI time and failures reproducible; add the smallest reproducer to the
+matching regression corpus whenever one of these boundaries is fixed.
+
 Adding or updating a dependency also needs:
 
 ```bash

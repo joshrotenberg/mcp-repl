@@ -27,7 +27,7 @@ use serde_json::Value;
 use tower_mcp::client::ClientTransport;
 use tower_mcp::error::Result;
 
-use crate::style::{paint, tag};
+use crate::style::{paint, sanitize, tag};
 use crate::timing;
 
 /// Which way a frame went.
@@ -234,6 +234,7 @@ pub fn render(dir: Direction, frame: &Frame) -> String {
         header.push_str(&timing(elapsed));
     }
     let body = serde_json::to_string_pretty(&frame.json).unwrap_or_else(|_| frame.json.to_string());
+    let body = sanitize(&body);
     format!("{header}\n{}", paint(Style::new().dimmed(), &body))
 }
 
@@ -718,6 +719,66 @@ impl<T: ClientTransport> ClientTransport for TracingTransport<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::property::{GENERATED_CASES, Generator, WIRE_REGRESSIONS};
+
+    fn assert_terminal_safe(text: &str) {
+        assert_eq!(
+            sanitize(text).as_ref(),
+            text,
+            "terminal control survived: {text:?}"
+        );
+    }
+
+    #[test]
+    fn property_wire_frames_are_total_terminal_safe_and_never_retain_seeded_secrets() {
+        let wire = Wire::new(true);
+        for (raw, secrets) in WIRE_REGRESSIONS {
+            let frame = wire.record(Direction::Received, raw);
+            let stored = serde_json::to_string(&frame.json).unwrap();
+            let rendered = render(Direction::Received, &frame);
+            for secret in *secrets {
+                assert!(
+                    !stored.contains(secret),
+                    "stored secret {secret:?}: {stored}"
+                );
+                assert!(
+                    !rendered.contains(secret),
+                    "rendered secret {secret:?}: {rendered}"
+                );
+            }
+            assert_terminal_safe(&rendered);
+        }
+
+        let mut generator = Generator::new(0x04);
+        for case in 0..GENERATED_CASES {
+            let arbitrary = generator.text(192);
+            let frame = wire.record(Direction::Received, &arbitrary);
+            assert_terminal_safe(&render(Direction::Received, &frame));
+
+            let secret = format!("fuzz-secret-{case:04x}-{:016x}", generator.next());
+            let note = serde_json::to_string(&generator.text(48)).unwrap();
+            let inputs = [
+                format!(r#"{{"password":"{secret}","note":{note}}}"#),
+                format!(r#"{{"clientSecret":"{secret}","note":{note}"#),
+                format!("X-Api-Key: {secret}\nNote: keep"),
+                format!(r#"{{"message":"Bearer {secret}","note":{note}}}"#),
+            ];
+            for raw in inputs {
+                let frame = wire.record(Direction::Received, &raw);
+                let stored = serde_json::to_string(&frame.json).unwrap();
+                let rendered = render(Direction::Received, &frame);
+                assert!(
+                    !stored.contains(&secret),
+                    "stored secret from {raw:?}: {stored}"
+                );
+                assert!(
+                    !rendered.contains(&secret),
+                    "rendered secret from {raw:?}: {rendered}"
+                );
+                assert_terminal_safe(&rendered);
+            }
+        }
+    }
 
     fn request(id: u32, method: &str) -> String {
         serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {}}).to_string()

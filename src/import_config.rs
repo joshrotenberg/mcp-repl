@@ -525,7 +525,63 @@ fn expand_recording(
 mod tests {
     use super::*;
     use crate::directories::{Directories, Platform};
+    use crate::property::{
+        GENERATED_CASES, Generator, INTERPOLATION_REGRESSIONS, SELECTOR_REGRESSIONS,
+    };
     use std::ffi::OsString;
+
+    #[test]
+    fn property_selectors_and_interpolation_are_total_and_do_not_leak_on_error() {
+        for selector in SELECTOR_REGRESSIONS {
+            if let Some(Err(error)) = parse_selector(selector) {
+                assert!(!error.is_empty());
+            }
+        }
+        for input in INTERPOLATION_REGRESSIONS {
+            let result = expand(input, Path::new("/workspace/project"), &|name| {
+                Some(format!("value-for-{name}"))
+            });
+            if let Err(error) = result {
+                assert!(!error.is_empty());
+            }
+        }
+
+        let mut generator = Generator::new(0x03);
+        for case in 0..GENERATED_CASES {
+            let arbitrary = generator.text(128);
+            if let Some(result) = parse_selector(&arbitrary) {
+                match result {
+                    Ok(selector) => {
+                        assert!(!selector.path.as_os_str().is_empty());
+                        assert!(!selector.entry.is_empty());
+                    }
+                    Err(error) => assert!(!error.is_empty()),
+                }
+            }
+
+            let entry = format!("server_{case}");
+            let selector = parse_selector(&format!("fuzz-{case}.JSON:{entry}"))
+                .expect("a JSON suffix is an explicit selector")
+                .expect("a non-empty selector is valid");
+            assert_eq!(selector.entry, entry);
+
+            let _ = expand(&arbitrary, Path::new("/workspace/project"), &|name| {
+                Some(format!("value-for-{name}"))
+            });
+
+            let seeded_secret = format!("never-echo-{case:04x}");
+            let error = expand(
+                &format!("{seeded_secret}-${{env:MISSING}}"),
+                Path::new("/workspace/project"),
+                &|_| None,
+            )
+            .expect_err("the generated missing variable must be rejected");
+            assert!(
+                !error.contains(&seeded_secret),
+                "secret leaked in {error:?}"
+            );
+        }
+    }
 
     fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
