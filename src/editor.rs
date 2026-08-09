@@ -1105,6 +1105,7 @@ fn run_interactive(
 mod tests {
     use super::*;
     use crate::directories::{Directories, Platform};
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
 
     fn surface_with_colliding_wait() -> Surface {
@@ -1137,6 +1138,140 @@ mod tests {
                 "Scale": {"type": "string", "enum": ["celsius", "fahrenheit"]},
             },
         })
+    }
+
+    fn surface_for_editor_paths() -> Surface {
+        Surface {
+            tools: vec![
+                serde_json::from_value(serde_json::json!({
+                    "name": "convert",
+                    "description": "Convert safely\u{001b}]52;c;hostile\u{0007}",
+                    "inputSchema": schema_with_defs(),
+                }))
+                .expect("tool definition"),
+            ],
+            prompts: vec![
+                serde_json::from_value(serde_json::json!({
+                    "name": "greet",
+                    "description": "Generate a greeting",
+                    "arguments": [{"name": "name", "required": true}],
+                }))
+                .expect("prompt definition"),
+            ],
+            resources: vec![
+                serde_json::from_value(serde_json::json!({
+                    "uri": "note://status",
+                    "name": "Status",
+                }))
+                .expect("resource definition"),
+            ],
+            templates: vec![
+                serde_json::from_value(serde_json::json!({
+                    "uriTemplate": "note://{name}",
+                    "name": "Notes",
+                }))
+                .expect("resource template definition"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validator_separates_unfinished_input_from_complete_or_impossible_input() {
+        let validator = ReplValidator;
+        assert!(matches!(
+            validator.validate("call echo {"),
+            ValidationResult::Incomplete
+        ));
+        assert!(matches!(
+            validator.validate(r#"call echo {"message":"hi"}"#),
+            ValidationResult::Complete
+        ));
+        assert!(matches!(
+            validator.validate("call echo {1]"),
+            ValidationResult::Complete
+        ));
+    }
+
+    #[test]
+    fn tool_argument_completion_is_schema_driven_and_sanitized() {
+        let surface = surface_for_editor_paths();
+        let names = ReplCompleter::complete_tool_arg_word(&surface, "convert", "", Span::new(8, 8));
+        let to = names
+            .iter()
+            .find(|suggestion| suggestion.value == "to=")
+            .expect("the referenced enum property completes");
+        assert_eq!(to.description.as_deref(), Some("string Target scale"));
+        assert!(!to.append_whitespace, "a value still belongs after `=`");
+
+        let values =
+            ReplCompleter::complete_tool_arg_word(&surface, "convert", "to=f", Span::new(8, 12));
+        assert_eq!(
+            values
+                .iter()
+                .map(|suggestion| suggestion.value.as_str())
+                .collect::<Vec<_>>(),
+            ["to=fahrenheit"]
+        );
+        assert!(values[0].append_whitespace);
+
+        let tools = ReplCompleter::complete_tool_name_word(&surface, "con", Span::new(0, 3));
+        let description = tools[0].description.as_deref().unwrap_or_default();
+        assert!(!description.contains('\u{1b}'), "{description:?}");
+        assert!(description.contains('\u{fffd}'), "{description:?}");
+    }
+
+    #[test]
+    fn describe_completion_covers_each_surface_kind_without_builtin_duplicates() {
+        let surface = surface_for_editor_paths();
+        for (partial, expected, kind) in [
+            ("con", "convert", "tool"),
+            ("gre", "greet", "prompt"),
+            ("note://s", "note://status", "resource"),
+            ("note://{", "note://{name}", "template"),
+            ("hel", "help", "built-in"),
+        ] {
+            let suggestions =
+                ReplCompleter::complete_describe_word(&surface, partial, Span::new(0, 0));
+            let found = suggestions
+                .iter()
+                .find(|suggestion| suggestion.value == expected)
+                .unwrap_or_else(|| panic!("missing {expected:?} for {partial:?}"));
+            assert!(
+                found
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(kind),
+                "{found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn highlighter_styles_aliases_prefixes_values_and_unknown_names_without_a_terminal() {
+        let aliases = Aliases::new(
+            BTreeMap::from([("cv".to_string(), "convert".to_string())]),
+            BTreeMap::new(),
+            None,
+            None,
+        );
+        let highlighter = ReplHighlighter::new(
+            Arc::new(RwLock::new(surface_for_editor_paths())),
+            Arc::new(RwLock::new(aliases)),
+        );
+        assert_eq!(
+            highlighter.command_style("cv"),
+            Style::new().fg(Color::Cyan).bold()
+        );
+        assert_eq!(highlighter.command_style("con"), Style::new());
+        assert_eq!(
+            highlighter.command_style("unknown"),
+            Style::new().fg(Color::Red)
+        );
+        assert_eq!(value_style("42"), Style::new().fg(Color::Yellow));
+        assert_eq!(value_style("true"), Style::new().fg(Color::Purple));
+        assert_eq!(value_style("plain"), Style::new());
     }
 
     #[test]
