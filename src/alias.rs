@@ -389,6 +389,7 @@ fn child_table<'t>(parent: &'t mut Table, key: &str) -> Result<Option<&'t mut Ta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::property::{ALIAS_REGRESSIONS, GENERATED_CASES, Generator};
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -400,6 +401,53 @@ mod tests {
     fn aliases(global: &[(&str, &str)], profile: &[(&str, &str)]) -> Aliases {
         let name = (!profile.is_empty()).then(|| "cratesio".to_string());
         Aliases::new(map(global), map(profile), name, None)
+    }
+
+    #[test]
+    fn property_alias_expansion_always_terminates_at_a_command_or_cycle() {
+        for (pairs, line) in ALIAS_REGRESSIONS {
+            let aliases = aliases(pairs, &[]);
+            if let Err(error) = aliases.expand(line) {
+                assert!(error.contains("cycle"), "unexpected alias failure: {error}");
+            }
+        }
+
+        let mut generator = Generator::new(0x05);
+        for _ in 0..GENERATED_CASES {
+            let count = 1 + generator.index(32);
+            let mut table = BTreeMap::new();
+            for index in 0..count {
+                let target = generator.index(count + 2);
+                let first = if target < count {
+                    format!("a{target}")
+                } else if target == count {
+                    "tool echo".to_string()
+                } else {
+                    "echo".to_string()
+                };
+                let tail = generator.text(24).replace(char::is_whitespace, "_");
+                let expansion = if tail.is_empty() {
+                    first
+                } else {
+                    format!("{first} value={tail}")
+                };
+                table.insert(format!("a{index}"), expansion);
+            }
+
+            let aliases = Aliases::new(table.clone(), BTreeMap::new(), None, None);
+            let line = format!("a{} arg={}", generator.index(count), generator.text(24));
+            match aliases.expand(&line) {
+                Ok(Some(expanded)) => {
+                    let first = expanded.split_whitespace().next().unwrap_or_default();
+                    assert!(
+                        matches!(first, "tool" | "builtin") || !table.contains_key(first),
+                        "expansion stopped on alias {first:?}: {expanded:?}"
+                    );
+                }
+                Ok(None) => panic!("generated input always starts with an alias: {line:?}"),
+                Err(error) => assert!(error.contains("cycle"), "unexpected failure: {error}"),
+            }
+        }
     }
 
     #[test]

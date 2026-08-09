@@ -56,6 +56,8 @@ mod jobs;
 pub mod lifecycle;
 pub mod oauth_profile;
 mod output;
+#[cfg(test)]
+mod property;
 mod sampling;
 mod schema_contract;
 mod secure_file;
