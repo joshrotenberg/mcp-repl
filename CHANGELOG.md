@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-08-09
+
+### Bug Fixes
+
+- Disambiguate tool and built-in name collisions ([#91](https://github.com/joshrotenberg/mcp-repl/pull/91))
+- Reject malformed direct-tool arguments instead of dropping them ([#104](https://github.com/joshrotenberg/mcp-repl/pull/104))
+- Reject malformed capture and filter paths ([#105](https://github.com/joshrotenberg/mcp-repl/pull/105))
+- Restore subscriptions after reconnect ([#106](https://github.com/joshrotenberg/mcp-repl/pull/106))
+- Use native Windows user directories ([#107](https://github.com/joshrotenberg/mcp-repl/pull/107))
+- Recognize live HTTP status errors as reconnectable session loss ([#115](https://github.com/joshrotenberg/mcp-repl/pull/115))
+
+### Features
+
+- Suggest a server when none was named ([#86](https://github.com/joshrotenberg/mcp-repl/pull/86))
+- Read HTTP bearer from inherited file descriptor ([#90](https://github.com/joshrotenberg/mcp-repl/pull/90))
+- Connect from inside the REPL instead of only from the command line ([#116](https://github.com/joshrotenberg/mcp-repl/pull/116))
+
+### Miscellaneous Tasks
+
+- Gate releases before publication ([#108](https://github.com/joshrotenberg/mcp-repl/pull/108))
+
+### Refactor
+
+- Split CLI orchestration and raise editor-path coverage ([#110](https://github.com/joshrotenberg/mcp-repl/pull/110))
+
+### Testing
+
+- Fuzz parser and redaction boundaries ([#111](https://github.com/joshrotenberg/mcp-repl/pull/111))
+- Remove the bearer-fd descriptor reuse race ([#113](https://github.com/joshrotenberg/mcp-repl/pull/113))
+
+### Security
+
+- Require approval before imported HTTP configs forward credentials ([#103](https://github.com/joshrotenberg/mcp-repl/pull/103))
+- Scrub malformed wire frames ([#109](https://github.com/joshrotenberg/mcp-repl/pull/109))
+
+
+
 ## [0.2.0] - 2026-08-06
 
 ### Bug Fixes
