@@ -2,8 +2,9 @@
 //! can be reached as `mcp-repl <name>` instead of a URL plus repeated
 //! `--bearer`/`--header` flags.
 //!
-//! The file lives at `$XDG_CONFIG_HOME/mcp-repl/config.toml`, falling back to
-//! `~/.config/mcp-repl/config.toml`, and `--config <path>` overrides it:
+//! On Unix the file lives at `$XDG_CONFIG_HOME/mcp-repl/config.toml`, falling
+//! back to `~/.config/mcp-repl/config.toml`. On Windows it lives below
+//! `%APPDATA%\mcp-repl`. `--config <path>` overrides either default:
 //!
 //! ```toml
 //! [servers.cratesio]
@@ -329,27 +330,48 @@ impl Profile {
 }
 
 /// The config file location: `--config` if given, else
-/// `$XDG_CONFIG_HOME/mcp-repl/config.toml`, else `~/.config/mcp-repl/config.toml`.
+/// the platform-native mcp-repl config directory.
 /// The bool is true when the path was explicitly requested, which makes a
 /// missing file an error.
 pub fn config_path(explicit: Option<&str>) -> Option<(PathBuf, bool)> {
+    config_path_with(explicit, &crate::directories::Directories::current())
+}
+
+fn config_path_with(
+    explicit: Option<&str>,
+    directories: &crate::directories::Directories,
+) -> Option<(PathBuf, bool)> {
     if let Some(p) = explicit {
         return Some((PathBuf::from(p), true));
     }
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(x) if !x.is_empty() => PathBuf::from(x),
-        _ => {
-            let mut home = PathBuf::from(std::env::var_os("HOME")?);
-            home.push(".config");
-            home
-        }
-    };
-    Some((base.join("mcp-repl").join("config.toml"), false))
+    Some((directories.config_file()?, false))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directories::{Directories, Platform};
+    use std::ffi::OsString;
+
+    #[test]
+    fn windows_directories_drive_the_default_config_path() {
+        let directories = Directories::from_lookup(Platform::Windows, |name| {
+            (name == "APPDATA").then(|| OsString::from(r"C:\Users\Ada\AppData\Roaming"))
+        });
+        assert_eq!(
+            config_path_with(None, &directories),
+            Some((
+                PathBuf::from(r"C:\Users\Ada\AppData\Roaming")
+                    .join("mcp-repl")
+                    .join("config.toml"),
+                false
+            ))
+        );
+        assert_eq!(
+            config_path_with(Some("portable.toml"), &directories),
+            Some((PathBuf::from("portable.toml"), true))
+        );
+    }
 
     const SAMPLE: &str = r#"
 [servers.cratesio]

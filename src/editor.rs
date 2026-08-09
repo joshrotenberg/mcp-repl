@@ -900,21 +900,16 @@ pub const DEFAULT_HISTORY_CAPACITY: usize = 1000;
 
 /// The command-history file, shared across sessions.
 ///
-/// `$XDG_STATE_HOME/mcp-repl/history`, falling back to
-/// `~/.local/state/mcp-repl/history`: history is state, not configuration,
-/// and the config file already follows the XDG layout. `None` when neither
-/// variable is set, which keeps history in memory for the session.
+/// On Unix this is `$XDG_STATE_HOME/mcp-repl/history`, falling back to
+/// `~/.local/state/mcp-repl/history`. On Windows it is below
+/// `%LOCALAPPDATA%\mcp-repl`. `None` when no platform state location is
+/// available, which keeps history in memory for the session.
 pub fn history_path() -> Option<std::path::PathBuf> {
-    let base = match std::env::var_os("XDG_STATE_HOME") {
-        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-        _ => {
-            let mut home = std::path::PathBuf::from(std::env::var_os("HOME")?);
-            home.push(".local");
-            home.push("state");
-            home
-        }
-    };
-    Some(base.join("mcp-repl").join("history"))
+    history_path_with(&crate::directories::Directories::current())
+}
+
+fn history_path_with(directories: &crate::directories::Directories) -> Option<std::path::PathBuf> {
+    directories.history_file()
 }
 
 /// The most recent history entries, newest last, for the `history` command.
@@ -923,10 +918,15 @@ pub fn history_path() -> Option<std::path::PathBuf> {
 /// readline thread and the command runs on the async side, and a history
 /// listing is not worth a channel round trip.
 pub fn recent_history(limit: usize) -> Vec<String> {
-    let Some(path) = history_path() else {
+    let path = history_path();
+    recent_history_at(path.as_deref(), limit)
+}
+
+fn recent_history_at(path: Option<&std::path::Path>, limit: usize) -> Vec<String> {
+    let Some(path) = path else {
         return Vec::new();
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     let lines: Vec<&str> = text
@@ -944,9 +944,7 @@ pub fn recent_history(limit: usize) -> Vec<String> {
 
 /// Where history used to live, for one-time migration.
 fn legacy_history_path() -> Option<std::path::PathBuf> {
-    let mut path = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    path.push(".mcp-repl_history");
-    Some(path)
+    crate::directories::Directories::current().legacy_history_file()
 }
 
 /// Move a pre-XDG history file to the new location, once.
@@ -1058,8 +1056,8 @@ fn run_interactive(
         .with_ansi_colors(style::colors_enabled());
 
     // Persist history across sessions (up to 1000 entries) so up-arrow recalls
-    // commands from previous runs. Best-effort: a read-only HOME just keeps
-    // history in-memory for this session.
+    // commands from previous runs. Best-effort: an unwritable platform state
+    // directory just keeps history in-memory for this session.
     if persist_history && let Some(path) = history_path() {
         migrate_legacy_history(&path);
         // Every typed line lands here, including tool arguments carrying
@@ -1106,6 +1104,8 @@ fn run_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directories::{Directories, Platform};
+    use std::ffi::OsString;
 
     fn surface_with_colliding_wait() -> Surface {
         Surface {
@@ -1139,30 +1139,32 @@ mod tests {
         })
     }
 
-    /// `history_path` and `recent_history` read process environment, so a
-    /// test that sets it must not run beside another that reads it.
-    fn with_state_home<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
-        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _held = GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os("XDG_STATE_HOME");
-        // SAFETY: serialized by GUARD, and restored before the lock drops.
-        unsafe { std::env::set_var("XDG_STATE_HOME", dir) };
-        let out = body();
-        match previous {
-            Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-        }
-        out
-    }
-
     #[test]
     fn history_follows_the_xdg_state_layout() {
         let dir = tempfile::tempdir().unwrap();
-        let path = with_state_home(dir.path(), history_path).expect("a path");
+        let directories = Directories::from_lookup(Platform::Unix, |name| {
+            (name == "XDG_STATE_HOME").then(|| dir.path().as_os_str().to_owned())
+        });
+        let path = history_path_with(&directories).expect("a path");
         assert_eq!(path, dir.path().join("mcp-repl").join("history"));
         // Not the old dotfile, and not under the config directory: history
         // is state.
         assert!(!path.to_string_lossy().contains(".mcp-repl_history"));
+    }
+
+    #[test]
+    fn windows_directories_drive_the_history_path() {
+        let directories = Directories::from_lookup(Platform::Windows, |name| {
+            (name == "LOCALAPPDATA").then(|| OsString::from(r"C:\Users\Ada\AppData\Local"))
+        });
+        assert_eq!(
+            history_path_with(&directories),
+            Some(
+                std::path::PathBuf::from(r"C:\Users\Ada\AppData\Local")
+                    .join("mcp-repl")
+                    .join("history")
+            )
+        );
     }
 
     #[test]
@@ -1181,19 +1183,19 @@ fourth
         )
         .unwrap();
 
-        let all = with_state_home(dir.path(), || recent_history(10));
+        let all = recent_history_at(Some(&file), 10);
         // Blank lines are not commands.
         assert_eq!(all, vec!["first", "second", "third", "fourth"]);
 
         // A limit takes the newest, still oldest-first on screen.
-        let tail = with_state_home(dir.path(), || recent_history(2));
+        let tail = recent_history_at(Some(&file), 2);
         assert_eq!(tail, vec!["third", "fourth"]);
     }
 
     #[test]
     fn no_history_file_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(with_state_home(dir.path(), || recent_history(10)).is_empty());
+        assert!(recent_history_at(Some(&dir.path().join("missing")), 10).is_empty());
     }
 
     #[test]

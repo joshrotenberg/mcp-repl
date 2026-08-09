@@ -20,7 +20,7 @@
 //! cargo run -p mcp-repl -- --login work --http https://mcp.example.com/mcp
 //! cargo run -p mcp-repl -- --oauth work --http https://mcp.example.com/mcp
 //!
-//! # Connect to a named profile from ~/.config/mcp-repl/config.toml:
+//! # Connect to a named profile from the platform config directory:
 //! cargo run -p mcp-repl -- --server cratesio
 //! ```
 //!
@@ -45,6 +45,7 @@ mod bearer_fd;
 mod bench;
 mod command;
 pub mod config;
+mod directories;
 mod editor;
 mod elicit;
 mod exit_status;
@@ -169,8 +170,8 @@ struct Args {
     #[arg(long, value_name = "NAME")]
     server: Option<String>,
 
-    /// Read server profiles from this file instead of
-    /// `$XDG_CONFIG_HOME/mcp-repl/config.toml` (or `~/.config/mcp-repl/config.toml`).
+    /// Read server profiles from this file instead of the platform default
+    /// (`$XDG_CONFIG_HOME` on Unix or `%APPDATA%` on Windows).
     #[arg(long, value_name = "PATH")]
     config: Option<String>,
 
@@ -302,7 +303,7 @@ struct Args {
     #[arg(long)]
     trust_import: bool,
 
-    /// Do not persist command history to ~/.mcp-repl_history.
+    /// Do not persist command history in the platform state directory.
     #[arg(long)]
     no_history: bool,
 
@@ -2645,7 +2646,7 @@ async fn handle_oauth_profile_action(
     let path = config_file.unwrap_or_else(|| {
         exit_with_error(
             ExitStatus::Usage,
-            "no config file location is available; set HOME/XDG_CONFIG_HOME or pass --config",
+            "no platform config directory is available; pass --config",
         )
     });
 
@@ -2863,13 +2864,14 @@ fn no_target_message() -> String {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let directories = directories::Directories::current();
+    let home = directories.home();
     let found: Vec<String> =
-        import_config::scan(&import_config::candidate_paths(&cwd, home.as_deref()))
+        import_config::scan(&import_config::candidate_paths_with(&cwd, &directories))
             .into_iter()
             .filter_map(|file| {
                 let entries = file.result.ok()?;
-                let path = typeable_path(&file.path, &cwd, home.as_deref());
+                let path = typeable_path(&file.path, &cwd, home);
                 Some(
                     entries
                         .into_iter()
@@ -2907,8 +2909,8 @@ fn no_target_message() -> String {
 
 fn print_scan() -> ExitStatus {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let paths = import_config::candidate_paths(&cwd, home.as_deref());
+    let directories = directories::Directories::current();
+    let paths = import_config::candidate_paths_with(&cwd, &directories);
     let scanned = import_config::scan(&paths);
 
     if json_output() {
@@ -2944,7 +2946,7 @@ fn print_scan() -> ExitStatus {
         report_error(
             ExitStatus::NoMatch,
             "no MCP client configs found (looked for .mcp.json, .vscode/mcp.json, \
-             .cursor/mcp.json, and the Claude configs under your home directory)",
+             .cursor/mcp.json, and the Claude configs in your platform user directories)",
         );
         return ExitStatus::NoMatch;
     }

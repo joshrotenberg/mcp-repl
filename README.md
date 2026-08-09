@@ -16,7 +16,7 @@ surface changes.
 
 ## Install
 
-A prebuilt binary for macOS or Linux, on x86_64 or arm64:
+On macOS or Linux, install the prebuilt x86_64 or arm64 binary with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/install.sh | sh
@@ -25,9 +25,11 @@ curl -fsSL https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/install
 It verifies the release's published checksum before unpacking, and installs
 to `~/.local/bin` unless `MCP_REPL_INSTALL_DIR` says otherwise. Reading a
 script before piping it to a shell is the better habit, and this one is
-short.
+short. On Windows, download the `x86_64-pc-windows-msvc.zip` from the
+[latest release](https://github.com/joshrotenberg/mcp-repl/releases/latest),
+extract `mcp-repl.exe`, and place it on `PATH`.
 
-Or from source, which is the only route on other platforms:
+Or install from source on any supported platform:
 
 ```bash
 cargo install mcp-repl
