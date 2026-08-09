@@ -24,7 +24,9 @@ covers the flags and their accepted values, so `--protocol <Tab>` offers
 
 Both generators run before anything connects: they need no config file, no
 server, and no terminal, which is what lets a packaging script call the
-binary it just built.
+binary it just built. The man page follows the CLI options with a `REPL
+BUILT-INS` section generated from the same structured reference as
+`help <command>`; it is the complete offline command reference.
 
 ## Run
 
