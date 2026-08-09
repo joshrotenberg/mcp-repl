@@ -43,6 +43,9 @@ impl ExitStatus {
     }
 
     pub fn from_mcp_error(error: &Error) -> Self {
+        if crate::session::is_reconnectable_http_error(error) {
+            return Self::Transport;
+        }
         match error {
             Error::Transport(message) if looks_like_auth_failure(message) => Self::Auth,
             Error::Transport(_) | Error::SessionExpired | Error::SseEventTooLarge { .. } => {
@@ -118,6 +121,14 @@ mod tests {
                 "HTTP 401 Unauthorized from server".into()
             )),
             ExitStatus::Auth
+        );
+        assert_eq!(
+            ExitStatus::from_mcp_error(&Error::JsonRpc(tower_mcp::error::JsonRpcError {
+                code: -32000,
+                message: "server returned HTTP 503 Service Unavailable".into(),
+                data: None,
+            })),
+            ExitStatus::Transport
         );
         assert_eq!(
             ExitStatus::from_mcp_error(&Error::JsonRpc(JsonRpcError {

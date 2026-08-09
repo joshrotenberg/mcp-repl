@@ -188,36 +188,49 @@ struct HttpFixture {
     url: String,
     subscription_file: PathBuf,
     resource_subscriptions_file: PathBuf,
+    tool_calls_file: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum HttpFailure {
+    Once,
+    Always,
 }
 
 impl HttpFixture {
     async fn start(fixture: &Path, temp: &TempDir) -> Self {
-        Self::start_configured(fixture, temp, None, false).await
+        Self::start_configured(fixture, temp, None, None).await
     }
 
     async fn start_with_bearer(fixture: &Path, temp: &TempDir, bearer: &str) -> Self {
-        Self::start_configured(fixture, temp, Some(bearer), false).await
+        Self::start_configured(fixture, temp, Some(bearer), None).await
     }
 
     async fn start_with_reconnect(fixture: &Path, temp: &TempDir) -> Self {
-        Self::start_configured(fixture, temp, None, true).await
+        Self::start_configured(fixture, temp, None, Some(HttpFailure::Once)).await
+    }
+
+    async fn start_always_unavailable(fixture: &Path, temp: &TempDir) -> Self {
+        Self::start_configured(fixture, temp, None, Some(HttpFailure::Always)).await
     }
 
     async fn start_configured(
         fixture: &Path,
         temp: &TempDir,
         bearer: Option<&str>,
-        reconnect_once: bool,
+        failure: Option<HttpFailure>,
     ) -> Self {
-        let label = match (bearer.is_some(), reconnect_once) {
+        let label = match (bearer.is_some(), failure) {
             (true, _) => "http-auth",
-            (_, true) => "http-reconnect",
+            (_, Some(HttpFailure::Once)) => "http-reconnect",
+            (_, Some(HttpFailure::Always)) => "http-unavailable",
             _ => "http",
         };
         let ready_file = temp.path().join(format!("{label}.ready"));
         let subscription_file = temp.path().join(format!("{label}.subscription"));
         let resource_subscriptions_file =
             temp.path().join(format!("{label}.resource-subscriptions"));
+        let tool_calls_file = temp.path().join(format!("{label}.tool-calls"));
         let mut command = Command::new(fixture);
         command
             .arg("--http")
@@ -227,6 +240,7 @@ impl HttpFixture {
                 "MCP_REPL_FIXTURE_RESOURCE_SUBSCRIPTIONS_FILE",
                 &resource_subscriptions_file,
             )
+            .env("MCP_REPL_FIXTURE_TOOL_CALLS_FILE", &tool_calls_file)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -234,11 +248,17 @@ impl HttpFixture {
         if let Some(bearer) = bearer {
             command.env("MCP_REPL_FIXTURE_EXPECT_BEARER", bearer);
         }
-        if reconnect_once {
-            command.env(
-                "MCP_REPL_FIXTURE_RECONNECT_ONCE_FILE",
-                temp.path().join("http-reconnect.triggered"),
-            );
+        match failure {
+            Some(HttpFailure::Once) => {
+                command.env(
+                    "MCP_REPL_FIXTURE_HTTP_503_ONCE_FILE",
+                    temp.path().join("http-reconnect.triggered"),
+                );
+            }
+            Some(HttpFailure::Always) => {
+                command.env("MCP_REPL_FIXTURE_HTTP_503_ALWAYS", "1");
+            }
+            None => {}
         }
         let child = command.spawn().expect("spawn HTTP fixture");
         let url = wait_for_file(&ready_file, "HTTP fixture readiness").await;
@@ -247,6 +267,7 @@ impl HttpFixture {
             url,
             subscription_file,
             resource_subscriptions_file,
+            tool_calls_file,
         }
     }
 
@@ -1911,7 +1932,38 @@ async fn exercise_http(fixture: &Path, temp: &TempDir) {
         "{}",
         String::from_utf8_lossy(&restored.stderr)
     );
+    assert_eq!(
+        std::fs::read_to_string(&reconnecting.tool_calls_file)
+            .expect("read transient HTTP tool-call count"),
+        "2",
+        "one failed HTTP request and one retry should reach the server"
+    );
     reconnecting.shutdown().await;
+
+    let unavailable = HttpFixture::start_always_unavailable(fixture, temp).await;
+    let failed = run_http(
+        &unavailable.url,
+        "persistent HTTP 503",
+        &["--json", "--exec", "add a=20 b=22"],
+    )
+    .await;
+    assert_status(&failed, 4, "persistent HTTP 503");
+    let values = json_lines(&failed, "persistent HTTP 503");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "transport");
+    assert_eq!(
+        std::fs::read_to_string(&unavailable.tool_calls_file)
+            .expect("read persistent HTTP tool-call count"),
+        "2",
+        "the reconnect path must retry exactly once"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("[reconnected]"), "{stderr}");
+    assert!(
+        stderr.contains("still no session after reconnecting"),
+        "{stderr}"
+    );
+    unavailable.shutdown().await;
 
     let http = HttpFixture::start(fixture, temp).await;
 
