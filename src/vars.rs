@@ -145,17 +145,32 @@ fn is_ident(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Reject a malformed non-empty selector before dispatching a command.
+pub fn validate_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("result filter has an empty path".to_string());
+    }
+    parse_path(path).map(|_| ())
+}
+
 /// Evaluate a path like `crates[0].name` (leading `.` optional) against a value.
-/// Returns `None` on any missing key or index. An empty path yields the value.
-pub fn get_path(value: &Value, path: &str) -> Option<Value> {
+/// A valid but missing key or index returns `Ok(None)`; malformed syntax is an
+/// error. An empty path yields the value so a bare `$name` can select all of it.
+pub fn get_path(value: &Value, path: &str) -> Result<Option<Value>, String> {
     let mut cur = value;
-    for seg in parse_path(path) {
+    for seg in parse_path(path)? {
         cur = match seg {
-            Seg::Key(k) => cur.get(&k)?,
-            Seg::Index(i) => cur.get(i)?,
+            Seg::Key(k) => match cur.get(&k) {
+                Some(value) => value,
+                None => return Ok(None),
+            },
+            Seg::Index(i) => match cur.get(i) {
+                Some(value) => value,
+                None => return Ok(None),
+            },
         };
     }
-    Some(cur.clone())
+    Ok(Some(cur.clone()))
 }
 
 enum Seg {
@@ -163,32 +178,67 @@ enum Seg {
     Index(usize),
 }
 
-fn parse_path(path: &str) -> Vec<Seg> {
+fn parse_path(path: &str) -> Result<Vec<Seg>, String> {
     let mut segs = Vec::new();
-    let mut rest = path.strip_prefix('.').unwrap_or(path);
+    let mut rest = match path.strip_prefix('.') {
+        Some("") => return Err(invalid_path(path, "a leading dot needs a field name")),
+        Some(rest) if rest.starts_with('[') => {
+            return Err(invalid_path(path, "a dot cannot be followed by an index"));
+        }
+        Some(rest) => rest,
+        None => path,
+    };
     while !rest.is_empty() {
         if let Some(r) = rest.strip_prefix('[') {
-            match r
-                .find(']')
-                .and_then(|end| r[..end].parse().ok().map(|i| (i, end)))
-            {
-                Some((i, end)) => {
-                    segs.push(Seg::Index(i));
-                    rest = &r[end + 1..];
-                }
-                None => break,
+            let Some(end) = r.find(']') else {
+                return Err(invalid_path(path, "an index is missing its closing `]`"));
+            };
+            let raw = &r[..end];
+            if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid_path(path, "indices must be non-negative integers"));
             }
+            let index = raw
+                .parse::<usize>()
+                .map_err(|_| invalid_path(path, "index is too large"))?;
+            segs.push(Seg::Index(index));
+            rest = &r[end + 1..];
+            if rest.is_empty() || rest.starts_with('[') {
+                continue;
+            }
+            let Some(after_dot) = rest.strip_prefix('.') else {
+                return Err(invalid_path(
+                    path,
+                    "an index must be followed by `.field`, another index, or the end",
+                ));
+            };
+            if after_dot.is_empty() || after_dot.starts_with(['.', '[', ']']) {
+                return Err(invalid_path(path, "a dot needs a field name"));
+            }
+            rest = after_dot;
         } else {
-            let end = rest.find(['.', '[']).unwrap_or(rest.len());
+            let end = rest.find(['.', '[', ']']).unwrap_or(rest.len());
             if end == 0 {
-                break;
+                return Err(invalid_path(path, "unexpected path delimiter"));
             }
             segs.push(Seg::Key(rest[..end].to_string()));
             rest = &rest[end..];
+            if rest.is_empty() || rest.starts_with('[') {
+                continue;
+            }
+            let Some(after_dot) = rest.strip_prefix('.') else {
+                return Err(invalid_path(path, "unexpected closing `]`"));
+            };
+            if after_dot.is_empty() || after_dot.starts_with(['.', '[', ']']) {
+                return Err(invalid_path(path, "a dot needs a field name"));
+            }
+            rest = after_dot;
         }
-        rest = rest.strip_prefix('.').unwrap_or(rest);
     }
-    segs
+    Ok(segs)
+}
+
+fn invalid_path(path: &str, reason: &str) -> String {
+    format!("invalid path {path:?}: {reason}")
 }
 
 /// Replace `$name` and `$name.path` references in `text` with their values.
@@ -218,7 +268,7 @@ pub fn substitute(text: &str) -> Result<String, String> {
             .unwrap_or(tail.len());
         let path = &tail[..path_len];
         let value = get(name).ok_or_else(|| format!("undefined variable `${name}`"))?;
-        let selected = get_path(&value, path)
+        let selected = get_path(&value, path)?
             .ok_or_else(|| format!("`${name}{path}` not found in `{name}`"))?;
         out.push_str(&render_scalar(&selected));
         rest = &tail[path_len..];
@@ -245,11 +295,39 @@ mod tests {
     #[test]
     fn path_selects_keys_and_indices() {
         let v = json!({ "crates": [{ "name": "serde" }, { "name": "tokio" }] });
-        assert_eq!(get_path(&v, "crates[0].name"), Some(json!("serde")));
-        assert_eq!(get_path(&v, ".crates[1].name"), Some(json!("tokio")));
-        assert_eq!(get_path(&v, ""), Some(v.clone()));
-        assert_eq!(get_path(&v, "crates[9].name"), None);
-        assert_eq!(get_path(&v, "missing"), None);
+        assert_eq!(
+            get_path(&v, "crates[0].name").unwrap(),
+            Some(json!("serde"))
+        );
+        assert_eq!(
+            get_path(&v, ".crates[1].name").unwrap(),
+            Some(json!("tokio"))
+        );
+        assert_eq!(get_path(&v, "").unwrap(), Some(v.clone()));
+        assert_eq!(get_path(&v, "crates[9].name").unwrap(), None);
+        assert_eq!(get_path(&v, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_paths_never_select_a_valid_prefix() {
+        let value = json!({"items": [{"name": "first"}]});
+        for path in [
+            ".",
+            ".[0]",
+            "items.",
+            "items..name",
+            "items[",
+            "items[]",
+            "items[-1]",
+            "items[nope]",
+            "items[0]name",
+            "items[0].",
+            "items]",
+        ] {
+            assert!(get_path(&value, path).is_err(), "accepted {path:?}");
+        }
+        assert!(validate_path("").is_err());
+        assert!(validate_path("items[0].name").is_ok());
     }
 
     #[test]
@@ -298,6 +376,7 @@ mod tests {
         );
         assert!(substitute("$missing").is_err());
         assert!(substitute("$x.crates[9].name").is_err());
+        assert!(substitute("$x.crates[0].name[").is_err());
         unset("x");
         unset("n");
     }

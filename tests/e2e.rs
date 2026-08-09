@@ -566,7 +566,7 @@ async fn exercise_imported_stdio_config(fixture: &Path, temp: &TempDir) {
         "the records name the entry a selector resolved to:\n{records}"
     );
     assert!(
-        records.contains("spawn approved by --trust-import"),
+        records.contains("import approved by --trust-import"),
         "and which approval let the spawn happen:\n{records}"
     );
 
@@ -720,7 +720,8 @@ async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
             "servers": {
                 "fixture": {
                     "type": "http",
-                    "url": "http://127.0.0.1:1/"
+                    "url": "http://127.0.0.1:1/",
+                    "headers": {"Authorization": "Bearer ${env:IMPORTED_HTTP_TOKEN}"}
                 }
             }
         })
@@ -729,14 +730,40 @@ async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
     .expect("write imported HTTP config");
     let selector = format!("{}:fixture", config.display());
     let mut command = repl_command();
-    command.args([
-        "--json",
-        "--exec",
-        "add a=20 b=22",
-        "--http",
-        &http.url,
-        &selector,
-    ]);
+    command
+        .args([
+            "--json",
+            "--exec",
+            "add a=20 b=22",
+            "--http",
+            &http.url,
+            &selector,
+        ])
+        .env("IMPORTED_HTTP_TOKEN", "do-not-print-this-token");
+    let refused = run(command, "unapproved imported HTTP config", CASE_TIMEOUT).await;
+    assert_status(&refused, 2, "unapproved imported HTTP config");
+    let refusal = json_lines(&refused, "unapproved imported HTTP config");
+    assert_eq!(refusal.len(), 1);
+    assert_eq!(refusal[0]["kind"], "usage");
+    assert!(
+        refusal[0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("--trust-import"))
+    );
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains("do-not-print-this-token"));
+
+    let mut command = repl_command();
+    command
+        .args([
+            "--json",
+            "--exec",
+            "add a=20 b=22",
+            "--trust-import",
+            "--http",
+            &http.url,
+            &selector,
+        ])
+        .env("IMPORTED_HTTP_TOKEN", "do-not-print-this-token");
     let output = run(command, "imported HTTP config", CASE_TIMEOUT).await;
     assert_success(&output, "imported HTTP config");
     let values = json_lines(&output, "imported HTTP config");
@@ -748,6 +775,40 @@ async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
 }
 
 async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
+    let malformed_filter = run_stdio(
+        fixture,
+        temp,
+        "malformed result filter",
+        &["--json", "--exec", "add a=20 b=22 | content["],
+    )
+    .await;
+    assert_status(&malformed_filter, 2, "malformed result filter");
+    let values = json_lines(&malformed_filter, "malformed result filter");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "usage");
+    assert!(
+        values[0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid path"))
+    );
+
+    let malformed = run_stdio(
+        fixture,
+        temp,
+        "malformed direct tool arguments",
+        &["--json", "--exec", "add forgot-the-equals"],
+    )
+    .await;
+    assert_status(&malformed, 2, "malformed direct tool arguments");
+    let values = json_lines(&malformed, "malformed direct tool arguments");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "usage");
+    assert!(
+        values[0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("key=value"))
+    );
+
     let stable = run_stdio(
         fixture,
         temp,

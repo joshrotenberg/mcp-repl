@@ -295,10 +295,10 @@ struct Args {
     #[arg(long, value_enum, value_name = "STRATEGY")]
     elicitation: Option<elicit::ElicitationMode>,
 
-    /// Spawn a server named by an imported client config without asking
-    /// first. The imported file chooses the program, its arguments, and
-    /// which of your environment variables it receives, so approval is
-    /// interactive by default and remembered per entry.
+    /// Use a server named by an imported client config without asking first.
+    /// Imported stdio entries choose a process to run; imported HTTP entries
+    /// choose a remote origin and headers. Approval is interactive by default
+    /// and remembered per entry without storing credential values.
     #[arg(long)]
     trust_import: bool,
 
@@ -862,21 +862,41 @@ fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::V
     }
 }
 
-fn parse_kv_args(schema: &serde_json::Value, tokens: &[&str]) -> serde_json::Value {
+fn parse_kv_args(schema: &serde_json::Value, tokens: &[&str]) -> Result<serde_json::Value, String> {
     // A single JSON object literal wins.
-    if tokens.len() == 1
-        && tokens[0].starts_with('{')
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(tokens[0])
-    {
-        return v;
+    if tokens.len() == 1 && tokens[0].starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(tokens[0])
+            .map_err(|error| format!("invalid JSON object argument: {error}"))?;
+        if !value.is_object() {
+            return Err("the JSON argument must be an object".to_string());
+        }
+        return Ok(value);
     }
     let mut map = serde_json::Map::new();
-    for t in tokens {
-        if let Some((k, v)) = t.split_once('=') {
-            map.insert(k.to_string(), coerce_arg(schema, k, v));
-        }
+    for token in tokens {
+        let (key, value) = split_kv_arg(token)?;
+        map.insert(key.to_string(), coerce_arg(schema, key, value));
     }
-    serde_json::Value::Object(map)
+    Ok(serde_json::Value::Object(map))
+}
+
+fn parse_prompt_args(tokens: &[&str]) -> Result<HashMap<String, String>, String> {
+    let mut arguments = HashMap::new();
+    for token in tokens {
+        let (key, value) = split_kv_arg(token)?;
+        arguments.insert(key.to_string(), value.to_string());
+    }
+    Ok(arguments)
+}
+
+fn split_kv_arg(token: &str) -> Result<(&str, &str), String> {
+    let Some((key, value)) = token.split_once('=') else {
+        return Err(format!("argument {token:?} must use `key=value` syntax"));
+    };
+    if key.is_empty() {
+        return Err(format!("argument {token:?} has an empty name"));
+    }
+    Ok((key, value))
 }
 
 fn render_content(content: &[Content]) {
@@ -3249,17 +3269,19 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
     // Explicit flags override imported or native profile fields: --http
     // retargets the URL while keeping HTTP auth, and --bearer/--header are
     // layered on in build_http_config.
-    let (profile_name, import_label, import_selector, connection) = match (imported, profile) {
-        (Some(imported), _) => (
-            None,
-            Some(imported.label()),
-            Some(imported.selector),
-            Some(imported.connection),
-        ),
-        (None, Some((name, connection))) => (Some(name), None, None, Some(connection)),
-        (None, None) => (None, None, None, None),
-    };
-    // Spawning an imported entry needs the config location for the approval
+    let (profile_name, import_label, import_selector, import_http_trust, connection) =
+        match (imported, profile) {
+            (Some(imported), _) => (
+                None,
+                Some(imported.label()),
+                Some(imported.selector),
+                imported.http_trust,
+                Some(imported.connection),
+            ),
+            (None, Some((name, connection))) => (Some(name), None, None, None, Some(connection)),
+            (None, None) => (None, None, None, None, None),
+        };
+    // Using an imported entry needs the config location for the approval
     // store, and the alias table takes ownership of it below.
     let trust_store_config = config_file.clone();
 
@@ -3379,6 +3401,36 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 headers,
                 oauth: profile_oauth,
             }) => {
+                // An imported HTTP entry can choose both a remote destination
+                // and credentials to forward. Gate it before OAuth setup or
+                // transport construction can make any network request.
+                if let (Some(selector), Some(trust)) = (&import_selector, &import_http_trust) {
+                    let mut env_keys = trust.header_env_keys.clone();
+                    if args.http.is_none() {
+                        env_keys.extend(trust.url_env_keys.iter().cloned());
+                    }
+                    let plan = import_trust::ImportPlan::http(
+                        &selector.path,
+                        &selector.entry,
+                        &url,
+                        &trust.header_names,
+                        &env_keys,
+                    )
+                    .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+                    let interactive =
+                        !one_shot && std::io::IsTerminal::is_terminal(&std::io::stdin());
+                    match import_trust::authorize(
+                        &plan,
+                        trust_store_config.as_deref(),
+                        args.trust_import,
+                        interactive,
+                    ) {
+                        import_trust::Decision::Approved => {}
+                        import_trust::Decision::Refused(reason) => {
+                            exit_with_error(ExitStatus::Usage, &reason);
+                        }
+                    }
+                }
                 validate_bearer_fd_exclusive(
                     bearer_from_fd.is_some(),
                     false,
@@ -3523,7 +3575,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 // resolved to and get approval before running it. A native
                 // profile is the user's own config file, so it is not gated.
                 if let Some(selector) = &import_selector {
-                    let plan = import_trust::SpawnPlan::new(
+                    let plan = import_trust::ImportPlan::stdio(
                         &selector.path,
                         &selector.entry,
                         &command,
@@ -3839,6 +3891,12 @@ async fn handle_line(
     // every command sees resolved arguments. Capture and pipe act on tool
     // results.
     let (output, routed) = vars::route(line);
+    if let Some(path) = &output.filter
+        && let Err(error) = vars::validate_path(path)
+    {
+        report_error(ExitStatus::Usage, &error);
+        return false;
+    }
     let command = match vars::substitute(routed) {
         Ok(c) => c,
         Err(e) => {
@@ -4406,12 +4464,16 @@ async fn handle_line(
             if !enforce_prompt_contract(schema_contracts, surface, name) {
                 return false;
             }
-            let mut prompt_args = HashMap::new();
-            for t in &rest[1..] {
-                if let Some((k, v)) = t.split_once('=') {
-                    prompt_args.insert(k.to_string(), v.to_string());
+            let prompt_args = match parse_prompt_args(&rest[1..]) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    report_error(
+                        ExitStatus::Usage,
+                        &format!("invalid arguments for prompt {name:?}: {error}"),
+                    );
+                    return false;
                 }
-            }
+            };
             let started = std::time::Instant::now();
             match with_reconnect(session, surface, |c| {
                 let prompt_args = prompt_args.clone();
@@ -4953,7 +5015,16 @@ async fn dispatch_direct_tool(
         report_error_with_hint(ExitStatus::Usage, &message, suggestion.as_deref());
         return;
     };
-    let arguments = parse_kv_args(&schema, rest);
+    let arguments = match parse_kv_args(&schema, rest) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            report_error(
+                ExitStatus::Usage,
+                &format!("invalid arguments for tool {tool_name:?}: {error}"),
+            );
+            return;
+        }
+    };
     run_tool(
         session,
         surface,
@@ -5012,7 +5083,16 @@ async fn handle_bench(
         return;
     }
     let arg_tokens: Vec<&str> = plan.args.iter().map(String::as_str).collect();
-    let arguments = parse_kv_args(&schema, &arg_tokens);
+    let arguments = match parse_kv_args(&schema, &arg_tokens) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            report_error(
+                ExitStatus::Usage,
+                &format!("invalid arguments for tool {:?}: {error}", plan.tool),
+            );
+            return;
+        }
+    };
 
     let outcome = bench::run(client, &plan.tool, arguments, plan.n, plan.concurrency).await;
     // A run with failures in it exits non-zero, like any other failing
@@ -5871,9 +5951,13 @@ fn emit_value(value: serde_json::Value, output: &vars::Output, human: impl FnOnc
 fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
     if let Some(path) = &output.filter {
         match vars::get_path(&value, path) {
-            Some(selected) => value = selected,
-            None => {
+            Ok(Some(selected)) => value = selected,
+            Ok(None) => {
                 command_error(&format!("path `{path}` not found in result"));
+                return;
+            }
+            Err(error) => {
+                report_error(ExitStatus::Usage, &error);
                 return;
             }
         }
@@ -6736,7 +6820,7 @@ mod tests {
         let arguments = |line: &str| -> serde_json::Value {
             let parsed = command::parse(line).expect("parses");
             let tokens: Vec<&str> = parsed.words[1..].iter().map(String::as_str).collect();
-            parse_kv_args(&schema, &tokens)
+            parse_kv_args(&schema, &tokens).unwrap()
         };
 
         assert_eq!(
@@ -7033,11 +7117,46 @@ world",
 
         assert!(parsed.background);
         assert_eq!(
-            parse_kv_args(&schema, &tokens),
+            parse_kv_args(&schema, &tokens).unwrap(),
             serde_json::json!({
                 "instruction": "Reply with exactly hello",
                 "mode": "interactive"
             })
+        );
+    }
+
+    #[test]
+    fn malformed_schema_coerced_arguments_are_errors() {
+        let schema = serde_json::json!({"type": "object"});
+        let positional = parse_kv_args(&schema, &["forgot-the-equals"]).unwrap_err();
+        assert!(positional.contains("key=value"), "{positional}");
+
+        let empty = parse_kv_args(&schema, &["=value"]).unwrap_err();
+        assert!(empty.contains("empty name"), "{empty}");
+
+        let malformed_json = parse_kv_args(&schema, &[r#"{"a":}"#]).unwrap_err();
+        assert!(
+            malformed_json.contains("invalid JSON object"),
+            "{malformed_json}"
+        );
+
+        assert_eq!(
+            parse_kv_args(&schema, &[r#"{"a":1}"#]).unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            parse_kv_args(&schema, &["empty="]).unwrap(),
+            serde_json::json!({"empty": ""})
+        );
+    }
+
+    #[test]
+    fn malformed_prompt_arguments_are_errors() {
+        assert!(parse_prompt_args(&["missing"]).is_err());
+        assert!(parse_prompt_args(&["=value"]).is_err());
+        assert_eq!(
+            parse_prompt_args(&["name=Ada"]).unwrap(),
+            HashMap::from([("name".to_string(), "Ada".to_string())])
         );
     }
 
