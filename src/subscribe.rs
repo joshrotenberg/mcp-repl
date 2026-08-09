@@ -41,6 +41,14 @@ pub fn contains(uri: &str) -> bool {
     active().lock().unwrap().contains(uri)
 }
 
+/// Forget subscriptions owned by the server being left.
+pub fn clear() -> usize {
+    let mut active = active().lock().unwrap();
+    let count = active.len();
+    active.clear();
+    count
+}
+
 /// A server's `resources.subscribe` capability, read from the initialize
 /// result. `None` when the server was not initialized.
 ///

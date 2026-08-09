@@ -71,6 +71,10 @@ pub struct Aliases {
     global: BTreeMap<String, String>,
     profile: BTreeMap<String, String>,
     profile_name: Option<String>,
+    /// Profile tables visited during this process. Definitions can be
+    /// session-only when no config path is available, and persisted changes
+    /// should also survive switching away and back without a config reload.
+    profile_cache: BTreeMap<String, BTreeMap<String, String>>,
     path: Option<PathBuf>,
 }
 
@@ -81,10 +85,15 @@ impl Aliases {
         profile_name: Option<String>,
         path: Option<PathBuf>,
     ) -> Self {
+        let profile_cache = profile_name
+            .as_ref()
+            .map(|name| [(name.clone(), profile.clone())].into_iter().collect())
+            .unwrap_or_default();
         Self {
             global,
             profile,
             profile_name,
+            profile_cache,
             path,
         }
     }
@@ -125,6 +134,24 @@ impl Aliases {
                 }),
         );
         out
+    }
+
+    /// Select the aliases scoped to a newly connected profile. Global aliases
+    /// and the persistence path remain session-wide.
+    pub fn select_profile(&mut self, name: Option<String>, aliases: BTreeMap<String, String>) {
+        if let Some(current) = self.profile_name.as_ref() {
+            self.profile_cache
+                .insert(current.clone(), self.profile.clone());
+        }
+        self.profile = name
+            .as_ref()
+            .and_then(|name| self.profile_cache.get(name).cloned())
+            .unwrap_or(aliases);
+        if let Some(name) = name.as_ref() {
+            self.profile_cache
+                .insert(name.clone(), self.profile.clone());
+        }
+        self.profile_name = name;
     }
 
     /// Expand a line whose first word is an alias. `Ok(None)` means the line
@@ -515,6 +542,27 @@ mod tests {
         let entries = a.entries();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].expansion, "templates");
+    }
+
+    #[test]
+    fn switching_profiles_keeps_globals_and_replaces_profile_aliases() {
+        let mut aliases = aliases(&[("g", "help")], &[("p", "tools")]);
+        aliases.select_profile(Some("other".to_string()), map(&[("q", "prompts")]));
+        assert!(aliases.lookup("p").is_none());
+        assert_eq!(aliases.lookup("g").map(|(value, _)| value), Some("help"));
+        assert_eq!(
+            aliases.lookup("q"),
+            Some(("prompts", Scope::Profile("other".to_string())))
+        );
+
+        aliases.define("live", "resources", false).unwrap();
+        aliases.select_profile(None, BTreeMap::new());
+        assert!(aliases.lookup("live").is_none());
+        aliases.select_profile(Some("other".to_string()), BTreeMap::new());
+        assert_eq!(
+            aliases.lookup("live").map(|(value, _)| value),
+            Some("resources")
+        );
     }
 
     #[test]

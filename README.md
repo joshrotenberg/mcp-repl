@@ -45,7 +45,22 @@ mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
 
 ## Start here
 
-No server needed: `--demo` runs one in this process.
+Open the REPL first and choose a server from inside it:
+
+```bash
+mcp-repl
+```
+
+```text
+mcp-repl> connect demo
+```
+
+`connect` also accepts an HTTP URL, saved profile, imported
+`path.json:entry`, or stdio command. Run it again to switch servers without
+losing command history or global aliases. Captured variables, background task
+ids, resource subscriptions, and profile-scoped aliases are cleared because
+they belong to the server being left. The original direct forms remain useful
+for scripts and one-server sessions:
 
 ```bash
 mcp-repl --demo

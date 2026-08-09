@@ -28,6 +28,31 @@ binary it just built.
 
 ## Run
 
+A bare invocation opens a disconnected prompt. `connect` accepts the same
+target shapes as startup and can be run again to switch servers:
+
+```text
+$ mcp-repl
+not connected — run `connect` to see targets, or try `connect demo`
+mcp-repl> connect demo
+mcp-repl-demo> connect https://example.com/mcp
+mcp-server> connect local-profile
+mcp-server> connect .mcp.json:workspace
+mcp-server> connect -- ./my-server --stdio
+```
+
+With no arguments, `connect` shows the saved profiles and imported targets it
+can find. A candidate is fully connected, initialized/discovered, and listed
+before it replaces the current session, so a failed switch leaves the old
+server usable. History and global aliases survive. Captured variables,
+background tasks, resource subscriptions, and profile aliases are
+server-scoped; a successful switch clears them and reports what was removed.
+
+The selected `--protocol`, HTTP auth flags, import trust policy, reconnect
+policy, and OAuth/browser policy apply to later `connect` commands too.
+`--exec` and `--json` still require a target at process startup and never open
+a disconnected prompt.
+
 ```bash
 # Against the bundled in-process demo router (no external server):
 mcp-repl --demo

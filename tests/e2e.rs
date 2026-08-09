@@ -59,6 +59,40 @@ async fn run(mut command: Command, label: &str, timeout: Duration) -> Output {
     }
 }
 
+async fn run_with_input(
+    mut command: Command,
+    input: &str,
+    label: &str,
+    timeout: Duration,
+) -> Output {
+    let mut stdout = tempfile::tempfile().expect("create stdout capture");
+    let mut stderr = tempfile::tempfile().expect("create stderr capture");
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(stdout.try_clone().expect("clone stdout capture"))
+        .stderr(stderr.try_clone().expect("clone stderr capture"))
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("write {label} input: {error}"));
+    let status = tokio::time::timeout(timeout, child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("{label} exceeded {timeout:?}"))
+        .unwrap_or_else(|error| panic!("wait for {label}: {error}"));
+    Output {
+        status,
+        stdout: read_capture(&mut stdout, label, "stdout"),
+        stderr: read_capture(&mut stderr, label, "stderr"),
+    }
+}
+
 fn read_capture(file: &mut std::fs::File, label: &str, stream: &str) -> Vec<u8> {
     file.rewind()
         .unwrap_or_else(|error| panic!("rewind {label} {stream}: {error}"));
@@ -199,19 +233,23 @@ enum HttpFailure {
 
 impl HttpFixture {
     async fn start(fixture: &Path, temp: &TempDir) -> Self {
-        Self::start_configured(fixture, temp, None, None).await
+        Self::start_configured(fixture, temp, None, None, None).await
+    }
+
+    async fn start_for_switching(fixture: &Path, temp: &TempDir) -> Self {
+        Self::start_configured(fixture, temp, None, None, Some("http-switching")).await
     }
 
     async fn start_with_bearer(fixture: &Path, temp: &TempDir, bearer: &str) -> Self {
-        Self::start_configured(fixture, temp, Some(bearer), None).await
+        Self::start_configured(fixture, temp, Some(bearer), None, None).await
     }
 
     async fn start_with_reconnect(fixture: &Path, temp: &TempDir) -> Self {
-        Self::start_configured(fixture, temp, None, Some(HttpFailure::Once)).await
+        Self::start_configured(fixture, temp, None, Some(HttpFailure::Once), None).await
     }
 
     async fn start_always_unavailable(fixture: &Path, temp: &TempDir) -> Self {
-        Self::start_configured(fixture, temp, None, Some(HttpFailure::Always)).await
+        Self::start_configured(fixture, temp, None, Some(HttpFailure::Always), None).await
     }
 
     async fn start_configured(
@@ -219,13 +257,14 @@ impl HttpFixture {
         temp: &TempDir,
         bearer: Option<&str>,
         failure: Option<HttpFailure>,
+        label: Option<&str>,
     ) -> Self {
-        let label = match (bearer.is_some(), failure) {
+        let label = label.unwrap_or(match (bearer.is_some(), failure) {
             (true, _) => "http-auth",
             (_, Some(HttpFailure::Once)) => "http-reconnect",
             (_, Some(HttpFailure::Always)) => "http-unavailable",
             _ => "http",
-        };
+        });
         let ready_file = temp.path().join(format!("{label}.ready"));
         let subscription_file = temp.path().join(format!("{label}.subscription"));
         let resource_subscriptions_file =
@@ -1174,25 +1213,17 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
     assert_status(&empty, 1, "exec wait with no tasks");
 }
 
-/// Naming no server is a usage error, and a script must still get the usage
-/// line rather than a survey of the machine.
-///
-/// The interactive form, which lists what was discovered, needs a terminal
-/// and is exercised by hand: `is_terminal` is exactly what this test cannot
-/// give it.
+/// A bare human REPL starts disconnected, while machine-oriented modes still
+/// require an initial target.
 async fn exercise_no_target(temp: &TempDir) {
     let mut command = repl_command();
     command.current_dir(temp.path());
     let output = run(command, "no target", CASE_TIMEOUT).await;
-    assert_status(&output, 2, "no target");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_success(&output, "disconnected prompt");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("usage: mcp-repl"),
-        "a pipe gets the usage line:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("configured on this machine"),
-        "and not the discovery listing, which is for a person:\n{stderr}"
+        stdout.contains("not connected") && stdout.contains("connect demo"),
+        "a bare invocation explains the disconnected prompt:\n{stdout}"
     );
 
     // Under --json it is the standard envelope, on stdout, like every other
@@ -1204,6 +1235,128 @@ async fn exercise_no_target(temp: &TempDir) {
     let values = json_lines(&as_json, "no target json");
     assert_eq!(values.len(), 1);
     assert_eq!(values[0]["kind"], "usage");
+
+    let mut exec = repl_command();
+    exec.args(["--exec", "help"]);
+    let exec = run(exec, "no target exec", CASE_TIMEOUT).await;
+    assert_status(&exec, 2, "no target exec");
+
+    let mut final_repl = repl_command();
+    final_repl.args([
+        "--protocol",
+        "2026-07-28",
+        "--no-history",
+        "--color",
+        "never",
+    ]);
+    let final_repl = run_with_input(
+        final_repl,
+        "connect demo\necho message=final-connect\nquit\n",
+        "disconnected final connect",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&final_repl, "disconnected final connect");
+    let stdout = String::from_utf8_lossy(&final_repl.stdout);
+    assert!(stdout.contains("protocol 2026-07-28"), "{stdout}");
+    assert!(stdout.contains("final-connect"), "{stdout}");
+}
+
+async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir) {
+    let fixture_string = fixture.display().to_string();
+    let fixture_literal = serde_json::to_string(&fixture_string).expect("quote fixture path");
+    let config = temp.path().join("connect.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[servers.profiled]\ntransport = \"stdio\"\ncommand = [{fixture_literal}]\n\
+             [servers.profiled.aliases]\nprofile_add = \"add\"\n"
+        ),
+    )
+    .expect("write connect profile");
+    let imported = temp.path().join("connect-import.json");
+    std::fs::write(
+        &imported,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "mcpServers": {
+                "imported": { "command": fixture_string }
+            }
+        }))
+        .expect("serialize imported config"),
+    )
+    .expect("write imported config");
+    let selector = format!("{}:imported", imported.display());
+    let exit_file = temp.path().join("in-repl-connect.exit");
+    let missing = temp.path().join("missing-mcp-server");
+    let input = format!(
+        "help connect\n\
+         alias h=help connect\n\
+         connect demo\n\
+         saved = echo message=hello\n\
+         connect -- {}\n\
+         vars\n\
+         echo message=still-connected\n\
+         connect -- {fixture_string}\n\
+         add a=20 b=22\n\
+         connect profiled\n\
+         profile_add a=19 b=23\n\
+         connect {selector}\n\
+         add a=18 b=24\n\
+         connect {http_url}\n\
+         add a=17 b=25\n\
+         connect demo\n\
+         vars\n\
+         h\n\
+         echo message=switched\n\
+         quit\n",
+        missing.display()
+    );
+    let mut command = repl_command();
+    command
+        .args([
+            "--no-history",
+            "--color",
+            "never",
+            "--trust-import",
+            "--config",
+        ])
+        .arg(&config)
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let output = run_with_input(command, &input, "in-REPL connect", CASE_TIMEOUT).await;
+    assert_success(&output, "in-REPL connect");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("not connected"), "{stdout}");
+    assert!(
+        stdout.contains("hello")
+            && stdout.contains("still-connected")
+            && stdout.contains("switched"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.matches("42").count() >= 4,
+        "stdio, profile, import, and HTTP targets all answer:\n{stdout}"
+    );
+    assert!(stdout.contains("profile profiled"), "{stdout}");
+    assert!(stdout.contains("import "), "{stdout}");
+    assert!(
+        stdout.contains("server-scoped state cleared: 1 captured variable"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.matches("connect <url|profile").count() >= 2,
+        "global aliases and help survive switches:\n{stdout}"
+    );
+    assert!(stdout.contains("no variables"), "{stdout}");
+    assert!(
+        stderr.contains("missing-mcp-server"),
+        "the failed candidate is reported:\n{stderr}"
+    );
+    assert_eq!(
+        wait_for_file(&exit_file, "switched stdio fixture shutdown").await,
+        "clean",
+        "switching servers did not orderly close the old stdio child"
+    );
 }
 
 /// `--login`/`--logout` under `--json` speak the same NDJSON contract.
@@ -1965,8 +2118,11 @@ async fn exercise_http(fixture: &Path, temp: &TempDir) {
     );
     unavailable.shutdown().await;
 
-    let http = HttpFixture::start(fixture, temp).await;
+    let switching = HttpFixture::start_for_switching(fixture, temp).await;
+    exercise_in_repl_connect(fixture, &switching.url, temp).await;
+    switching.shutdown().await;
 
+    let http = HttpFixture::start(fixture, temp).await;
     exercise_imported_http_config(&http, temp).await;
 
     let stable = run_http(

@@ -108,7 +108,12 @@ async fn run(
         // caught by the atomic comparison before an ending is retried.
         let generation = session.generation();
         generations.borrow_and_update();
-        let client = session.client();
+        let Some(client) = session.try_client() else {
+            if generations.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
 
         let opened = tokio::select! {
             result = client.listen_subscriptions(requested_filter()) => result,
@@ -357,7 +362,7 @@ mod tests {
     async fn reconnect_reopens_the_surface_stream_on_the_fresh_client() {
         let listens = Arc::new(AtomicUsize::new(0));
         let connector_listens = listens.clone();
-        let connector: Connector = Box::new(move || {
+        let connector: Connector = Arc::new(move || {
             let listens = connector_listens.clone();
             Box::pin(async move { Ok(final_client(listens, NotificationHandler::new()).await) })
         });

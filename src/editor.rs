@@ -75,12 +75,12 @@ impl Validator for ReplValidator {
 // ---------------------------------------------------------------------------
 
 struct ReplPrompt {
-    server_name: String,
+    server_name: crate::elicit::ServerLabel,
 }
 
 impl Prompt for ReplPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.server_name)
+        Cow::Owned(self.server_name.read().unwrap().clone())
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -209,7 +209,9 @@ impl ReplCompleter {
         arg: &str,
         partial: &str,
     ) -> Vec<String> {
-        let client = self.session.client();
+        let Some(client) = self.session.try_client() else {
+            return Vec::new();
+        };
         let (prompt, arg, partial) = (prompt.to_string(), arg.to_string(), partial.to_string());
         self.runtime
             .block_on(async move {
@@ -234,7 +236,9 @@ impl ReplCompleter {
         var: &str,
         partial: &str,
     ) -> Vec<String> {
-        let client = self.session.client();
+        let Some(client) = self.session.try_client() else {
+            return Vec::new();
+        };
         let (template, var, partial) = (
             uri_template.to_string(),
             var.to_string(),
@@ -862,7 +866,7 @@ impl Highlighter for ReplHighlighter {
 /// line-reader so non-interactive use keeps working.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_readline_thread(
-    server_name: String,
+    server_name: crate::elicit::ServerLabel,
     surface: Arc<RwLock<Surface>>,
     session: Arc<Session>,
     aliases: Arc<RwLock<Aliases>>,
@@ -1017,7 +1021,7 @@ fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mp
 
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
-    server_name: String,
+    server_name: crate::elicit::ServerLabel,
     surface: Arc<RwLock<Surface>>,
     session: Arc<Session>,
     aliases: Arc<RwLock<Aliases>>,
