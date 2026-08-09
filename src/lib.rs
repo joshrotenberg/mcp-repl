@@ -202,7 +202,7 @@ struct Args {
     #[arg(long, value_name = "SHELL")]
     completions: Option<clap_complete::Shell>,
 
-    /// Print this program's man page, in roff, and exit.
+    /// Print the CLI and REPL built-in reference, in roff, and exit.
     ///
     /// Packagers redirect it: `mcp-repl --man > mcp-repl.1`.
     #[arg(long)]
@@ -654,7 +654,7 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "connect",
         "connect <url|profile|path.json:entry|command...|demo>",
-        "Connect from a disconnected prompt or switch servers without losing history and global aliases. `connect` alone lists available forms and saved profiles.",
+        "Connect from a disconnected prompt or switch the live REPL to another server.",
     ),
     (
         "tool",
@@ -686,9 +686,7 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "find",
         "find [-E] [-m N] [--case-sensitive] [--tools|--prompts|--resources|--templates|--builtins] <keyword>",
-        "Search names and descriptions across the surface and the built-ins. Kind flags narrow \
-         it, `-m` caps the results, `-E` treats the keyword as a regular expression, and it \
-         exits non-zero when nothing matches, like grep.",
+        "Search names and descriptions across the server surface and REPL built-ins.",
     ),
     (
         "describe",
@@ -708,9 +706,7 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "read",
         "read <uri> [--out <path>] [--force]",
-        "Read a resource. Tab completes URIs, and template variables via the server. \
-         `--out` writes the content to a file, decoding a binary resource, instead of \
-         printing it.",
+        "Read a resource, or write one returned content item to a file.",
     ),
     (
         "subscribe",
@@ -740,7 +736,7 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "bench",
         "bench <tool> [k=v...] [--n N] [--concurrency C]",
-        "Time repeated calls and report the latency distribution. Any failure exits non-zero.",
+        "Time repeated tool calls and report their latency distribution.",
     ),
     (
         "jobs",
@@ -750,19 +746,12 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "task",
         "task <task> [respond]",
-        "Show one background task. Takes the short number from `jobs`, `last`, or the server's \
-         id. \
-         `respond` answers what an `input_required` task is waiting for and lets its handler \
-         resume; it needs --protocol 2026-07-28.",
+        "Show one background task, or answer a task waiting for operator input.",
     ),
     (
         "wait",
         "wait [<task>] [--timeout <seconds>]",
-        "Block until a task settles. With no task, waits for every task this session started, \
-         in start order, which is how an --exec script waits for work whose id it never saw. \
-         `last` names the most recent. A task that failed or was cancelled sets a non-zero exit \
-         status. Ctrl-C interrupts; the global --timeout does not apply, and this one applies \
-         per task.",
+        "Block until one background task, or all tasks this session started, settle.",
     ),
     (
         "cancel",
@@ -772,7 +761,7 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "alias",
         "alias [--global] [<name>=<expansion>]",
-        "Define, list, or show a command alias. Saved to the config file.",
+        "Define, list, or show command aliases stored with the server profiles.",
     ),
     (
         "unalias",
@@ -804,7 +793,7 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
     (
         "wire",
         "wire [on|off]",
-        "Trace raw JSON-RPC frames to stderr. Bare `wire` reports the current state.",
+        "Toggle redacted JSON-RPC frame tracing, or report its current state.",
     ),
     (
         "last",
@@ -816,22 +805,155 @@ const BUILTIN_HELP: &[(&str, &str, &str)] = &[
         "history [count]",
         "List recent commands from previous sessions. Ctrl-R searches them interactively.",
     ),
-    (
-        "vars",
-        "vars",
-        "List captured variables. Capture with `name = <command>`.",
-    ),
+    ("vars", "vars", "List values captured from command results."),
     ("unset", "unset <name>", "Clear one captured variable."),
     ("quit", "quit", "Close the session and exit."),
     ("exit", "exit", "Close the session and exit."),
 ];
 
-/// The usage line and explanation for a built-in, if it has one.
-fn builtin_help(name: &str) -> Option<(&'static str, &'static str)> {
-    BUILTIN_HELP
+/// Longer paragraphs and examples for commands that benefit from more than
+/// one dense sentence. Kept beside [`BUILTIN_HELP`], and rendered by both the
+/// live prompt and `--man`, so the binary remains the reference source.
+struct BuiltinGuide {
+    name: &'static str,
+    details: &'static [&'static str],
+    examples: &'static [&'static str],
+}
+
+const BUILTIN_GUIDES: &[BuiltinGuide] = &[
+    BuiltinGuide {
+        name: "connect",
+        details: &[
+            "The target may be an HTTP URL, a saved profile, a path.json:entry import, a stdio command, or demo. Bare connect lists saved and discovered candidates.",
+            "A candidate is initialized and its surface fetched before it replaces the current server. A failed switch leaves the old session usable. History and aliases survive; captured variables, task ids, and resource subscriptions are cleared after a successful switch.",
+        ],
+        examples: &[
+            "connect demo",
+            "connect https://example.com/mcp",
+            "connect -- ./my-server --stdio",
+        ],
+    },
+    BuiltinGuide {
+        name: "find",
+        details: &[
+            "Kind flags can be combined. -m/--max caps the best-ranked results, -E/--regex treats the query as a regular expression, and --case-sensitive disables case folding.",
+            "The cached surface is searched without sending a request. No matches set the no-match exit status, which makes find useful in scripts as well as at the prompt.",
+        ],
+        examples: &["find --tools -m 3 download", "find -E '^get_.*downloads$'"],
+    },
+    BuiltinGuide {
+        name: "read",
+        details: &[
+            "Tab completes concrete resource URIs and asks the server to complete variables in resource templates.",
+            "--out writes one returned content item to an owner-only file and decodes blobs. Existing files require --force; multiple contents are refused rather than concatenated.",
+        ],
+        examples: &["read note://ideas", "read img://pixel --out pixel.png"],
+    },
+    BuiltinGuide {
+        name: "prompt",
+        details: &[
+            "Argument names come from the prompt definition. Values stay strings, and completion/complete is used when the server supports prompt argument completion.",
+        ],
+        examples: &["prompt greet name=Ada"],
+    },
+    BuiltinGuide {
+        name: "bench",
+        details: &[
+            "Arguments are coerced exactly like a direct tool call. --n defaults to 20; --concurrency defaults to 1 and never exceeds the call count.",
+            "The distribution uses successful calls. Failures are counted separately, the first error is shown, and any failure sets a non-zero exit status.",
+        ],
+        examples: &[
+            "bench get_downloads crate=serde --n 50",
+            "bench get_downloads crate=serde --n 50 --concurrency 8",
+        ],
+    },
+    BuiltinGuide {
+        name: "task",
+        details: &[
+            "A task can be named by its short jobs number, last, full server id, or an unambiguous id prefix.",
+            "respond is available on the 2026-07-28 protocol when a task is input_required. It collects the requested elicitation answers and resumes the task handler.",
+        ],
+        examples: &["task 1", "task last respond"],
+    },
+    BuiltinGuide {
+        name: "wait",
+        details: &[
+            "With no task, wait reports every task in start order. --timeout is a per-task deadline; the global request timeout does not apply to task waiting.",
+            "A failed or cancelled task sets a non-zero exit status. Ctrl-C interrupts the wait without inventing a result for unfinished work.",
+        ],
+        examples: &["wait last", "wait --timeout 30"],
+    },
+    BuiltinGuide {
+        name: "alias",
+        details: &[
+            "An alias replaces the first command word and may expand through another alias; cycles are rejected. It can include arguments, an explicit tool/builtin qualifier, or a trailing &.",
+            "Definitions made through a profile are profile-scoped; otherwise they are global. --global forces the shared table. Changes preserve comments and formatting in the config file.",
+        ],
+        examples: &[
+            "alias dl=get_downloads",
+            "alias w=tool wait",
+            "alias --global t=tools",
+        ],
+    },
+    BuiltinGuide {
+        name: "wire",
+        details: &[
+            "Frames are written to stderr with direction, timestamp, and request latency. Recognized credential fields and authorization schemes are redacted before storage or display.",
+            "Tracing can be enabled at startup with --trace. The last exchange is recorded even while tracing is off and can be replayed with last.",
+        ],
+        examples: &["wire on", "wire off"],
+    },
+    BuiltinGuide {
+        name: "vars",
+        details: &[
+            "Capture with name = command, filter with command | path, and reference a value later as $name or $name.path[index]. Captures are cleared when connect switches servers.",
+        ],
+        examples: &[
+            "result = search query=serde",
+            "describe $result.items[0].name",
+        ],
+    },
+];
+
+#[derive(Clone, Copy)]
+struct BuiltinHelp {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+    details: &'static [&'static str],
+    examples: &'static [&'static str],
+}
+
+/// The structured reference for one built-in, shared by human help, JSON
+/// help, `describe`, and the generated man page.
+fn builtin_help(name: &str) -> Option<BuiltinHelp> {
+    let &(name, usage, description) = BUILTIN_HELP
         .iter()
-        .find(|(builtin, _, _)| *builtin == name)
-        .map(|(_, usage, detail)| (*usage, *detail))
+        .find(|(builtin, _, _)| *builtin == name)?;
+    let guide = BUILTIN_GUIDES.iter().find(|guide| guide.name == name);
+    Some(BuiltinHelp {
+        name,
+        usage,
+        description,
+        details: guide.map(|guide| guide.details).unwrap_or_default(),
+        examples: guide.map(|guide| guide.examples).unwrap_or_default(),
+    })
+}
+
+fn print_builtin_help(help: BuiltinHelp) {
+    println!("{}", paint(Style::new().bold(), help.usage));
+    println!("  {}", help.description);
+    for paragraph in help.details {
+        println!();
+        println!("  {paragraph}");
+    }
+    if !help.examples.is_empty() {
+        println!();
+        println!("examples:");
+        for example in help.examples {
+            println!("  {example}");
+        }
+    }
 }
 
 pub(crate) fn is_builtin(name: &str) -> bool {
@@ -3098,16 +3220,51 @@ fn print_completions(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
 }
 
-/// `--man`: the man page, in roff, on stdout.
-fn print_man() {
+fn roff_escape(text: &str) -> String {
+    text.replace('\\', "\\e").replace('-', "\\-")
+}
+
+/// Render clap's CLI reference followed by the REPL command reference. The
+/// latter is deliberately sourced from [`BUILTIN_HELP`] rather than copied
+/// into a packaging template.
+fn render_man_page() -> Result<Vec<u8>, String> {
     let command = <Args as clap::CommandFactory>::command();
     let mut page = Vec::new();
-    if let Err(error) = clap_mangen::Man::new(command).render(&mut page) {
-        exit_with_error(
-            ExitStatus::Usage,
-            &format!("could not render the man page: {error}"),
-        );
+    clap_mangen::Man::new(command)
+        .render(&mut page)
+        .map_err(|error| format!("could not render the man page: {error}"))?;
+
+    use std::io::Write;
+    writeln!(page, ".SH \"REPL BUILT-INS\"").map_err(|error| error.to_string())?;
+    writeln!(
+        page,
+        "The server's tools are top-level commands. These built-ins are supplied by mcp-repl. The same reference is available interactively through \\fBhelp <command>\\fR."
+    )
+    .map_err(|error| error.to_string())?;
+    for &(name, _, _) in BUILTIN_HELP {
+        let help = builtin_help(name).expect("BUILTIN_HELP entry resolves itself");
+        writeln!(page, ".TP\n\\fB{}\\fR", roff_escape(help.usage))
+            .map_err(|error| error.to_string())?;
+        writeln!(page, "{}", roff_escape(help.description)).map_err(|error| error.to_string())?;
+        for paragraph in help.details {
+            writeln!(page, ".PP\n{}", roff_escape(paragraph)).map_err(|error| error.to_string())?;
+        }
+        if !help.examples.is_empty() {
+            writeln!(page, ".RS 4\nExamples:\n.nf").map_err(|error| error.to_string())?;
+            for example in help.examples {
+                writeln!(page, "{}", roff_escape(example)).map_err(|error| error.to_string())?;
+            }
+            writeln!(page, ".fi\n.RE").map_err(|error| error.to_string())?;
+        }
     }
+    Ok(page)
+}
+
+/// `--man`: the CLI and REPL built-in reference, in roff, on stdout.
+fn print_man() {
+    let page = render_man_page().unwrap_or_else(|error| {
+        exit_with_error(ExitStatus::Usage, &error);
+    });
     use std::io::Write;
     if let Err(error) = std::io::stdout().write_all(&page) {
         exit_with_error(
@@ -4483,17 +4640,18 @@ async fn handle_line(
             // `help <command>` explains one built-in. Falls through to the
             // full listing when the name is not one.
             if let Some(name) = rest.first()
-                && let Some((usage, detail)) = builtin_help(name)
+                && let Some(help) = builtin_help(name)
             {
                 if json_output() {
                     print_json(&serde_json::json!({
-                        "name": name,
-                        "usage": usage,
-                        "description": detail,
+                        "name": help.name,
+                        "usage": help.usage,
+                        "description": help.description,
+                        "details": help.details,
+                        "examples": help.examples,
                     }));
                 } else {
-                    println!("{}", paint(Style::new().bold(), usage));
-                    println!("  {detail}");
+                    print_builtin_help(help);
                 }
                 return false;
             }
@@ -5946,12 +6104,14 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
                 })
         })
         .or_else(|| {
-            builtin_help(name).map(|(usage, description)| {
+            builtin_help(name).map(|help| {
                 serde_json::json!({
                     "kind": "builtin",
-                    "name": name,
-                    "usage": usage,
-                    "description": description,
+                    "name": help.name,
+                    "usage": help.usage,
+                    "description": help.description,
+                    "details": help.details,
+                    "examples": help.examples,
                 })
             })
         })
@@ -6173,13 +6333,22 @@ fn describe(surface: &Surface, name: &str) {
             .templates
             .iter()
             .any(|template| template.name == name || template.uri_template == name);
-    if !surface_has_name && let Some((usage, detail)) = builtin_help(name) {
+    if !surface_has_name && let Some(help) = builtin_help(name) {
         println!(
             "built-in {}",
             paint(Style::new().fg(Color::Cyan).bold(), name)
         );
-        println!("  usage: {usage}");
-        println!("  {detail}");
+        println!("  usage: {}", help.usage);
+        println!("  {}", help.description);
+        for paragraph in help.details {
+            println!("  {paragraph}");
+        }
+        if !help.examples.is_empty() {
+            println!("  examples:");
+            for example in help.examples {
+                println!("    {example}");
+            }
+        }
         return;
     }
     if let Some(t) = surface.tools.iter().find(|t| t.name == name) {
@@ -7217,19 +7386,23 @@ mod tests {
 
     #[test]
     fn the_man_page_renders_with_the_real_sections() {
-        let command = <Args as clap::CommandFactory>::command();
-        let mut page = Vec::new();
-        clap_mangen::Man::new(command)
-            .render(&mut page)
-            .expect("man page renders");
+        let page = render_man_page().expect("man page renders");
         let roff = String::from_utf8(page).expect("roff is UTF-8");
         assert!(roff.contains("mcp-repl"));
-        for section in [".SH NAME", ".SH SYNOPSIS", ".SH DESCRIPTION", ".SH OPTIONS"] {
+        for section in [
+            ".SH NAME",
+            ".SH SYNOPSIS",
+            ".SH DESCRIPTION",
+            ".SH OPTIONS",
+            ".SH \"REPL BUILT-INS\"",
+        ] {
             assert!(roff.contains(section), "man page has no {section}");
         }
         // The description is the long one, not the one-liner. The apostrophe
         // arrives as the roff escape clap_mangen emits for it.
         assert!(roff.contains("surface is the command set"));
+        assert!(roff.contains("connect demo"));
+        assert!(roff.contains("wait \\-\\-timeout 30"));
     }
 
     #[test]
@@ -7247,6 +7420,33 @@ mod tests {
             assert!(
                 BUILTINS.iter().any(|(builtin, _)| builtin == name),
                 "BUILTIN_HELP documents `{name}`, which is not a built-in"
+            );
+        }
+        for guide in BUILTIN_GUIDES {
+            assert!(
+                BUILTINS.iter().any(|(name, _)| *name == guide.name),
+                "BUILTIN_GUIDES documents unknown `{}`",
+                guide.name
+            );
+            assert!(
+                !guide.details.is_empty() || !guide.examples.is_empty(),
+                "guide `{}` adds no detail",
+                guide.name
+            );
+        }
+        for (index, guide) in BUILTIN_GUIDES.iter().enumerate() {
+            assert!(
+                !BUILTIN_GUIDES[index + 1..]
+                    .iter()
+                    .any(|other| other.name == guide.name),
+                "BUILTIN_GUIDES documents `{}` more than once",
+                guide.name
+            );
+        }
+        for name in ["connect", "find", "read", "bench", "wait", "alias", "wire"] {
+            assert!(
+                !builtin_help(name).unwrap().examples.is_empty(),
+                "high-value help for `{name}` needs a runnable example"
             );
         }
     }

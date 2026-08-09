@@ -6,6 +6,12 @@
 The server's surface is the command set. This is everything the REPL adds
 on top of it.
 
+The reference lives in the binary: `help <command>` shows a usage line,
+focused explanation, and examples for commands that need them. `--json -e
+'help <command>'` exposes the same fields as data, and `mcp-repl --man`
+exports every built-in after the startup options. This guide is the tour and
+the reasoning around those commands rather than a second flag manual.
+
 ## What to try
 
 Start with `mcp-repl`, then run `connect demo` (or start directly with
@@ -283,7 +289,7 @@ Tab opens a columnar menu. What gets completed:
 
 A server with dozens of tools is not navigable by listing it. `find
 <keyword>` searches names and descriptions across tools, prompts, resources,
-and templates, grouped by kind:
+templates, and built-ins, grouped by kind:
 
 ```text
 cratesio> find download
@@ -293,11 +299,7 @@ tools:
 2 matches
 ```
 
-`find` searches the REPL's own commands too, so `find alias` reaches the
-alias built-in rather than reporting that the server has nothing by that name.
-`describe <built-in>` explains one the same way `help <built-in>` does.
-
-Flags follow grep's, since the exit status already does:
+The flags follow grep's because the exit status does too:
 
 ```text
 cratesio> find --tools -m 3 download      # tools only, best three
@@ -306,25 +308,11 @@ cratesio> find --builtins alias           # the REPL's own commands
 cratesio> find -E '^get_.*downloads$'     # a regular expression
 ```
 
-`--tools`, `--prompts`, `--resources`, `--templates`, and `--builtins` can be
-combined; several narrow to the union of those kinds. `-m N` (also `-mN`,
-`--max N`, `--max=N`) caps the results after ranking, so the best survive.
-
-`-E` (also `--regex`) treats the keyword as a regular expression, which is
-what anchors are for: no substring search can express "ends with". A pattern
-that does not compile is a usage error before any searching starts, and it
-names the pattern. Patterns fold case like everything else here, so
-`--case-sensitive` applies to them too. The other flags apply unchanged: `-E`
-narrows what matches, not how results are ranked or capped.
-
-Matching is case-insensitive unless `--case-sensitive` says otherwise. Results rank an exact name match first, then a
-name prefix, then a name substring, then a description match, and last a
-subsequence (`gvd` reaches `get_version_downloads`) so a loose match never
-buries a literal one. The search runs against the cached surface, so it
-issues no request.
-
-Under `--json` it prints an array of `{kind, name, description, score}`
-objects. A search that matched nothing exits non-zero, following grep.
+Run `help find` for every spelling and combination. The important behavior is
+the ranking: exact name, prefix, substring, description, then subsequence, so
+a loose match never buries the literal one. Search uses the cached surface and
+sends no request. JSON returns `{kind, name, description, score}` objects; no
+matches set the no-match status.
 
 A mistyped command word gets the nearest built-in, tool, or prompt name by
 edit distance:
@@ -367,28 +355,13 @@ cratesio> unalias dl
 removed dl (profile cratesio)
 ```
 
-- `alias` lists what is in effect, `alias <name>` shows one, `alias
-  <name>=<expansion>` defines, and `unalias <name>` removes.
-- Expansion is a literal substitution of the first word with whatever
-  followed the alias appended: with `dl = "get_downloads"`, `dl crate=serde`
-  runs `get_downloads crate=serde`. An expansion that itself starts with an
-  alias expands again; a cycle is reported rather than looped.
-- An expansion can end in `&`, so an alias can run its tool task-augmented.
-- An alias can make a collision convenient by expanding to the explicit
-  spelling, for example `alias w=tool wait`. An alias that expands to bare
-  `wait` remains ambiguous rather than silently choosing a namespace.
-- Scope: an alias defined while connected through a profile belongs to that
-  profile; otherwise it is global. `alias --global <name>=<expansion>` forces
-  the file-level table. A profile alias shadows a global one of the same
-  name, and `unalias` removes the definition that is actually in effect
-  (`--global` reaches past a profile alias to the global one).
-- Aliases cannot be named after a built-in, since expansion happens before
-  dispatch and the built-in would become unreachable. An alias that shadows a
-  *tool* is allowed, and says so when defined.
-- Every change is written back to the config file through `toml_edit`, so
-  comments, key order, and formatting elsewhere in the file survive. Removing
-  the last alias leaves the (now empty) table, because a comment above
-  `[aliases]` belongs to that table and would go with it.
+`help alias` carries the syntax and expansion rules. The design points worth
+remembering are scope and fidelity: definitions made through a profile belong
+to it, while `--global` reaches the shared table; profile definitions shadow
+global ones. Edits go through `toml_edit`, preserving comments, order, and
+formatting. A built-in name is reserved so an alias cannot hide the command
+needed to remove it, while a tool collision is allowed and can be made
+explicit with an expansion such as `alias w=tool wait`.
 
 ```toml
 [aliases]                       # every server
