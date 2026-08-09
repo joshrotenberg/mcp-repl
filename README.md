@@ -111,6 +111,7 @@ typed exit statuses so a failure is distinguishable from an empty result.
 | [The command set](docs/commands.md) | every built-in, completion, aliases, capture and filtering, subscriptions, elicitation, output rendering |
 | [Scripting](docs/scripting.md) | `--exec`, NDJSON, exit statuses, schema contracts |
 | [Debugging a server](docs/debugging.md) | wire tracing, `last`, `bench` |
+| [Release pipeline](docs/releases.md) | maintainer gates, native artifacts, failure and retry behavior |
 
 ## Other MCP clients
 
