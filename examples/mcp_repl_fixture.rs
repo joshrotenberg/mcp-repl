@@ -183,14 +183,63 @@ fn write_marker(name: &str, contents: impl AsRef<[u8]>) {
     }
 }
 
+fn increment_marker(name: &str) {
+    let Some(path) = env_path(name) else {
+        return;
+    };
+    let count = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        + 1;
+    write_marker(name, count.to_string());
+}
+
+fn claim_marker(name: &str) -> bool {
+    let Some(path) = env_path(name) else {
+        return false;
+    };
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => panic!("claim {}: {error}", path.display()),
+    }
+}
+
 async fn observe_subscription(request: Request, next: Next) -> Response {
-    if request
+    let method = request
         .headers()
         .get("mcp-method")
         .and_then(|value| value.to_str().ok())
-        == Some("subscriptions/listen")
-    {
-        write_marker("MCP_REPL_FIXTURE_SUBSCRIPTION_FILE", b"seen");
+        .map(str::to_string);
+    match method.as_deref() {
+        Some("subscriptions/listen") => {
+            write_marker("MCP_REPL_FIXTURE_SUBSCRIPTION_FILE", b"seen");
+        }
+        Some("resources/subscribe") => {
+            increment_marker("MCP_REPL_FIXTURE_RESOURCE_SUBSCRIPTIONS_FILE");
+        }
+        Some("tools/call") if claim_marker("MCP_REPL_FIXTURE_RECONNECT_ONCE_FILE") => {
+            let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                .await
+                .expect("read reconnect fixture request");
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("decode reconnect fixture request");
+            return axum::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {
+                    "code": -32600,
+                    "message": "Client must send notifications/initialized before making requests"
+                }
+            }))
+            .into_response();
+        }
+        _ => {}
     }
     next.run(request).await
 }

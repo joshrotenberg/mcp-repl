@@ -9,6 +9,7 @@
 //! both need it and neither owns the other.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 
 static ACTIVE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
@@ -52,6 +53,42 @@ pub fn server_supports(capabilities: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// What happened while replaying subscriptions onto a replacement client.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReplayReport {
+    pub restored: usize,
+    /// URI and sanitized-at-the-call-site error text for subscriptions the
+    /// replacement server rejected without losing the new connection.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Replay a snapshot of active URIs on a replacement connection.
+///
+/// A connection-loss error aborts the reconnect and leaves the caller's
+/// active set untouched. Ordinary per-resource errors are collected so the
+/// caller can warn and drop only those stale entries without making an
+/// otherwise healthy replacement session unusable.
+pub async fn replay<F, Fut, P>(
+    uris: Vec<String>,
+    mut request: F,
+    connection_lost: P,
+) -> Result<ReplayReport, tower_mcp::Error>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<(), tower_mcp::Error>>,
+    P: Fn(&tower_mcp::Error) -> bool,
+{
+    let mut report = ReplayReport::default();
+    for uri in uris {
+        match request(uri.clone()).await {
+            Ok(()) => report.restored += 1,
+            Err(error) if connection_lost(&error) => return Err(error),
+            Err(error) => report.failed.push((uri, error.to_string())),
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +121,40 @@ mod tests {
         assert!(!server_supports(&no));
         // A server with no resources capability at all.
         assert!(!server_supports(&serde_json::json!({ "tools": {} })));
+    }
+
+    #[tokio::test]
+    async fn replay_is_ordered_and_distinguishes_resource_errors_from_connection_loss() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        let report = replay(
+            vec!["note://a".to_string(), "note://b".to_string()],
+            move |uri| {
+                requests.lock().unwrap().push(uri.clone());
+                async move {
+                    if uri.ends_with('b') {
+                        Err(tower_mcp::Error::tool("subscription rejected"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |_| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["note://a", "note://b"]);
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "note://b");
+
+        let lost = replay(
+            vec!["note://a".to_string()],
+            |_uri| async { Err(tower_mcp::Error::SessionExpired) },
+            |_| true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(lost, tower_mcp::Error::SessionExpired));
     }
 }

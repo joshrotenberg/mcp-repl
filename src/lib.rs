@@ -2558,9 +2558,38 @@ fn http_connector(
                 )
                 .await?;
             establish_connection(&client, protocol).await?;
+            restore_resource_subscriptions(&client).await?;
             Ok(client)
         })
     })
+}
+
+/// Re-establish the resource subscriptions that belonged to the dead HTTP
+/// session before publishing its replacement. A second connection loss
+/// aborts the reconnect; a server that rejects one URI merely loses that
+/// stale local entry, so unrelated commands can still recover.
+async fn restore_resource_subscriptions(client: &McpClient) -> Result<(), tower_mcp::Error> {
+    let report = subscribe::replay(
+        subscribe::list(),
+        |uri| async move { client.subscribe_resource(&uri).await },
+        is_session_lost,
+    )
+    .await?;
+    if report.restored > 0 {
+        tracing::debug!(
+            count = report.restored,
+            "restored resource subscriptions after reconnect"
+        );
+    }
+    for (uri, error) in report.failed {
+        subscribe::remove(&uri);
+        eprintln!(
+            "warning: resource subscription {} was not restored after reconnect: {}",
+            sanitize(&uri),
+            sanitize(&error)
+        );
+    }
+    Ok(())
 }
 
 /// Load the profile config, exiting with a usage status on a bad file. A

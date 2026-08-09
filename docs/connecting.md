@@ -396,9 +396,12 @@ also replaces the lost session; final connections are sessionless.
 ```
 
 The retry is bounded to a single attempt, so a server that is really down
-fails fast with its original error rather than hanging the prompt. Task ids
-do not survive a reconnect (they belong to the session that created them), so
-`task`, `wait`, and `cancel` never trigger one.
+fails fast with its original error rather than hanging the prompt. Active
+resource subscriptions are replayed on the replacement session before the
+command is retried. If the replacement server rejects one URI, the REPL warns
+and removes only that stale entry from `subscriptions`. Task ids do not survive
+a reconnect (they belong to the session that created them), so `task`, `wait`,
+and `cancel` never trigger one.
 
 Pass `--no-reconnect` to turn this off and see session-loss errors as they
 arrive. stdio children and `--demo` are never reconnected: there, a lost

@@ -187,30 +187,46 @@ struct HttpFixture {
     child: Option<Child>,
     url: String,
     subscription_file: PathBuf,
+    resource_subscriptions_file: PathBuf,
 }
 
 impl HttpFixture {
     async fn start(fixture: &Path, temp: &TempDir) -> Self {
-        Self::start_configured(fixture, temp, None).await
+        Self::start_configured(fixture, temp, None, false).await
     }
 
     async fn start_with_bearer(fixture: &Path, temp: &TempDir, bearer: &str) -> Self {
-        Self::start_configured(fixture, temp, Some(bearer)).await
+        Self::start_configured(fixture, temp, Some(bearer), false).await
     }
 
-    async fn start_configured(fixture: &Path, temp: &TempDir, bearer: Option<&str>) -> Self {
-        let label = if bearer.is_some() {
-            "http-auth"
-        } else {
-            "http"
+    async fn start_with_reconnect(fixture: &Path, temp: &TempDir) -> Self {
+        Self::start_configured(fixture, temp, None, true).await
+    }
+
+    async fn start_configured(
+        fixture: &Path,
+        temp: &TempDir,
+        bearer: Option<&str>,
+        reconnect_once: bool,
+    ) -> Self {
+        let label = match (bearer.is_some(), reconnect_once) {
+            (true, _) => "http-auth",
+            (_, true) => "http-reconnect",
+            _ => "http",
         };
         let ready_file = temp.path().join(format!("{label}.ready"));
         let subscription_file = temp.path().join(format!("{label}.subscription"));
+        let resource_subscriptions_file =
+            temp.path().join(format!("{label}.resource-subscriptions"));
         let mut command = Command::new(fixture);
         command
             .arg("--http")
             .env("MCP_REPL_FIXTURE_READY_FILE", &ready_file)
             .env("MCP_REPL_FIXTURE_SUBSCRIPTION_FILE", &subscription_file)
+            .env(
+                "MCP_REPL_FIXTURE_RESOURCE_SUBSCRIPTIONS_FILE",
+                &resource_subscriptions_file,
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -218,12 +234,19 @@ impl HttpFixture {
         if let Some(bearer) = bearer {
             command.env("MCP_REPL_FIXTURE_EXPECT_BEARER", bearer);
         }
+        if reconnect_once {
+            command.env(
+                "MCP_REPL_FIXTURE_RECONNECT_ONCE_FILE",
+                temp.path().join("http-reconnect.triggered"),
+            );
+        }
         let child = command.spawn().expect("spawn HTTP fixture");
         let url = wait_for_file(&ready_file, "HTTP fixture readiness").await;
         Self {
             child: Some(child),
             url,
             subscription_file,
+            resource_subscriptions_file,
         }
     }
 
@@ -1856,6 +1879,40 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
 }
 
 async fn exercise_http(fixture: &Path, temp: &TempDir) {
+    let reconnecting = HttpFixture::start_with_reconnect(fixture, temp).await;
+    let restored = run_http(
+        &reconnecting.url,
+        "resource subscription reconnect",
+        &[
+            "--json",
+            "--exec",
+            "subscribe fixture://guide",
+            "--exec",
+            "add a=20 b=22",
+        ],
+    )
+    .await;
+    assert_success(&restored, "resource subscription reconnect");
+    let values = json_lines(&restored, "resource subscription reconnect");
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0]["subscribe"], "fixture://guide");
+    assert_eq!(
+        values[1].pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&reconnecting.resource_subscriptions_file)
+            .expect("read resource subscription count"),
+        "2",
+        "the active resource subscription must be sent once initially and once on reconnect"
+    );
+    assert!(
+        String::from_utf8_lossy(&restored.stderr).contains("[reconnected]"),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    reconnecting.shutdown().await;
+
     let http = HttpFixture::start(fixture, temp).await;
 
     exercise_imported_http_config(&http, temp).await;
