@@ -46,7 +46,10 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
           - target: x86_64-apple-darwin
-            os: macos-13
+            # `macos-13` was retired in December 2025. Keep this on GitHub's
+            # standard Intel runner so the archive is built and exercised on
+            # the same architecture it ships for.
+            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc

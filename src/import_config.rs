@@ -1,7 +1,7 @@
 //! Import named servers from the common JSON configuration used by MCP
 //! clients such as Claude, Cursor, and VS Code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -20,6 +20,22 @@ pub struct Selector {
 pub struct ImportedConnection {
     pub selector: Selector,
     pub connection: Connection,
+    /// Non-secret provenance needed to approve an imported HTTP connection.
+    pub http_trust: Option<ImportedHttpTrust>,
+}
+
+/// What an imported HTTP entry can forward, without any resolved values.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ImportedHttpTrust {
+    pub header_names: Vec<String>,
+    pub header_env_keys: Vec<String>,
+    pub url_env_keys: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedEntry {
+    connection: Connection,
+    http_trust: Option<ImportedHttpTrust>,
 }
 
 impl ImportedConnection {
@@ -67,7 +83,7 @@ pub fn load_with(
         .map_err(|error| format!("{}: {error}", selector.path.display()))?;
     let path = std::fs::canonicalize(&selector.path)
         .map_err(|error| format!("{}: {error}", selector.path.display()))?;
-    let connection = parse_document(&source, &path, &selector.entry, &lookup)?;
+    let resolved = parse_document(&source, &path, &selector.entry, &lookup)?;
     tracing::debug!(
         path = %path.display(),
         entry = %selector.entry,
@@ -78,7 +94,8 @@ pub fn load_with(
             path,
             entry: selector.entry,
         },
-        connection,
+        connection: resolved.connection,
+        http_trust: resolved.http_trust,
     })
 }
 
@@ -259,7 +276,7 @@ fn parse_document(
     path: &Path,
     selected: &str,
     lookup: &impl Fn(&str) -> Option<String>,
-) -> Result<Connection, String> {
+) -> Result<ResolvedEntry, String> {
     let document: Document = serde_json::from_str(source)
         .map_err(|error| format!("{}: invalid MCP JSON config: {error}", path.display()))?;
     let mut entries = document.mcp_servers;
@@ -294,7 +311,7 @@ fn resolve_entry(
     path: &Path,
     name: &str,
     lookup: &impl Fn(&str) -> Option<String>,
-) -> Result<Connection, String> {
+) -> Result<ResolvedEntry, String> {
     let workspace = workspace_folder(path);
     let declared = match (&entry.kind, &entry.transport) {
         (Some(kind), Some(transport)) => {
@@ -367,10 +384,13 @@ fn resolve_entry(
                         workspace.join(cwd)
                     }
                 });
-            Ok(Connection::Stdio {
-                command: command_and_args,
-                env,
-                cwd,
+            Ok(ResolvedEntry {
+                connection: Connection::Stdio {
+                    command: command_and_args,
+                    env,
+                    cwd,
+                },
+                http_trust: None,
             })
         }
         ImportedTransport::Http => {
@@ -387,18 +407,35 @@ fn resolve_entry(
                 .url
                 .as_deref()
                 .ok_or_else(|| format!("HTTP server {name:?} has no `url`"))?;
-            let headers = entry
+            let mut url_env_keys = BTreeSet::new();
+            let url = expand_recording(url, &workspace, lookup, &mut url_env_keys)?;
+            let mut header_env_keys = BTreeSet::new();
+            let mut headers = Vec::with_capacity(entry.headers.len());
+            for (key, value) in &entry.headers {
+                headers.push((
+                    key.clone(),
+                    expand_recording(value, &workspace, lookup, &mut header_env_keys)?,
+                ));
+            }
+            let mut header_names: Vec<String> = entry
                 .headers
-                .iter()
-                .map(|(key, value)| {
-                    expand(value, &workspace, lookup).map(|value| (key.clone(), value))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Connection::Http {
-                url: expand(url, &workspace, lookup)?,
-                bearer: None,
-                headers,
-                oauth: None,
+                .keys()
+                .map(|name| name.to_ascii_lowercase())
+                .collect();
+            header_names.sort();
+            header_names.dedup();
+            Ok(ResolvedEntry {
+                connection: Connection::Http {
+                    url,
+                    bearer: None,
+                    headers,
+                    oauth: None,
+                },
+                http_trust: Some(ImportedHttpTrust {
+                    header_names,
+                    header_env_keys: header_env_keys.into_iter().collect(),
+                    url_env_keys: url_env_keys.into_iter().collect(),
+                }),
             })
         }
     }
@@ -432,6 +469,15 @@ fn expand(
     workspace: &Path,
     lookup: &impl Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
+    expand_recording(input, workspace, lookup, &mut BTreeSet::new())
+}
+
+fn expand_recording(
+    input: &str,
+    workspace: &Path,
+    lookup: &impl Fn(&str) -> Option<String>,
+    env_keys: &mut BTreeSet<String>,
+) -> Result<String, String> {
     let mut rendered = String::new();
     let mut rest = input;
     while let Some(start) = rest.find("${") {
@@ -447,12 +493,20 @@ fn expand(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            "userHome" => lookup("HOME")
-                .or_else(|| lookup("USERPROFILE"))
-                .ok_or_else(|| {
-                    "`${userHome}` requires the HOME or USERPROFILE environment variable"
-                        .to_string()
-                })?,
+            "userHome" => {
+                if let Some(value) = lookup("HOME") {
+                    env_keys.insert("HOME".to_string());
+                    value
+                } else if let Some(value) = lookup("USERPROFILE") {
+                    env_keys.insert("USERPROFILE".to_string());
+                    value
+                } else {
+                    return Err(
+                        "`${userHome}` requires the HOME or USERPROFILE environment variable"
+                            .to_string(),
+                    );
+                }
+            }
             variable if variable.starts_with("input:") => {
                 return Err(format!(
                     "`${{{variable}}}` requires interactive client input, which mcp-repl cannot import; use an environment variable instead"
@@ -465,6 +519,7 @@ fn expand(
                         "imported config contains an empty environment substitution".to_string()
                     );
                 }
+                env_keys.insert(variable.to_string());
                 lookup(variable).ok_or_else(|| {
                     format!("imported config requires environment variable {variable:?}, but it is unset")
                 })?
@@ -614,7 +669,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolved,
+            resolved.connection,
             Connection::Stdio {
                 command: vec![
                     "/repo/bin/server".to_string(),
@@ -646,13 +701,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolved,
+            resolved.connection,
             Connection::Http {
                 url: "https://example/mcp".to_string(),
                 bearer: None,
                 headers: vec![("Authorization".to_string(), "Bearer secret".to_string())],
                 oauth: None,
             }
+        );
+        assert_eq!(
+            resolved.http_trust,
+            Some(ImportedHttpTrust {
+                header_names: vec!["authorization".to_string()],
+                header_env_keys: vec!["TOKEN".to_string()],
+                url_env_keys: vec!["MCP_URL".to_string()],
+            })
         );
     }
 
