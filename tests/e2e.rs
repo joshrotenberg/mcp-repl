@@ -1,9 +1,12 @@
 //! Black-box coverage for the published `mcp-repl` process boundary.
 
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -141,6 +144,10 @@ async fn build_fixture() -> PathBuf {
 fn repl_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-repl"));
     command.current_dir(repo_root());
+    // The suite pins the published process output. A developer's ambient
+    // tracing filter must not add framework records to those assertions;
+    // individual cases opt back in when logging is what they exercise.
+    command.env_remove("RUST_LOG");
     command
 }
 
@@ -184,8 +191,21 @@ struct HttpFixture {
 
 impl HttpFixture {
     async fn start(fixture: &Path, temp: &TempDir) -> Self {
-        let ready_file = temp.path().join("http.ready");
-        let subscription_file = temp.path().join("http.subscription");
+        Self::start_configured(fixture, temp, None).await
+    }
+
+    async fn start_with_bearer(fixture: &Path, temp: &TempDir, bearer: &str) -> Self {
+        Self::start_configured(fixture, temp, Some(bearer)).await
+    }
+
+    async fn start_configured(fixture: &Path, temp: &TempDir, bearer: Option<&str>) -> Self {
+        let label = if bearer.is_some() {
+            "http-auth"
+        } else {
+            "http"
+        };
+        let ready_file = temp.path().join(format!("{label}.ready"));
+        let subscription_file = temp.path().join(format!("{label}.subscription"));
         let mut command = Command::new(fixture);
         command
             .arg("--http")
@@ -195,6 +215,9 @@ impl HttpFixture {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        if let Some(bearer) = bearer {
+            command.env("MCP_REPL_FIXTURE_EXPECT_BEARER", bearer);
+        }
         let child = command.spawn().expect("spawn HTTP fixture");
         let url = wait_for_file(&ready_file, "HTTP fixture readiness").await;
         Self {
@@ -212,6 +235,64 @@ impl HttpFixture {
             .expect("HTTP fixture did not exit")
             .expect("wait for HTTP fixture");
     }
+}
+
+#[cfg(unix)]
+fn inherited_bearer_pipe(contents: &[u8]) -> OwnedFd {
+    let mut descriptors = [0; 2];
+    // SAFETY: `pipe` initializes both descriptors on success. Each is
+    // immediately transferred into one owning standard-library type.
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    let mut writer = unsafe { std::fs::File::from_raw_fd(descriptors[1]) };
+    writer.write_all(contents).expect("write bearer pipe");
+    drop(writer);
+    reader
+}
+
+#[cfg(unix)]
+fn inherited_bearer_file(contents: &[u8]) -> std::fs::File {
+    let mut file = tempfile::tempfile().expect("create bearer descriptor file");
+    file.write_all(contents)
+        .expect("write bearer descriptor file");
+    file.rewind().expect("rewind bearer descriptor file");
+    let descriptor = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    assert!(flags >= 0, "read bearer descriptor flags");
+    assert_eq!(
+        unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+        0,
+        "make bearer descriptor inheritable"
+    );
+    file
+}
+
+#[cfg(unix)]
+async fn assert_bearer_fd_usage_error(descriptor: i32, expected: &str, label: &str) {
+    let descriptor = descriptor.to_string();
+    let mut command = repl_command();
+    command
+        .args([
+            "--json",
+            "--bearer-fd",
+            &descriptor,
+            "--exec",
+            "tools",
+            "--http",
+            "http://127.0.0.1:9/",
+        ])
+        .env_remove("MCP_BEARER");
+    let output = run(command, label, CASE_TIMEOUT).await;
+    assert_status(&output, 2, label);
+    let values = json_lines(&output, label);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["kind"], "usage");
+    let error = values[0]["error"].as_str().unwrap();
+    assert!(error.contains(expected), "{label}: {error}");
+    assert!(
+        !error.contains("HTTP request failed"),
+        "{label} connected: {error}"
+    );
 }
 
 impl Drop for HttpFixture {
@@ -1584,6 +1665,131 @@ async fn exercise_http(fixture: &Path, temp: &TempDir) {
     http.shutdown().await;
 }
 
+#[cfg(unix)]
+async fn exercise_bearer_fd(fixture: &Path, temp: &TempDir) {
+    const SECRET: &str = "fd-only-secret-88";
+    let http = HttpFixture::start_with_bearer(fixture, temp, SECRET).await;
+    let config = temp.path().join("bearer-fd.toml");
+    std::fs::write(&config, "").expect("write empty bearer-fd config");
+    let config = config.display().to_string();
+
+    // `libc::pipe` leaves the read side inheritable. The secret is pipe data,
+    // never an argument or an environment value in the mcp-repl process.
+    let inherited = inherited_bearer_pipe(format!("{SECRET}\r\n").as_bytes());
+    let descriptor = inherited.as_raw_fd().to_string();
+    let mut command = repl_command();
+    command
+        .args([
+            "--json",
+            "--trace",
+            "--no-history",
+            "--config",
+            &config,
+            "--bearer-fd",
+            &descriptor,
+            "--exec",
+            "tools",
+            "--http",
+            &http.url,
+        ])
+        .env_remove("MCP_BEARER")
+        .env("RUST_LOG", "debug");
+    let output = run(command, "bearer from inherited descriptor", CASE_TIMEOUT).await;
+    drop(inherited);
+    assert_success(&output, "bearer from inherited descriptor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains(SECRET), "secret reached stdout: {stdout}");
+    assert!(!stderr.contains(SECRET), "secret reached stderr: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "",
+        "the ephemeral bearer must not be saved to the profile file"
+    );
+    http.shutdown().await;
+
+    // CLI conflicts are rejected before reading the descriptor, and no
+    // network connection is attempted when another source is present.
+    let inherited = inherited_bearer_pipe(b"fd-secret");
+    let descriptor = inherited.as_raw_fd().to_string();
+    let mut conflict = repl_command();
+    conflict.args([
+        "--json",
+        "--bearer-fd",
+        &descriptor,
+        "--bearer",
+        "other-secret",
+        "--exec",
+        "tools",
+        "--http",
+        "http://127.0.0.1:9/",
+    ]);
+    let conflict = run(conflict, "conflicting bearer sources", CASE_TIMEOUT).await;
+    drop(inherited);
+    assert_status(&conflict, 2, "conflicting bearer sources");
+    let values = json_lines(&conflict, "conflicting bearer sources");
+    assert_eq!(values[0]["kind"], "usage");
+    let error = values[0]["error"].as_str().unwrap();
+    assert!(error.contains("--bearer-fd") && error.contains("--bearer"));
+    assert!(!error.contains("fd-secret") && !error.contains("other-secret"));
+
+    // Every malformed descriptor shape is a local usage failure. Regular
+    // files keep the oversized case deterministic even on systems whose pipe
+    // buffer is smaller than the test input.
+    assert_bearer_fd_usage_error(0, "reserved", "stdio-reserved bearer descriptor").await;
+    assert_bearer_fd_usage_error(i32::MAX, "not open", "closed bearer descriptor").await;
+    let invalid_utf8 = inherited_bearer_file(&[0xff, 0xfe]);
+    assert_bearer_fd_usage_error(
+        invalid_utf8.as_raw_fd(),
+        "UTF-8",
+        "non-UTF-8 bearer descriptor",
+    )
+    .await;
+    drop(invalid_utf8);
+    let oversized = inherited_bearer_file(&vec![b'x'; 16 * 1024 + 1]);
+    assert_bearer_fd_usage_error(
+        oversized.as_raw_fd(),
+        "input limit",
+        "oversized bearer descriptor",
+    )
+    .await;
+    drop(oversized);
+
+    // A native bearer_env declaration is a conflict even when it is unset:
+    // resolution must not try to load a credential that cannot be selected.
+    let profile = temp.path().join("bearer-fd-profile.toml");
+    std::fs::write(
+        &profile,
+        "[servers.secure]\nurl = \"http://127.0.0.1:9/\"\nbearer_env = \"PROFILE_TOKEN\"\n",
+    )
+    .unwrap();
+    let inherited = inherited_bearer_pipe(b"fd-secret");
+    let descriptor = inherited.as_raw_fd().to_string();
+    let profile = profile.display().to_string();
+    let mut profile_conflict = repl_command();
+    profile_conflict
+        .args([
+            "--json",
+            "--config",
+            &profile,
+            "--bearer-fd",
+            &descriptor,
+            "--exec",
+            "tools",
+            "--server",
+            "secure",
+        ])
+        .env_remove("PROFILE_TOKEN")
+        .env_remove("MCP_BEARER");
+    let profile_conflict = run(profile_conflict, "profile bearer conflict", CASE_TIMEOUT).await;
+    drop(inherited);
+    assert_status(&profile_conflict, 2, "profile bearer conflict");
+    let values = json_lines(&profile_conflict, "profile bearer conflict");
+    let error = values[0]["error"].as_str().unwrap();
+    assert!(error.contains("profile `bearer_env`"), "{error}");
+    assert!(!error.contains("fd-secret"));
+}
+
 /// The generators run before anything connects, so they need no server, no
 /// config file, and no terminal. That is the property a packaging script
 /// depends on, and it only holds at the process boundary.
@@ -1655,6 +1861,8 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;
+        #[cfg(unix)]
+        exercise_bearer_fd(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;
     })
     .await

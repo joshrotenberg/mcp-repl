@@ -1553,6 +1553,7 @@ dependencies = [
  "crossterm",
  "getrandom 0.4.3",
  "keyring",
+ "libc",
  "nu-ansi-term",
  "reedline",
  "regex",

@@ -41,6 +41,7 @@
 //! details so consumers do not accidentally depend on terminal behavior.
 
 mod alias;
+mod bearer_fd;
 mod bench;
 mod command;
 pub mod config;
@@ -204,10 +205,16 @@ struct Args {
 
     /// Bearer token for an authenticated `--http` server (sets
     /// `Authorization: Bearer <token>`). Falls back to the `MCP_BEARER`
-    /// environment variable, which is preferred since a command-line token is
-    /// visible in `ps` and shell history.
+    /// environment variable, which is safer than argv; on Unix, --bearer-fd
+    /// also avoids exporting the token in the startup environment.
     #[arg(long)]
     bearer: Option<String>,
+
+    /// Read an HTTP bearer token from this inherited file descriptor, then
+    /// close it before connecting. Unix only. Conflicts with every other
+    /// bearer, Authorization header, and OAuth credential source.
+    #[arg(long, value_name = "FD")]
+    bearer_fd: Option<i32>,
 
     /// Extra header for an authenticated `--http` server, as `Name: Value`
     /// (repeatable). Split on the first colon.
@@ -1710,6 +1717,98 @@ fn build_http_config_with_env(
     Ok(config)
 }
 
+fn raw_header_is_authorization(header: &str) -> bool {
+    header
+        .split_once(':')
+        .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+}
+
+fn selected_header_is_authorization((name, _): &(String, String)) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+}
+
+fn bearer_fd_conflict_result(conflicts: Vec<&'static str>) -> Result<(), String> {
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "--bearer-fd cannot be combined with other authorization sources: {}. Remove the other source instead of relying on credential precedence",
+        conflicts.join(", ")
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_bearer_fd_exclusive(
+    enabled: bool,
+    cli_bearer: bool,
+    env_bearer: bool,
+    cli_headers: &[String],
+    selected_bearer: bool,
+    selected_headers: &[(String, String)],
+    cli_oauth: bool,
+    selected_oauth: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    let mut conflicts = Vec::new();
+    if cli_bearer {
+        conflicts.push("--bearer");
+    }
+    if env_bearer {
+        conflicts.push("MCP_BEARER");
+    }
+    if selected_bearer {
+        conflicts.push("profile `bearer`/`bearer_env`");
+    }
+    if cli_headers
+        .iter()
+        .any(|header| raw_header_is_authorization(header))
+    {
+        conflicts.push("--header Authorization");
+    }
+    if selected_headers
+        .iter()
+        .any(selected_header_is_authorization)
+    {
+        conflicts.push("profile/import Authorization header");
+    }
+    if cli_oauth {
+        conflicts.push("--oauth");
+    }
+    if selected_oauth {
+        conflicts.push("profile OAuth");
+    }
+    bearer_fd_conflict_result(conflicts)
+}
+
+fn validate_profile_bearer_fd_exclusive(
+    enabled: bool,
+    profile: &config::Profile,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    let mut conflicts = Vec::new();
+    if profile.bearer.is_some() {
+        conflicts.push("profile `bearer`");
+    }
+    if profile.bearer_env.is_some() {
+        conflicts.push("profile `bearer_env`");
+    }
+    if profile.oauth.is_some() {
+        conflicts.push("profile OAuth");
+    }
+    if profile
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    {
+        conflicts.push("profile Authorization header");
+    }
+    bearer_fd_conflict_result(conflicts)
+}
+
 fn selected_oauth_profile(
     cli_oauth: Option<&str>,
     profile_oauth: Option<&str>,
@@ -1717,11 +1816,9 @@ fn selected_oauth_profile(
     cli_headers: &[String],
 ) -> Option<String> {
     let explicit_authorization = cli_bearer
-        || cli_headers.iter().any(|header| {
-            header
-                .split_once(':')
-                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
-        });
+        || cli_headers
+            .iter()
+            .any(|header| raw_header_is_authorization(header));
     (!explicit_authorization)
         .then(|| cli_oauth.or(profile_oauth).map(str::to_string))
         .flatten()
@@ -2461,13 +2558,14 @@ async fn handle_oauth_profile_action(
         || !args.exec.is_empty()
         || args.list_servers
         || args.bearer.is_some()
+        || args.bearer_fd.is_some()
         || !args.headers.is_empty()
         || args.oauth.is_some()
     {
         exit_with_error(
             ExitStatus::Usage,
             "--login/--logout are standalone credential operations; do not combine them with \
-             a command, --demo, --exec, --list-servers, --bearer, --header, or --oauth \
+             a command, --demo, --exec, --list-servers, --bearer, --bearer-fd, --header, or --oauth \
              (--json is allowed, and reports what was created)",
         );
     }
@@ -2770,7 +2868,11 @@ fn print_servers(config: &config::Config) {
 /// bare single positional that matches a configured profile. A positional that
 /// matches nothing stays a stdio command, so spawning a server by bare name
 /// still works when no profile shadows it.
-fn resolve_profile(args: &Args, config: &config::Config) -> Option<(String, config::Connection)> {
+fn resolve_profile(
+    args: &Args,
+    config: &config::Config,
+    bearer_fd: bool,
+) -> Option<(String, config::Connection)> {
     let name = args
         .server
         .clone()
@@ -2784,6 +2886,8 @@ fn resolve_profile(args: &Args, config: &config::Config) -> Option<(String, conf
             exit_with_error(ExitStatus::Usage, &e);
         }
     };
+    validate_profile_bearer_fd_exclusive(bearer_fd, profile)
+        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
     if profile.bearer.is_some() {
         eprintln!(
             "warning: profile {name:?} stores a literal `bearer` token; prefer \
@@ -2862,8 +2966,7 @@ fn log_level_style(level: LogLevel) -> Style {
 /// The binary target intentionally delegates straight here so the application
 /// lifecycle remains testable and the package can be extracted without moving
 /// its implementation back into a monolithic executable.
-#[tokio::main]
-pub async fn run_cli() {
+pub fn run_cli() {
     // Parsed first: the subscriber has to know what --color decided, and
     // building it beforehand meant `--color never` still emitted escape
     // sequences into a stderr a script was told would be plain.
@@ -2886,7 +2989,36 @@ pub async fn run_cli() {
     wire::init(args.trace);
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
 
-    if let Err(error) = run(args).await {
+    // CLI and ambient sources need no config or runtime to identify. Reject
+    // them before reading so a conflicting pipe cannot make a doomed command
+    // wait for EOF, and an unknown OAuth profile cannot obscure the conflict.
+    validate_bearer_fd_exclusive(
+        args.bearer_fd.is_some(),
+        args.bearer.is_some(),
+        std::env::var_os("MCP_BEARER").is_some(),
+        &args.headers,
+        false,
+        &[],
+        args.oauth.is_some(),
+        false,
+    )
+    .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+
+    // Consume inherited secret input before Tokio opens any runtime file
+    // descriptors. Otherwise a closed descriptor number supplied by the
+    // caller could be reused by the runtime before we validate it.
+    let bearer_from_fd = args
+        .bearer_fd
+        .map(bearer_fd::read)
+        .transpose()
+        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build Tokio runtime");
+
+    if let Err(error) = runtime.block_on(run(args, bearer_from_fd)) {
         exit_with_error(
             ExitStatus::from_mcp_error(&error),
             collapse_repeated_label(&error.to_string()),
@@ -2894,7 +3026,7 @@ pub async fn run_cli() {
     }
 }
 
-async fn run(args: Args) -> tower_mcp::Result<()> {
+async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()> {
     // Server profiles are read up front: both --list-servers and profile
     // resolution need them before anything connects.
     let config_file = config::config_path(args.config.as_deref()).map(|(path, _)| path);
@@ -2930,6 +3062,12 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     if handle_oauth_profile_action(&args, &profiles, config_file.as_deref()).await {
         return Ok(());
     }
+    if bearer_from_fd.is_some() && (args.list_servers || args.scan) {
+        exit_with_error(
+            ExitStatus::Usage,
+            "--bearer-fd requires an HTTP connection and cannot be used while only listing servers",
+        );
+    }
     if args.list_servers {
         print_servers(&profiles);
         return Ok(());
@@ -2942,7 +3080,7 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
             .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
     let imported = resolve_import(&args);
     let profile = if imported.is_none() {
-        resolve_profile(&args, &profiles)
+        resolve_profile(&args, &profiles, bearer_from_fd.is_some())
     } else {
         None
     };
@@ -3079,6 +3217,12 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
     };
 
     let over_http = matches!(connection, Some(config::Connection::Http { .. }));
+    if !over_http && bearer_from_fd.is_some() {
+        exit_with_error(
+            ExitStatus::Usage,
+            "--bearer-fd applies only to HTTP servers and cannot be ignored safely",
+        );
+    }
     if !over_http && (args.bearer.is_some() || !args.headers.is_empty()) {
         eprintln!("warning: --bearer/--header apply only to HTTP servers; ignoring them here");
     }
@@ -3130,19 +3274,30 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                 headers,
                 oauth: profile_oauth,
             }) => {
+                validate_bearer_fd_exclusive(
+                    bearer_from_fd.is_some(),
+                    false,
+                    false,
+                    &[],
+                    bearer.is_some(),
+                    &headers,
+                    false,
+                    profile_oauth.is_some(),
+                )
+                .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+                let explicit_bearer = bearer_from_fd.or_else(|| args.bearer.clone());
                 let oauth_name = selected_oauth_profile(
                     args.oauth.as_deref(),
                     profile_oauth.as_deref(),
-                    args.bearer.is_some(),
+                    explicit_bearer.is_some(),
                     &args.headers,
                 );
                 let cli_authorization = oauth_name.is_none()
-                    && (args.bearer.is_some()
-                        || args.headers.iter().any(|header| {
-                            header.split_once(':').is_some_and(|(name, _)| {
-                                name.trim().eq_ignore_ascii_case("authorization")
-                            })
-                        }));
+                    && (explicit_bearer.is_some()
+                        || args
+                            .headers
+                            .iter()
+                            .any(|header| raw_header_is_authorization(header)));
                 if cli_authorization && (args.oauth.is_some() || profile_oauth.is_some()) && !quiet
                 {
                     eprintln!(
@@ -3159,14 +3314,14 @@ async fn run(args: Args) -> tower_mcp::Result<()> {
                 };
                 let config = if oauth_name.is_some() {
                     build_http_config_with_env(
-                        args.bearer.clone(),
+                        explicit_bearer,
                         &args.headers,
                         None,
                         &profile_headers,
                         None,
                     )
                 } else {
-                    build_http_config(args.bearer.clone(), &args.headers, bearer, &profile_headers)
+                    build_http_config(explicit_bearer, &args.headers, bearer, &profile_headers)
                 }
                 .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
                 let oauth = if let Some(name) = oauth_name {
@@ -6034,6 +6189,51 @@ mod tests {
     }
 
     #[test]
+    fn bearer_fd_rejects_every_competing_authorization_source() {
+        let cli_headers = vec!["Authorization: Basic cli".to_string()];
+        let selected_headers = vec![("authorization".to_string(), "Basic profile".to_string())];
+        let error = validate_bearer_fd_exclusive(
+            true,
+            true,
+            true,
+            &cli_headers,
+            true,
+            &selected_headers,
+            true,
+            true,
+        )
+        .unwrap_err();
+        for source in [
+            "--bearer",
+            "MCP_BEARER",
+            "profile `bearer`/`bearer_env`",
+            "--header Authorization",
+            "profile/import Authorization header",
+            "--oauth",
+            "profile OAuth",
+        ] {
+            assert!(error.contains(source), "missing {source:?} from {error:?}");
+        }
+        assert!(
+            validate_bearer_fd_exclusive(true, false, false, &[], false, &[], false, false).is_ok()
+        );
+        // Existing auth precedence is untouched when the new input is absent.
+        assert!(
+            validate_bearer_fd_exclusive(
+                false,
+                true,
+                true,
+                &cli_headers,
+                true,
+                &selected_headers,
+                true,
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn build_http_config_rejects_header_without_colon() {
         let err = build_http_config(Some("tok".into()), &["nope".into()], None, &[]).unwrap_err();
         assert!(
@@ -6101,6 +6301,7 @@ mod tests {
         for flag in [
             "--protocol",
             "--http",
+            "--bearer-fd",
             "--elicitation",
             "--timeout",
             "--man",

@@ -78,12 +78,31 @@ Attach credentials to an `--http` connection:
 MCP_BEARER="$TOKEN" mcp-repl --http https://internal.example/mcp
 mcp-repl --http https://internal.example/mcp --bearer "$TOKEN"
 
+# Unix: inherit an ephemeral pipe as fd 3, then restore stdin for the REPL.
+token-helper | mcp-repl --bearer-fd 3 3<&0 </dev/tty \
+  --http https://internal.example/mcp
+
 # Arbitrary headers, repeatable (split on the first colon):
 mcp-repl --http https://internal.example/mcp --header "X-Api-Key: abc"
 ```
 
+`--bearer-fd` is the most constrained static-credential form. It is Unix-only,
+owns and closes the inherited descriptor before the async runtime or network
+connection starts, removes one trailing LF or CRLF, and limits input to 16384
+bytes. Empty, non-UTF-8, non-ASCII, multiline, closed, and stdio-reserved
+descriptors are usage errors. The token is never written to history, profiles,
+debug output, or error messages.
+
+It also fails closed when any other authorization source is present:
+`--bearer`, `MCP_BEARER`, a profile `bearer`/`bearer_env`, an Authorization
+header, or OAuth. Unset the competing source rather than relying on the normal
+static-auth precedence rules. On non-Unix platforms, use `MCP_BEARER` or a
+secure OAuth profile.
+
 `--bearer` and `--header` apply only to HTTP connections; they are ignored
-(with a warning) for the demo and stdio-child transports.
+(with a warning) for the demo and stdio-child transports. `--bearer-fd` is
+rejected instead of ignored, because silently discarding secret input is not
+safe.
 
 For an MCP server using OAuth authorization-code + PKCE, create a named login
 without opening an MCP session:

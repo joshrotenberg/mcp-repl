@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::extract::Request;
+use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
@@ -158,6 +159,27 @@ async fn observe_subscription(request: Request, next: Next) -> Response {
         == Some("subscriptions/listen")
     {
         write_marker("MCP_REPL_FIXTURE_SUBSCRIPTION_FILE", b"seen");
+    }
+    next.run(request).await
+}
+
+/// Require an exact bearer only in the authentication fixture process.
+///
+/// The expected value is never rendered: the test process supplies it to the
+/// server side solely so a successful MCP handshake proves that the client
+/// transported the descriptor's bytes in the Authorization header.
+async fn require_bearer(request: Request, next: Next) -> Response {
+    let Some(expected) = std::env::var_os("MCP_REPL_FIXTURE_EXPECT_BEARER") else {
+        return next.run(request).await;
+    };
+    let expected = format!("Bearer {}", expected.to_string_lossy());
+    let accepted = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected);
+    if !accepted {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer").into_response();
     }
     next.run(request).await
 }
@@ -316,6 +338,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             .protocol_support(protocol_support())
             .disable_origin_validation()
             .into_router()
+            .layer(axum::middleware::from_fn(require_bearer))
             .layer(axum::middleware::from_fn(observe_subscription));
         axum::serve(listener, app).await?;
     } else {
