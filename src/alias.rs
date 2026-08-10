@@ -290,9 +290,10 @@ fn validate(name: &str, expansion: &str) -> Result<(), String> {
     if name.contains('=') {
         return Err(format!("alias name `{name}` cannot contain `=`"));
     }
-    if let Some((builtin, _)) = BUILTINS.iter().find(|(b, _)| *b == name) {
+    if let Some(builtin) = BUILTINS.get(name) {
         return Err(format!(
-            "`{builtin}` is a built-in command, so an alias by that name would hide it"
+            "`{}` is a built-in command, so an alias by that name would hide it",
+            builtin.name
         ));
     }
     if expansion.trim().is_empty() {
