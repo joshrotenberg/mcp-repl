@@ -88,6 +88,11 @@ jobs:
           shellcheck install.sh scripts/*.sh
           sh -n install.sh
           for script in scripts/*.sh; do bash -n "$script"; done
+      - name: Release guard behavior
+        # Syntax checks cannot tell whether a guard reports the right thing,
+        # and these only run while a release is being published. This drives
+        # them against a stubbed `gh`.
+        run: ./scripts/test-release-guards.sh
 
   windows-directories:
     name: Windows directories

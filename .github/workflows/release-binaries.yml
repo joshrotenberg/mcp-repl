@@ -35,6 +35,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # A plain checkout: this job needs scripts/publish-release.sh, and a
+      # clever partial one is a new way for a release to fail at the moment
+      # it is being published.
+      - uses: actions/checkout@v7
+
       - name: Download every native package
         uses: actions/download-artifact@v7
         with:
@@ -46,67 +51,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # This job downloads artifacts and talks to the API; it never needs
-          # the source, so it does not check out. Without a checkout there is
-          # no git remote for `gh` to infer the repository from, and every
-          # `gh release` call below fails with "not a git repository" before
-          # it can say anything about the release.
+          # Explicit rather than inferred from the checkout's git remote, so
+          # the script does not depend on where it happens to be run from.
+          # Its absence is what left v0.3.0 stuck as a draft.
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-
-          # Asking and answering are different failures. A command
-          # substitution that fails inside `[[ ]]` does not end the script
-          # even under `set -e`, so a `gh` error used to arrive here as an
-          # empty string and get reported as a claim about the release.
-          if ! draft_state=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
-            echo "Could not read release $RELEASE_TAG; see the gh error above" >&2
-            exit 1
-          fi
-          if [[ "$draft_state" != true ]]; then
-            echo "Release $RELEASE_TAG is already published; refusing to re-attach assets" >&2
-            exit 1
-          fi
-
-          targets=(
-            x86_64-unknown-linux-gnu
-            aarch64-unknown-linux-gnu
-            x86_64-apple-darwin
-            aarch64-apple-darwin
-            x86_64-pc-windows-msvc
-          )
-          assets=()
-          for target in "${targets[@]}"; do
-            extension=tar.gz
-            [[ "$target" == x86_64-pc-windows-msvc ]] && extension=zip
-            archive="dist/mcp-repl-${RELEASE_TAG}-${target}.${extension}"
-            # A bare test would exit through `set -e` and say nothing at all,
-            # leaving a green-looking log ending in a bare failure.
-            for required in "$archive" "$archive.sha256"; do
-              if [[ ! -f "$required" ]]; then
-                echo "Missing $required; the $target job produced no complete package" >&2
-                exit 1
-              fi
-            done
-            assets+=("$archive" "$archive.sha256")
-          done
-
-          file_count=$(find dist -type f | wc -l | tr -d ' ')
-          if [[ "$file_count" != 10 ]]; then
-            # Naming them turns "found 11" into something actionable, since
-            # the extra or missing file is the whole question.
-            echo "Expected exactly 10 release files, found $file_count:" >&2
-            find dist -type f | sort >&2
-            exit 1
-          fi
-
-          (
-            cd dist
-            sha256sum --check --strict ./*.sha256
-          )
-
-          # If an upload fails, the release stays private and a rerun safely
-          # replaces any assets that reached the draft before the failure.
-          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+        run: ./scripts/publish-release.sh "${{ inputs.tag }}" dist
