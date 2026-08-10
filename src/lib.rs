@@ -7755,10 +7755,7 @@ world",
         // Every routable name is a real built-in, so the guard cannot
         // advertise a command that does not exist.
         for name in ROUTABLE_BUILTINS {
-            assert!(
-                BUILTINS.contains(name),
-                "{name} is not a built-in"
-            );
+            assert!(BUILTINS.contains(name), "{name} is not a built-in");
         }
     }
 
