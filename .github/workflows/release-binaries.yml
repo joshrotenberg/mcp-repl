@@ -56,8 +56,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ $(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft) != true ]]; then
-            echo "Release $RELEASE_TAG must exist and remain a draft" >&2
+          # Asking and answering are different failures. A command
+          # substitution that fails inside `[[ ]]` does not end the script
+          # even under `set -e`, so a `gh` error used to arrive here as an
+          # empty string and get reported as a claim about the release.
+          if ! draft_state=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
+            echo "Could not read release $RELEASE_TAG; see the gh error above" >&2
+            exit 1
+          fi
+          if [[ "$draft_state" != true ]]; then
+            echo "Release $RELEASE_TAG is already published; refusing to re-attach assets" >&2
             exit 1
           fi
 
@@ -73,13 +81,23 @@ jobs:
             extension=tar.gz
             [[ "$target" == x86_64-pc-windows-msvc ]] && extension=zip
             archive="dist/mcp-repl-${RELEASE_TAG}-${target}.${extension}"
-            [[ -f "$archive" && -f "$archive.sha256" ]]
+            # A bare test would exit through `set -e` and say nothing at all,
+            # leaving a green-looking log ending in a bare failure.
+            for required in "$archive" "$archive.sha256"; do
+              if [[ ! -f "$required" ]]; then
+                echo "Missing $required; the $target job produced no complete package" >&2
+                exit 1
+              fi
+            done
             assets+=("$archive" "$archive.sha256")
           done
 
           file_count=$(find dist -type f | wc -l | tr -d ' ')
           if [[ "$file_count" != 10 ]]; then
-            echo "Expected exactly 10 release files, found $file_count" >&2
+            # Naming them turns "found 11" into something actionable, since
+            # the extra or missing file is the whole question.
+            echo "Expected exactly 10 release files, found $file_count:" >&2
+            find dist -type f | sort >&2
             exit 1
           fi
 
