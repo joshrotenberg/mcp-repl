@@ -46,6 +46,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job downloads artifacts and talks to the API; it never needs
+          # the source, so it does not check out. Without a checkout there is
+          # no git remote for `gh` to infer the repository from, and every
+          # `gh release` call below fails with "not a git repository" before
+          # it can say anything about the release.
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
