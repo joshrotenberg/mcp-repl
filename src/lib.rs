@@ -4218,6 +4218,12 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         )
     };
 
+    // Installed before the first command runs, for the reason in
+    // `Interrupts`. Everything above this point is connection setup, where an
+    // interrupt still ends the process outright: there is no command to
+    // abandon yet.
+    let mut interrupts = Interrupts::arm();
+
     // One-shot: run each --exec command in order, then exit non-zero if any
     // errored. No editor, no event loop.
     if one_shot {
@@ -4230,6 +4236,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 &jobs,
                 &schema_contracts,
                 &connect_runtime,
+                &mut interrupts,
                 cmd.trim(),
             )
             .await
@@ -4316,6 +4323,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                     &jobs,
                     &schema_contracts,
                     &connect_runtime,
+                    &mut interrupts,
                     line.trim(),
                 )
                 .await;
@@ -4340,18 +4348,64 @@ enum Ran {
     Cancelled,
 }
 
-/// Run one command, abandoning it if the operator interrupts.
+/// The interrupt listener, installed once and reused by every command.
 ///
-/// Ctrl-C at the prompt never reaches here: reedline holds the terminal in
-/// raw mode and takes the keypress itself. It only arrives while a command
-/// owns the terminal, which is exactly when there is something to abandon.
-/// Installing a handler at all is what keeps SIGINT from killing the process
-/// and skipping session shutdown.
+/// A `tokio::signal::ctrl_c()` future installs the handler only when it is
+/// first polled, so building one inside the per-command `select!` left a
+/// window: the command wrote its request to the wire before it yielded, and
+/// until it did, SIGINT still had its default disposition. A signal that
+/// landed in there killed the process rather than cancelling the call, which
+/// cost the operator the exit status, the shutdown, and the
+/// `notifications/cancelled` the server needed. Both platforms install the
+/// handler when the listener is constructed, so constructing it before the
+/// first command closes the window.
 ///
-/// Dropping the command future is the cancellation: the request is no longer
-/// awaited and the REPL takes the next line. The server is not told to stop
-/// (see the note in the module docs), so a tool with side effects may still
-/// be running on the other end.
+/// Windows has no SIGINT; the console's Ctrl-C event is the same thing for
+/// this purpose.
+struct Interrupts {
+    #[cfg(unix)]
+    listener: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    listener: tokio::signal::windows::CtrlC,
+}
+
+impl Interrupts {
+    /// Install the handler. Runs before the first command.
+    fn arm() -> Self {
+        #[cfg(unix)]
+        let listener = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("install the SIGINT handler");
+        #[cfg(not(unix))]
+        let listener = tokio::signal::windows::ctrl_c().expect("install the Ctrl-C handler");
+        Self { listener }
+    }
+
+    /// The next interrupt.
+    ///
+    /// The `None` never arrives in practice. Reporting it as one keeps a
+    /// listener that somehow ended from being read as a cancellation the
+    /// operator never asked for: the `select!` branch drops out instead.
+    async fn recv(&mut self) -> Option<()> {
+        self.listener.recv().await
+    }
+
+    /// Forget an interrupt that arrived with no command running.
+    ///
+    /// The handler is installed for the whole session now, so a signal sent
+    /// between commands stays pending instead of reaching a `select!`. An
+    /// interrupt cancels the command that is running, and with nothing to
+    /// cancel there is nothing to carry forward: delivering it to the next
+    /// command would abandon a line the operator typed afterwards. This is
+    /// also what absorbs the extra presses when Ctrl-C is hit repeatedly on
+    /// one slow call.
+    ///
+    /// Reports whether there was one to forget.
+    fn discard_pending(&mut self) -> bool {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        self.listener.poll_recv(&mut context).is_ready()
+    }
+}
+
 /// The tool a cancelled line was calling, when it could have been a task.
 ///
 /// Only for the hint after an interrupt. A line that already ends in `&` is
@@ -4379,6 +4433,19 @@ fn backgroundable_tool(surface: &Arc<RwLock<Surface>>, line: &str) -> Option<Str
         .then(|| tool.name.clone())
 }
 
+/// Run one command, abandoning it if the operator interrupts.
+///
+/// Ctrl-C at the prompt never reaches here: reedline holds the terminal in
+/// raw mode and takes the keypress itself. It only arrives while a command
+/// owns the terminal, which is exactly when there is something to abandon.
+/// Installing a handler at all is what keeps SIGINT from killing the process
+/// and skipping session shutdown.
+///
+/// Dropping the command future is the cancellation: the request is no longer
+/// awaited and the REPL takes the next line. The server is not told to stop
+/// (see the note in the module docs), so a tool with side effects may still
+/// be running on the other end.
+#[allow(clippy::too_many_arguments)]
 async fn run_cancellable(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
@@ -4386,8 +4453,10 @@ async fn run_cancellable(
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
+    interrupts: &mut Interrupts,
     line: &str,
 ) -> Ran {
+    interrupts.discard_pending();
     tokio::select! {
         biased;
         quit = handle_line(
@@ -4401,7 +4470,7 @@ async fn run_cancellable(
         ) => {
             Ran::Completed(quit)
         }
-        _ = tokio::signal::ctrl_c() => {
+        Some(()) = interrupts.recv() => {
             note_error(ExitStatus::Cancelled);
             if json_output() {
                 print_json(&error_json(ExitStatus::Cancelled, "cancelled"));
@@ -6779,6 +6848,57 @@ mod tests {
         // Nothing the server offers by that name.
         assert_eq!(backgroundable_tool(&surface, "nope"), None);
         assert_eq!(backgroundable_tool(&surface, ""), None);
+    }
+
+    /// An interrupt survives landing before anything polls for it, and one
+    /// sent with no command running does not survive at all.
+    ///
+    /// The first half is what arming the listener up front buys. A command
+    /// that has already written its request to the wire has not yielded yet,
+    /// so the `select!` has never polled its interrupt branch, and a handler
+    /// installed on first poll is not installed at all yet. Regress that and
+    /// the signal raised here finds SIGINT at its default disposition and
+    /// takes the test process down rather than failing an assertion.
+    ///
+    /// Both halves live in one test because the signal reaches every armed
+    /// listener in the process: split in two, they would run in parallel and
+    /// hand each other interrupts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupt_is_armed_up_front_and_never_carried_forward() {
+        let mut interrupts = Interrupts::arm();
+        // `raise` targets this process, and the handler for the signal it
+        // sends was installed on the line above.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");
+        tokio::time::timeout(Duration::from_secs(5), interrupts.recv())
+            .await
+            .expect("an interrupt raised before the first poll is delivered")
+            .expect("the listener outlives the interrupt");
+
+        // Nothing is running now, so this one belongs to no command. Carrying
+        // it forward would abandon a line the operator typed after
+        // interrupting, and would make the second Ctrl-C on one slow call
+        // cancel whatever came next.
+        assert_eq!(
+            unsafe { libc::raise(libc::SIGINT) },
+            0,
+            "raise SIGINT again"
+        );
+        // Delivery completes on a later runtime tick, so wait for the signal
+        // to land instead of assuming it already has.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !interrupts.discard_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the raised interrupt lands");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), interrupts.recv())
+                .await
+                .is_err(),
+            "a discarded interrupt must not cancel the next command"
+        );
     }
 
     #[test]
