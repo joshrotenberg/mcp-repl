@@ -29,7 +29,15 @@ binaries.
 
 The release target matrix lives only in
 `.github/workflows/release-build.yml`; both the PR rehearsal and publication
-call it. Packaging logic likewise lives only in `scripts/package-release.sh`.
+call it. Packaging logic likewise lives only in `scripts/package-release.sh`,
+and the verification and publication step in `scripts/publish-release.sh`.
+
+Those guards decide whether a release becomes public and otherwise run only
+while one is being cut, so `scripts/test-release-guards.sh` drives them
+against a stubbed `gh`: an unreachable API, an already published release, a
+missing archive or checksum, an unexpected extra file, a checksum that does
+not verify, and the complete set that should publish. CI runs it in the
+workflow-lint job.
 
 ## Failure and retry behavior
 
