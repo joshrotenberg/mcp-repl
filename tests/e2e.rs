@@ -1943,6 +1943,10 @@ async fn exercise_cancellation() {
     // rather than on a timer: a loaded runner can spend longer than that
     // getting the process up and connected, and a signal that arrives before
     // the call is in flight would test nothing.
+    //
+    // Wait for the call frame, not for the tool's name: the name is already
+    // on the wire in the `tools/list` response fetched at connect, so waiting
+    // on it released the signal while the REPL was still setting up.
     let mut trace = String::new();
     tokio::time::timeout(CASE_TIMEOUT, async {
         let mut chunk = [0u8; 4096];
@@ -1952,7 +1956,7 @@ async fn exercise_cancellation() {
                 break;
             }
             trace.push_str(&String::from_utf8_lossy(&chunk[..read]));
-            if trace.contains("\"slow_add\"") {
+            if trace.contains("\"method\": \"tools/call\"") {
                 break;
             }
         }

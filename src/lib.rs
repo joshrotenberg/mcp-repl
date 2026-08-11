@@ -4169,6 +4169,12 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         )
     };
 
+    // Installed before the first command runs, for the reason in
+    // `Interrupts`. Everything above this point is connection setup, where an
+    // interrupt still ends the process outright: there is no command to
+    // abandon yet.
+    let mut interrupts = Interrupts::arm();
+
     // One-shot: run each --exec command in order, then exit non-zero if any
     // errored. No editor, no event loop.
     if one_shot {
@@ -4181,6 +4187,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 &jobs,
                 &schema_contracts,
                 &connect_runtime,
+                &mut interrupts,
                 cmd.trim(),
             )
             .await
@@ -4267,6 +4274,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                     &jobs,
                     &schema_contracts,
                     &connect_runtime,
+                    &mut interrupts,
                     line.trim(),
                 )
                 .await;
@@ -4291,18 +4299,62 @@ enum Ran {
     Cancelled,
 }
 
-/// Run one command, abandoning it if the operator interrupts.
+/// The interrupt listener, installed once and reused by every command.
 ///
-/// Ctrl-C at the prompt never reaches here: reedline holds the terminal in
-/// raw mode and takes the keypress itself. It only arrives while a command
-/// owns the terminal, which is exactly when there is something to abandon.
-/// Installing a handler at all is what keeps SIGINT from killing the process
-/// and skipping session shutdown.
+/// A `tokio::signal::ctrl_c()` future installs the handler only when it is
+/// first polled, so building one inside the per-command `select!` left a
+/// window: the command wrote its request to the wire before it yielded, and
+/// until it did, SIGINT still had its default disposition. A signal that
+/// landed in there killed the process rather than cancelling the call, which
+/// cost the operator the exit status, the shutdown, and the
+/// `notifications/cancelled` the server needed. Both platforms install the
+/// handler when the listener is constructed, so constructing it before the
+/// first command closes the window.
 ///
-/// Dropping the command future is the cancellation: the request is no longer
-/// awaited and the REPL takes the next line. The server is not told to stop
-/// (see the note in the module docs), so a tool with side effects may still
-/// be running on the other end.
+/// Windows has no SIGINT; the console's Ctrl-C event is the same thing for
+/// this purpose.
+struct Interrupts {
+    #[cfg(unix)]
+    listener: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    listener: tokio::signal::windows::CtrlC,
+}
+
+impl Interrupts {
+    /// Install the handler. Runs before the first command.
+    fn arm() -> Self {
+        #[cfg(unix)]
+        let listener = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("install the SIGINT handler");
+        #[cfg(not(unix))]
+        let listener = tokio::signal::windows::ctrl_c().expect("install the Ctrl-C handler");
+        Self { listener }
+    }
+
+    /// The next interrupt.
+    ///
+    /// The `None` never arrives in practice. Reporting it as one keeps a
+    /// listener that somehow ended from being read as a cancellation the
+    /// operator never asked for: the `select!` branch drops out instead.
+    async fn recv(&mut self) -> Option<()> {
+        self.listener.recv().await
+    }
+
+    /// Forget an interrupt that arrived with no command running.
+    ///
+    /// The handler is installed for the whole session now, so a signal sent
+    /// between commands stays pending instead of reaching a `select!`. An
+    /// interrupt cancels the command that is running, and with nothing to
+    /// cancel there is nothing to carry forward: delivering it to the next
+    /// command would abandon a line the operator typed afterwards. This is
+    /// also what absorbs the extra presses when Ctrl-C is hit repeatedly on
+    /// one slow call.
+    fn discard_pending(&mut self) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let _ = self.listener.poll_recv(&mut context);
+    }
+}
+
 /// The tool a cancelled line was calling, when it could have been a task.
 ///
 /// Only for the hint after an interrupt. A line that already ends in `&` is
@@ -4330,6 +4382,19 @@ fn backgroundable_tool(surface: &Arc<RwLock<Surface>>, line: &str) -> Option<Str
         .then(|| tool.name.clone())
 }
 
+/// Run one command, abandoning it if the operator interrupts.
+///
+/// Ctrl-C at the prompt never reaches here: reedline holds the terminal in
+/// raw mode and takes the keypress itself. It only arrives while a command
+/// owns the terminal, which is exactly when there is something to abandon.
+/// Installing a handler at all is what keeps SIGINT from killing the process
+/// and skipping session shutdown.
+///
+/// Dropping the command future is the cancellation: the request is no longer
+/// awaited and the REPL takes the next line. The server is not told to stop
+/// (see the note in the module docs), so a tool with side effects may still
+/// be running on the other end.
+#[allow(clippy::too_many_arguments)]
 async fn run_cancellable(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
@@ -4337,8 +4402,10 @@ async fn run_cancellable(
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
+    interrupts: &mut Interrupts,
     line: &str,
 ) -> Ran {
+    interrupts.discard_pending();
     tokio::select! {
         biased;
         quit = handle_line(
@@ -4352,7 +4419,7 @@ async fn run_cancellable(
         ) => {
             Ran::Completed(quit)
         }
-        _ = tokio::signal::ctrl_c() => {
+        Some(()) = interrupts.recv() => {
             note_error(ExitStatus::Cancelled);
             if json_output() {
                 print_json(&error_json(ExitStatus::Cancelled, "cancelled"));
