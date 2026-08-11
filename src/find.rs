@@ -318,7 +318,8 @@ fn search_matching(
         let description = t.description.clone().unwrap_or_else(|| t.name.clone());
         push(Kind::Template, &t.uri_template, &description);
     }
-    for (name, description) in BUILTINS {
+    for builtin in BUILTINS.iter() {
+        let (name, description) = (builtin.name, builtin.summary);
         push(Kind::Builtin, name, description);
     }
 
@@ -396,7 +397,7 @@ pub fn did_you_mean(surface: &Surface, word: &str) -> Option<String> {
     }
     let candidates = BUILTINS
         .iter()
-        .map(|(name, _)| (*name).to_string())
+        .map(|builtin| builtin.name.to_string())
         .chain(surface.tools.iter().map(|t| t.name.clone()))
         .chain(surface.prompts.iter().map(|p| p.name.clone()));
 
