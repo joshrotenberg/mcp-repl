@@ -4349,9 +4349,11 @@ impl Interrupts {
     /// command would abandon a line the operator typed afterwards. This is
     /// also what absorbs the extra presses when Ctrl-C is hit repeatedly on
     /// one slow call.
-    fn discard_pending(&mut self) {
+    ///
+    /// Reports whether there was one to forget.
+    fn discard_pending(&mut self) -> bool {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        let _ = self.listener.poll_recv(&mut context);
+        self.listener.poll_recv(&mut context).is_ready()
     }
 }
 
@@ -6797,6 +6799,57 @@ mod tests {
         // Nothing the server offers by that name.
         assert_eq!(backgroundable_tool(&surface, "nope"), None);
         assert_eq!(backgroundable_tool(&surface, ""), None);
+    }
+
+    /// An interrupt survives landing before anything polls for it, and one
+    /// sent with no command running does not survive at all.
+    ///
+    /// The first half is what arming the listener up front buys. A command
+    /// that has already written its request to the wire has not yielded yet,
+    /// so the `select!` has never polled its interrupt branch, and a handler
+    /// installed on first poll is not installed at all yet. Regress that and
+    /// the signal raised here finds SIGINT at its default disposition and
+    /// takes the test process down rather than failing an assertion.
+    ///
+    /// Both halves live in one test because the signal reaches every armed
+    /// listener in the process: split in two, they would run in parallel and
+    /// hand each other interrupts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupt_is_armed_up_front_and_never_carried_forward() {
+        let mut interrupts = Interrupts::arm();
+        // `raise` targets this process, and the handler for the signal it
+        // sends was installed on the line above.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");
+        tokio::time::timeout(Duration::from_secs(5), interrupts.recv())
+            .await
+            .expect("an interrupt raised before the first poll is delivered")
+            .expect("the listener outlives the interrupt");
+
+        // Nothing is running now, so this one belongs to no command. Carrying
+        // it forward would abandon a line the operator typed after
+        // interrupting, and would make the second Ctrl-C on one slow call
+        // cancel whatever came next.
+        assert_eq!(
+            unsafe { libc::raise(libc::SIGINT) },
+            0,
+            "raise SIGINT again"
+        );
+        // Delivery completes on a later runtime tick, so wait for the signal
+        // to land instead of assuming it already has.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !interrupts.discard_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the raised interrupt lands");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), interrupts.recv())
+                .await
+                .is_err(),
+            "a discarded interrupt must not cancel the next command"
+        );
     }
 
     #[test]
