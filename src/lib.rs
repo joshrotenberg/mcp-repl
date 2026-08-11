@@ -43,6 +43,7 @@
 mod alias;
 mod bearer_fd;
 mod bench;
+mod builtin;
 mod command;
 pub mod config;
 mod connection_auth;
@@ -97,6 +98,7 @@ use tower_mcp::protocol::{
 use tower_mcp::{ProtocolSupport, ProtocolSupportError};
 
 use alias::Aliases;
+use builtin::{Builtin, Builtins};
 use elicit::ReplClientHandler;
 use exit_status::ExitStatus;
 use jobs::Jobs;
@@ -601,219 +603,266 @@ impl Surface {
     }
 }
 
-/// Built-in commands with the short descriptions shown in the completion
-/// menu and `help`.
-pub(crate) const BUILTINS: &[(&str, &str)] = &[
-    ("help", "list built-ins and the server's tools"),
-    ("connect", "connect to a server or switch servers"),
-    ("tool", "call a server tool explicitly"),
-    ("builtin", "run a REPL built-in explicitly"),
-    ("tools", "list tools"),
-    ("prompts", "list prompts"),
-    ("resources", "list resources"),
-    ("templates", "list resource templates"),
-    ("find", "search the surface by keyword"),
-    ("describe", "show schemas and metadata for a name"),
-    ("snapshot", "export a tool or prompt schema contract"),
-    ("validate", "compare the surface with a schema snapshot"),
-    ("read", "read a resource"),
-    ("subscribe", "watch a resource for updates"),
-    ("unsubscribe", "stop watching a resource"),
-    ("subscriptions", "list active resource subscriptions"),
-    ("prompt", "get a prompt"),
-    ("call", "call a tool with raw JSON"),
-    ("bench", "time repeated calls to a tool"),
-    ("jobs", "list background tasks"),
-    ("task", "show a background task"),
-    ("wait", "wait for background tasks"),
-    ("cancel", "cancel a background task"),
-    ("alias", "define, list, or show a command alias"),
-    ("unalias", "remove a command alias"),
-    ("ping", "check the server is answering"),
-    ("loglevel", "set the server's log verbosity"),
-    ("refresh", "re-fetch the server surface"),
-    ("info", "replay the connection banner plus capabilities"),
-    ("wire", "toggle raw JSON-RPC frame tracing (on|off)"),
-    ("last", "reprint the previous request and response"),
-    ("history", "list recent command history"),
-    ("vars", "list captured variables"),
-    ("unset", "clear a captured variable"),
-    ("quit", "exit"),
-    ("exit", "exit"),
-];
-
-/// Usage and a sentence of explanation per built-in, for `help <name>` and
-/// `describe <name>`. Names not listed here fall back to their one-line
-/// [`BUILTINS`] description.
-const BUILTIN_HELP: &[(&str, &str, &str)] = &[
-    (
-        "help",
-        "help [command]",
-        "With no argument, list the built-ins and the server's tools. With one, explain that command.",
-    ),
-    (
-        "connect",
-        "connect <url|profile|path.json:entry|command...|demo>",
-        "Connect from a disconnected prompt or switch the live REPL to another server.",
-    ),
-    (
-        "tool",
-        "tool <name> [k=v...]",
-        "Call a server tool explicitly. Use this when its name also belongs to a built-in.",
-    ),
-    (
-        "builtin",
-        "builtin <name> [args...]",
-        "Run a REPL built-in explicitly. Use this when a server tool has the same name.",
-    ),
-    (
-        "tools",
-        "tools [--full]",
-        "List the server's tools. Every tool is also a command: `<tool> [k=v...]`. \
-         A long list is trimmed to the window; `--full` prints all of it.",
-    ),
-    ("prompts", "prompts [--full]", "List the server's prompts."),
-    (
-        "resources",
-        "resources [--full]",
-        "List concrete resources. Parameterized ones are under `templates`.",
-    ),
-    (
-        "templates",
-        "templates [--full]",
-        "List resource templates: URIs with `{variable}` parts, completed by the server.",
-    ),
-    (
-        "find",
-        "find [-E] [-m N] [--case-sensitive] [--tools|--prompts|--resources|--templates|--builtins] <keyword>",
-        "Search names and descriptions across the server surface and REPL built-ins.",
-    ),
-    (
-        "describe",
-        "describe <name>",
-        "Show a tool's schemas, a prompt's arguments, or a resource's metadata, plus an example invocation.",
-    ),
-    (
-        "snapshot",
-        "snapshot <name> [path]",
-        "Export a tool or prompt's schema as a versioned contract. Without a path, print it.",
-    ),
-    (
-        "validate",
-        "validate <path> [strict|compatible|ignore]",
-        "Compare a saved snapshot with the live surface. No request is sent.",
-    ),
-    (
-        "read",
-        "read <uri> [--out <path>] [--force]",
-        "Read a resource, or write one returned content item to a file.",
-    ),
-    (
-        "subscribe",
-        "subscribe <uri>",
-        "Ask the server to report updates to a resource. Updates print inline.",
-    ),
-    (
-        "unsubscribe",
-        "unsubscribe <uri>",
-        "Stop receiving updates for a resource.",
-    ),
-    (
-        "subscriptions",
-        "subscriptions",
-        "List the resources the server is currently reporting updates for.",
-    ),
-    (
-        "prompt",
-        "prompt <name> [k=v...]",
-        "Retrieve a prompt. Argument values tab-complete through the server.",
-    ),
-    (
-        "call",
-        "call <tool> <json>",
-        "Call a tool with a raw JSON argument object, for when `k=v` coercion is not enough.",
-    ),
-    (
-        "bench",
-        "bench <tool> [k=v...] [--n N] [--concurrency C]",
-        "Time repeated tool calls and report their latency distribution.",
-    ),
-    (
-        "jobs",
-        "jobs",
-        "List the background tasks this session started, with their current status.",
-    ),
-    (
-        "task",
-        "task <task> [respond]",
-        "Show one background task, or answer a task waiting for operator input.",
-    ),
-    (
-        "wait",
-        "wait [<task>] [--timeout <seconds>]",
-        "Block until one background task, or all tasks this session started, settle.",
-    ),
-    (
-        "cancel",
-        "cancel <task>",
-        "Ask the server to cancel a task. `last` names the most recent.",
-    ),
-    (
-        "alias",
-        "alias [--global] [<name>=<expansion>]",
-        "Define, list, or show command aliases stored with the server profiles.",
-    ),
-    (
-        "unalias",
-        "unalias [--global] <name>",
-        "Remove the alias that is in effect for a name.",
-    ),
-    (
-        "loglevel",
-        "loglevel <debug|info|notice|warning|error|critical|alert|emergency>",
-        "Ask the server to change how much it logs, via `logging/setLevel`. Levels are the \
-         syslog severities the MCP spec uses, least severe first: a level means that one and \
-         everything more severe. Needs the server to declare the `logging` capability.",
-    ),
-    (
-        "ping",
-        "ping",
-        "Send an empty request and report the round trip. Exits non-zero if the server does not answer.",
-    ),
-    (
-        "refresh",
-        "refresh",
-        "Re-fetch the surface. Usually unnecessary: list_changed notifications refresh it live.",
-    ),
-    (
-        "info",
-        "info",
-        "Replay the connection banner and show the server's capabilities.",
-    ),
-    (
-        "wire",
-        "wire [on|off]",
-        "Toggle redacted JSON-RPC frame tracing, or report its current state.",
-    ),
-    (
-        "last",
-        "last",
-        "Reprint the previous request and response. Frames are recorded whether or not tracing is on.",
-    ),
-    (
-        "history",
-        "history [count]",
-        "List recent commands from previous sessions. Ctrl-R searches them interactively.",
-    ),
-    ("vars", "vars", "List values captured from command results."),
-    ("unset", "unset <name>", "Clear one captured variable."),
-    ("quit", "quit", "Close the session and exit."),
-    ("exit", "exit", "Close the session and exit."),
-];
+/// Every command the REPL provides itself.
+///
+/// One record per command: the completion menu and `find` read the
+/// summary, `help <name>` and the man page read the usage and detail, and
+/// completion and highlighting read the name. They were two parallel
+/// tables keyed by name, which needed a test to keep them agreeing.
+///
+/// Declaration order is what `help` prints, so it is grouped by what a
+/// command is for rather than alphabetically.
+pub(crate) const BUILTINS: Builtins = Builtins(&[
+    Builtin {
+        name: "help",
+        summary: "list built-ins and the server's tools",
+        usage: "help [command]",
+        detail: "With no argument, list the built-ins and the server's tools. With \
+         one, explain that command.",
+    },
+    Builtin {
+        name: "connect",
+        summary: "connect to a server or switch servers",
+        usage: "connect <url|profile|path.json:entry|command...|demo>",
+        detail: "Connect from a disconnected prompt or switch the live REPL to \
+         another server.",
+    },
+    Builtin {
+        name: "tool",
+        summary: "call a server tool explicitly",
+        usage: "tool <name> [k=v...]",
+        detail: "Call a server tool explicitly. Use this when its name also belongs \
+         to a built-in.",
+    },
+    Builtin {
+        name: "builtin",
+        summary: "run a REPL built-in explicitly",
+        usage: "builtin <name> [args...]",
+        detail: "Run a REPL built-in explicitly. Use this when a server tool has \
+         the same name.",
+    },
+    Builtin {
+        name: "tools",
+        summary: "list tools",
+        usage: "tools [--full]",
+        detail: "List the server's tools. Every tool is also a command: `<tool> \
+         [k=v...]`. A long list is trimmed to the window; `--full` prints \
+         all of it.",
+    },
+    Builtin {
+        name: "prompts",
+        summary: "list prompts",
+        usage: "prompts [--full]",
+        detail: "List the server's prompts.",
+    },
+    Builtin {
+        name: "resources",
+        summary: "list resources",
+        usage: "resources [--full]",
+        detail: "List concrete resources. Parameterized ones are under `templates`.",
+    },
+    Builtin {
+        name: "templates",
+        summary: "list resource templates",
+        usage: "templates [--full]",
+        detail: "List resource templates: URIs with `{variable}` parts, completed \
+         by the server.",
+    },
+    Builtin {
+        name: "find",
+        summary: "search the surface by keyword",
+        usage: "find [-E] [-m N] [--case-sensitive] \
+         [--tools|--prompts|--resources|--templates|--builtins] <keyword>",
+        detail: "Search names and descriptions across the server surface and REPL \
+         built-ins.",
+    },
+    Builtin {
+        name: "describe",
+        summary: "show schemas and metadata for a name",
+        usage: "describe <name>",
+        detail: "Show a tool's schemas, a prompt's arguments, or a resource's \
+         metadata, plus an example invocation.",
+    },
+    Builtin {
+        name: "snapshot",
+        summary: "export a tool or prompt schema contract",
+        usage: "snapshot <name> [path]",
+        detail: "Export a tool or prompt's schema as a versioned contract. Without \
+         a path, print it.",
+    },
+    Builtin {
+        name: "validate",
+        summary: "compare the surface with a schema snapshot",
+        usage: "validate <path> [strict|compatible|ignore]",
+        detail: "Compare a saved snapshot with the live surface. No request is \
+         sent.",
+    },
+    Builtin {
+        name: "read",
+        summary: "read a resource",
+        usage: "read <uri> [--out <path>] [--force]",
+        detail: "Read a resource, or write one returned content item to a file.",
+    },
+    Builtin {
+        name: "subscribe",
+        summary: "watch a resource for updates",
+        usage: "subscribe <uri>",
+        detail: "Ask the server to report updates to a resource. Updates print \
+         inline.",
+    },
+    Builtin {
+        name: "unsubscribe",
+        summary: "stop watching a resource",
+        usage: "unsubscribe <uri>",
+        detail: "Stop receiving updates for a resource.",
+    },
+    Builtin {
+        name: "subscriptions",
+        summary: "list active resource subscriptions",
+        usage: "subscriptions",
+        detail: "List the resources the server is currently reporting updates for.",
+    },
+    Builtin {
+        name: "prompt",
+        summary: "get a prompt",
+        usage: "prompt <name> [k=v...]",
+        detail: "Retrieve a prompt. Argument values tab-complete through the \
+         server.",
+    },
+    Builtin {
+        name: "call",
+        summary: "call a tool with raw JSON",
+        usage: "call <tool> <json>",
+        detail: "Call a tool with a raw JSON argument object, for when `k=v` \
+         coercion is not enough.",
+    },
+    Builtin {
+        name: "bench",
+        summary: "time repeated calls to a tool",
+        usage: "bench <tool> [k=v...] [--n N] [--concurrency C]",
+        detail: "Time repeated tool calls and report their latency distribution.",
+    },
+    Builtin {
+        name: "jobs",
+        summary: "list background tasks",
+        usage: "jobs",
+        detail: "List the background tasks this session started, with their current \
+         status.",
+    },
+    Builtin {
+        name: "task",
+        summary: "show a background task",
+        usage: "task <task> [respond]",
+        detail: "Show one background task, or answer a task waiting for operator \
+         input.",
+    },
+    Builtin {
+        name: "wait",
+        summary: "wait for background tasks",
+        usage: "wait [<task>] [--timeout <seconds>]",
+        detail: "Block until one background task, or all tasks this session \
+         started, settle.",
+    },
+    Builtin {
+        name: "cancel",
+        summary: "cancel a background task",
+        usage: "cancel <task>",
+        detail: "Ask the server to cancel a task. `last` names the most recent.",
+    },
+    Builtin {
+        name: "alias",
+        summary: "define, list, or show a command alias",
+        usage: "alias [--global] [<name>=<expansion>]",
+        detail: "Define, list, or show command aliases stored with the server \
+         profiles.",
+    },
+    Builtin {
+        name: "unalias",
+        summary: "remove a command alias",
+        usage: "unalias [--global] <name>",
+        detail: "Remove the alias that is in effect for a name.",
+    },
+    Builtin {
+        name: "ping",
+        summary: "check the server is answering",
+        usage: "ping",
+        detail: "Send an empty request and report the round trip. Exits non-zero if \
+         the server does not answer.",
+    },
+    Builtin {
+        name: "loglevel",
+        summary: "set the server's log verbosity",
+        usage: "loglevel \
+         <debug|info|notice|warning|error|critical|alert|emergency>",
+        detail: "Ask the server to change how much it logs, via `logging/setLevel`. \
+         Levels are the syslog severities the MCP spec uses, least severe \
+         first: a level means that one and everything more severe. Needs \
+         the server to declare the `logging` capability.",
+    },
+    Builtin {
+        name: "refresh",
+        summary: "re-fetch the server surface",
+        usage: "refresh",
+        detail: "Re-fetch the surface. Usually unnecessary: list_changed \
+         notifications refresh it live.",
+    },
+    Builtin {
+        name: "info",
+        summary: "replay the connection banner plus capabilities",
+        usage: "info",
+        detail: "Replay the connection banner and show the server's capabilities.",
+    },
+    Builtin {
+        name: "wire",
+        summary: "toggle raw JSON-RPC frame tracing (on|off)",
+        usage: "wire [on|off]",
+        detail: "Toggle redacted JSON-RPC frame tracing, or report its current \
+         state.",
+    },
+    Builtin {
+        name: "last",
+        summary: "reprint the previous request and response",
+        usage: "last",
+        detail: "Reprint the previous request and response. Frames are recorded \
+         whether or not tracing is on.",
+    },
+    Builtin {
+        name: "history",
+        summary: "list recent command history",
+        usage: "history [count]",
+        detail: "List recent commands from previous sessions. Ctrl-R searches them \
+         interactively.",
+    },
+    Builtin {
+        name: "vars",
+        summary: "list captured variables",
+        usage: "vars",
+        detail: "List values captured from command results.",
+    },
+    Builtin {
+        name: "unset",
+        summary: "clear a captured variable",
+        usage: "unset <name>",
+        detail: "Clear one captured variable.",
+    },
+    Builtin {
+        name: "quit",
+        summary: "exit",
+        usage: "quit",
+        detail: "Close the session and exit.",
+    },
+    Builtin {
+        name: "exit",
+        summary: "exit",
+        usage: "exit",
+        detail: "Close the session and exit.",
+    },
+]);
 
 /// Longer paragraphs and examples for commands that benefit from more than
-/// one dense sentence. Kept beside [`BUILTIN_HELP`], and rendered by both the
-/// live prompt and `--man`, so the binary remains the reference source.
+/// one dense sentence. Keyed by name against [`BUILTINS`], and rendered by
+/// both the live prompt and `--man`, so the binary remains the reference
+/// source.
 struct BuiltinGuide {
     name: &'static str,
     details: &'static [&'static str],
@@ -927,14 +976,14 @@ struct BuiltinHelp {
 /// The structured reference for one built-in, shared by human help, JSON
 /// help, `describe`, and the generated man page.
 fn builtin_help(name: &str) -> Option<BuiltinHelp> {
-    let &(name, usage, description) = BUILTIN_HELP
+    let builtin = BUILTINS.get(name)?;
+    let guide = BUILTIN_GUIDES
         .iter()
-        .find(|(builtin, _, _)| *builtin == name)?;
-    let guide = BUILTIN_GUIDES.iter().find(|guide| guide.name == name);
+        .find(|guide| guide.name == builtin.name);
     Some(BuiltinHelp {
-        name,
-        usage,
-        description,
+        name: builtin.name,
+        usage: builtin.usage,
+        description: builtin.detail,
         details: guide.map(|guide| guide.details).unwrap_or_default(),
         examples: guide.map(|guide| guide.examples).unwrap_or_default(),
     })
@@ -957,7 +1006,7 @@ fn print_builtin_help(help: BuiltinHelp) {
 }
 
 pub(crate) fn is_builtin(name: &str) -> bool {
-    BUILTINS.iter().any(|(builtin, _)| *builtin == name)
+    BUILTINS.contains(name)
 }
 
 pub(crate) fn is_tool(surface: &Surface, name: &str) -> bool {
@@ -3225,8 +3274,8 @@ fn roff_escape(text: &str) -> String {
 }
 
 /// Render clap's CLI reference followed by the REPL command reference. The
-/// latter is deliberately sourced from [`BUILTIN_HELP`] rather than copied
-/// into a packaging template.
+/// latter is deliberately sourced from [`BUILTINS`] rather than copied into a
+/// packaging template.
 fn render_man_page() -> Result<Vec<u8>, String> {
     let command = <Args as clap::CommandFactory>::command();
     let mut page = Vec::new();
@@ -3241,8 +3290,8 @@ fn render_man_page() -> Result<Vec<u8>, String> {
         "The server's tools are top-level commands. These built-ins are supplied by mcp-repl. The same reference is available interactively through \\fBhelp <command>\\fR."
     )
     .map_err(|error| error.to_string())?;
-    for &(name, _, _) in BUILTIN_HELP {
-        let help = builtin_help(name).expect("BUILTIN_HELP entry resolves itself");
+    for builtin in BUILTINS.iter() {
+        let help = builtin_help(builtin.name).expect("every built-in resolves itself");
         writeln!(page, ".TP\n\\fB{}\\fR", roff_escape(help.usage))
             .map_err(|error| error.to_string())?;
         writeln!(page, "{}", roff_escape(help.description)).map_err(|error| error.to_string())?;
@@ -4169,6 +4218,12 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         )
     };
 
+    // Installed before the first command runs, for the reason in
+    // `Interrupts`. Everything above this point is connection setup, where an
+    // interrupt still ends the process outright: there is no command to
+    // abandon yet.
+    let mut interrupts = Interrupts::arm();
+
     // One-shot: run each --exec command in order, then exit non-zero if any
     // errored. No editor, no event loop.
     if one_shot {
@@ -4181,6 +4236,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 &jobs,
                 &schema_contracts,
                 &connect_runtime,
+                &mut interrupts,
                 cmd.trim(),
             )
             .await
@@ -4267,6 +4323,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                     &jobs,
                     &schema_contracts,
                     &connect_runtime,
+                    &mut interrupts,
                     line.trim(),
                 )
                 .await;
@@ -4291,18 +4348,64 @@ enum Ran {
     Cancelled,
 }
 
-/// Run one command, abandoning it if the operator interrupts.
+/// The interrupt listener, installed once and reused by every command.
 ///
-/// Ctrl-C at the prompt never reaches here: reedline holds the terminal in
-/// raw mode and takes the keypress itself. It only arrives while a command
-/// owns the terminal, which is exactly when there is something to abandon.
-/// Installing a handler at all is what keeps SIGINT from killing the process
-/// and skipping session shutdown.
+/// A `tokio::signal::ctrl_c()` future installs the handler only when it is
+/// first polled, so building one inside the per-command `select!` left a
+/// window: the command wrote its request to the wire before it yielded, and
+/// until it did, SIGINT still had its default disposition. A signal that
+/// landed in there killed the process rather than cancelling the call, which
+/// cost the operator the exit status, the shutdown, and the
+/// `notifications/cancelled` the server needed. Both platforms install the
+/// handler when the listener is constructed, so constructing it before the
+/// first command closes the window.
 ///
-/// Dropping the command future is the cancellation: the request is no longer
-/// awaited and the REPL takes the next line. The server is not told to stop
-/// (see the note in the module docs), so a tool with side effects may still
-/// be running on the other end.
+/// Windows has no SIGINT; the console's Ctrl-C event is the same thing for
+/// this purpose.
+struct Interrupts {
+    #[cfg(unix)]
+    listener: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    listener: tokio::signal::windows::CtrlC,
+}
+
+impl Interrupts {
+    /// Install the handler. Runs before the first command.
+    fn arm() -> Self {
+        #[cfg(unix)]
+        let listener = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("install the SIGINT handler");
+        #[cfg(not(unix))]
+        let listener = tokio::signal::windows::ctrl_c().expect("install the Ctrl-C handler");
+        Self { listener }
+    }
+
+    /// The next interrupt.
+    ///
+    /// The `None` never arrives in practice. Reporting it as one keeps a
+    /// listener that somehow ended from being read as a cancellation the
+    /// operator never asked for: the `select!` branch drops out instead.
+    async fn recv(&mut self) -> Option<()> {
+        self.listener.recv().await
+    }
+
+    /// Forget an interrupt that arrived with no command running.
+    ///
+    /// The handler is installed for the whole session now, so a signal sent
+    /// between commands stays pending instead of reaching a `select!`. An
+    /// interrupt cancels the command that is running, and with nothing to
+    /// cancel there is nothing to carry forward: delivering it to the next
+    /// command would abandon a line the operator typed afterwards. This is
+    /// also what absorbs the extra presses when Ctrl-C is hit repeatedly on
+    /// one slow call.
+    ///
+    /// Reports whether there was one to forget.
+    fn discard_pending(&mut self) -> bool {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        self.listener.poll_recv(&mut context).is_ready()
+    }
+}
+
 /// The tool a cancelled line was calling, when it could have been a task.
 ///
 /// Only for the hint after an interrupt. A line that already ends in `&` is
@@ -4330,6 +4433,19 @@ fn backgroundable_tool(surface: &Arc<RwLock<Surface>>, line: &str) -> Option<Str
         .then(|| tool.name.clone())
 }
 
+/// Run one command, abandoning it if the operator interrupts.
+///
+/// Ctrl-C at the prompt never reaches here: reedline holds the terminal in
+/// raw mode and takes the keypress itself. It only arrives while a command
+/// owns the terminal, which is exactly when there is something to abandon.
+/// Installing a handler at all is what keeps SIGINT from killing the process
+/// and skipping session shutdown.
+///
+/// Dropping the command future is the cancellation: the request is no longer
+/// awaited and the REPL takes the next line. The server is not told to stop
+/// (see the note in the module docs), so a tool with side effects may still
+/// be running on the other end.
+#[allow(clippy::too_many_arguments)]
 async fn run_cancellable(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
@@ -4337,8 +4453,10 @@ async fn run_cancellable(
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
+    interrupts: &mut Interrupts,
     line: &str,
 ) -> Ran {
+    interrupts.discard_pending();
     tokio::select! {
         biased;
         quit = handle_line(
@@ -4352,7 +4470,7 @@ async fn run_cancellable(
         ) => {
             Ran::Completed(quit)
         }
-        _ = tokio::signal::ctrl_c() => {
+        Some(()) = interrupts.recv() => {
             note_error(ExitStatus::Cancelled);
             if json_output() {
                 print_json(&error_json(ExitStatus::Cancelled, "cancelled"));
@@ -4668,9 +4786,9 @@ async fn handle_line(
                 print_json(&serde_json::json!({
                     "builtins": BUILTINS
                         .iter()
-                        .map(|(name, description)| serde_json::json!({
-                            "name": name,
-                            "description": description,
+                        .map(|builtin| serde_json::json!({
+                            "name": builtin.name,
+                            "description": builtin.summary,
                         }))
                         .collect::<Vec<_>>(),
                     "tools": s.tools,
@@ -6732,6 +6850,57 @@ mod tests {
         assert_eq!(backgroundable_tool(&surface, ""), None);
     }
 
+    /// An interrupt survives landing before anything polls for it, and one
+    /// sent with no command running does not survive at all.
+    ///
+    /// The first half is what arming the listener up front buys. A command
+    /// that has already written its request to the wire has not yielded yet,
+    /// so the `select!` has never polled its interrupt branch, and a handler
+    /// installed on first poll is not installed at all yet. Regress that and
+    /// the signal raised here finds SIGINT at its default disposition and
+    /// takes the test process down rather than failing an assertion.
+    ///
+    /// Both halves live in one test because the signal reaches every armed
+    /// listener in the process: split in two, they would run in parallel and
+    /// hand each other interrupts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupt_is_armed_up_front_and_never_carried_forward() {
+        let mut interrupts = Interrupts::arm();
+        // `raise` targets this process, and the handler for the signal it
+        // sends was installed on the line above.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");
+        tokio::time::timeout(Duration::from_secs(5), interrupts.recv())
+            .await
+            .expect("an interrupt raised before the first poll is delivered")
+            .expect("the listener outlives the interrupt");
+
+        // Nothing is running now, so this one belongs to no command. Carrying
+        // it forward would abandon a line the operator typed after
+        // interrupting, and would make the second Ctrl-C on one slow call
+        // cancel whatever came next.
+        assert_eq!(
+            unsafe { libc::raise(libc::SIGINT) },
+            0,
+            "raise SIGINT again"
+        );
+        // Delivery completes on a later runtime tick, so wait for the signal
+        // to land instead of assuming it already has.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !interrupts.discard_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the raised interrupt lands");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), interrupts.recv())
+                .await
+                .is_err(),
+            "a discarded interrupt must not cancel the next command"
+        );
+    }
+
     #[test]
     fn command_collisions_are_detected_from_the_live_surface() {
         let surface = surface_with_a_task_capable_tool();
@@ -7323,14 +7492,14 @@ mod tests {
     // first-class built-in rather than a hidden one.
     #[test]
     fn bench_is_a_listed_builtin() {
-        assert!(BUILTINS.iter().any(|(name, _)| *name == "bench"));
+        assert!(BUILTINS.contains("bench"));
     }
 
     // Completion and highlighting both read BUILTINS, so membership is what
     // makes `find` completable rather than any code in the editor.
     #[test]
     fn find_is_a_completable_builtin() {
-        assert!(BUILTINS.iter().any(|(name, _)| *name == "find"));
+        assert!(BUILTINS.contains("find"));
     }
 
     /// Generate into a buffer the way the flag generates onto stdout.
@@ -7407,24 +7576,31 @@ mod tests {
 
     #[test]
     fn every_builtin_can_explain_itself() {
-        // `help <name>` and `describe <name>` both read this table, so a
-        // built-in missing from it answers with nothing useful.
-        for (name, _) in BUILTINS {
+        // A built-in now carries its own usage and description, so `help` can
+        // no longer fail to find them. What it can still be given is an empty
+        // string, which prints as a blank line rather than an answer.
+        for builtin in BUILTINS.iter() {
             assert!(
-                builtin_help(name).is_some(),
-                "`{name}` has no usage line; add one to BUILTIN_HELP"
+                !builtin.usage.is_empty(),
+                "`{}` has no usage line",
+                builtin.name
+            );
+            assert!(
+                !builtin.summary.is_empty(),
+                "`{}` has no summary",
+                builtin.name
+            );
+            assert!(
+                !builtin.detail.is_empty(),
+                "`{}` has no description",
+                builtin.name
             );
         }
-        // And nothing in the table names a command that does not exist.
-        for (name, _, _) in BUILTIN_HELP {
-            assert!(
-                BUILTINS.iter().any(|(builtin, _)| builtin == name),
-                "BUILTIN_HELP documents `{name}`, which is not a built-in"
-            );
-        }
+        // Guides are still a separate table keyed by name, so that pairing can
+        // still drift even though usage and description no longer can.
         for guide in BUILTIN_GUIDES {
             assert!(
-                BUILTINS.iter().any(|(name, _)| *name == guide.name),
+                BUILTINS.contains(guide.name),
                 "BUILTIN_GUIDES documents unknown `{}`",
                 guide.name
             );
@@ -7699,10 +7875,7 @@ world",
         // Every routable name is a real built-in, so the guard cannot
         // advertise a command that does not exist.
         for name in ROUTABLE_BUILTINS {
-            assert!(
-                BUILTINS.iter().any(|(builtin, _)| builtin == name),
-                "{name} is not a built-in"
-            );
+            assert!(BUILTINS.contains(name), "{name} is not a built-in");
         }
     }
 

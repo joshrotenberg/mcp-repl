@@ -393,10 +393,8 @@ impl ReplCompleter {
     fn complete_builtin_name_word(word: &str, span: Span) -> Vec<Suggestion> {
         BUILTINS
             .iter()
-            .filter(|(name, _)| name.starts_with(word))
-            .map(|(name, description)| {
-                word_suggestion(*name, Some((*description).to_string()), span)
-            })
+            .filter(|builtin| builtin.name.starts_with(word))
+            .map(|builtin| word_suggestion(builtin.name, Some(builtin.summary.to_string()), span))
             .collect()
     }
 
@@ -407,7 +405,8 @@ impl ReplCompleter {
         span: Span,
     ) -> Vec<Suggestion> {
         let mut out = Vec::new();
-        for (name, description) in BUILTINS {
+        for builtin in BUILTINS.iter() {
+            let (name, description) = (builtin.name, builtin.summary);
             if !name.starts_with(word) {
                 continue;
             }
@@ -416,7 +415,7 @@ impl ReplCompleter {
             } else {
                 (*description).to_string()
             };
-            out.push(word_suggestion(*name, Some(description), span));
+            out.push(word_suggestion(name, Some(description), span));
         }
         for entry in aliases.entries() {
             if entry.name.starts_with(word) {
@@ -468,7 +467,8 @@ impl ReplCompleter {
                 ));
             }
         }
-        for (name, description) in BUILTINS {
+        for builtin in BUILTINS.iter() {
+            let (name, description) = (builtin.name, builtin.summary);
             let already_named = surface.tools.iter().any(|tool| tool.name == *name)
                 || surface.prompts.iter().any(|prompt| prompt.name == *name)
                 || surface
@@ -481,7 +481,7 @@ impl ReplCompleter {
                     .any(|template| template.name == *name || template.uri_template == *name);
             if name.starts_with(word) && !already_named {
                 out.push(word_suggestion(
-                    *name,
+                    name,
                     Some(format!("built-in: {description}")),
                     span,
                 ));
@@ -751,7 +751,7 @@ impl ReplHighlighter {
             return Style::new().fg(Color::Green).bold();
         }
         // Prefix of something completable: neutral while typing.
-        let is_prefix = BUILTINS.iter().any(|(name, _)| name.starts_with(word))
+        let is_prefix = BUILTINS.any_starts_with(word)
             || aliases.entries().iter().any(|e| e.name.starts_with(word))
             || surface.tools.iter().any(|t| t.name.starts_with(word));
         if is_prefix {
@@ -774,7 +774,7 @@ impl ReplHighlighter {
                 }
             }
             "builtin" if crate::is_builtin(word) => Style::new().fg(Color::Cyan).bold(),
-            "builtin" if BUILTINS.iter().any(|(name, _)| name.starts_with(word)) => Style::new(),
+            "builtin" if BUILTINS.any_starts_with(word) => Style::new(),
             _ => Style::new().fg(Color::Red),
         }
     }
