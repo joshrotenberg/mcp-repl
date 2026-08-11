@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-08-11
+
+### Bug Fixes
+
+- Arm the interrupt handler before a command starts ([#135](https://github.com/joshrotenberg/mcp-repl/pull/135))
+
+### Refactor
+
+- Give a built-in one record instead of two parallel tables ([#134](https://github.com/joshrotenberg/mcp-repl/pull/134))
+
+
+
 ## [0.3.0] - 2026-08-09
 
 ### Bug Fixes
