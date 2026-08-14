@@ -1262,6 +1262,22 @@ async fn exercise_no_target(temp: &TempDir) {
     assert!(stdout.contains("final-connect"), "{stdout}");
 }
 
+async fn exercise_multiline_piped_input() {
+    let mut command = repl_command();
+    command.args(["--demo", "--no-history", "--color", "never"]);
+    let output = run_with_input(
+        command,
+        "call echo {\n  \"message\": \"hello from a pipe\"\n}\nquit\n",
+        "multiline piped input",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, "multiline piped input");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("hello from a pipe"), "{stdout}");
+    assert!(!stdout.contains("unknown command"), "{stdout}");
+}
+
 async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir) {
     let fixture_string = fixture.display().to_string();
     let fixture_literal = serde_json::to_string(&fixture_string).expect("quote fixture path");
@@ -2392,6 +2408,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_repl_config(&temp).await;
         exercise_login_json(&temp).await;
         exercise_no_target(&temp).await;
+        exercise_multiline_piped_input().await;
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_absent_cursor(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;

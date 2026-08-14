@@ -991,32 +991,61 @@ fn migrate_legacy_history(destination: &std::path::Path) {
 
 fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mpsc::Receiver<()>) {
     let stdin = std::io::stdin();
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        // Scope the stdin lock to the read: holding it while waiting on
-        // the ack channel would deadlock the elicitation handler, which
-        // reads stdin during a foreground tool call.
-        let read = {
+    run_piped_with(
+        |buf| {
+            // Scope the stdin lock to one read: holding it while waiting on
+            // the ack channel would deadlock the elicitation handler, which
+            // reads stdin during a foreground tool call.
             let mut lock = stdin.lock();
-            std::io::BufRead::read_line(&mut lock, &mut buf)
-        };
-        match read {
+            std::io::BufRead::read_line(&mut lock, buf)
+        },
+        line_tx,
+        ack_rx,
+    );
+}
+
+fn run_piped_with(
+    mut read_line: impl FnMut(&mut String) -> std::io::Result<usize>,
+    line_tx: &tokio::sync::mpsc::Sender<String>,
+    ack_rx: &std::sync::mpsc::Receiver<()>,
+) {
+    let mut pending = String::new();
+    loop {
+        let mut line = String::new();
+        match read_line(&mut line) {
             Ok(0) | Err(_) => {
+                if !pending.is_empty() && !dispatch_piped(&mut pending, line_tx, ack_rx) {
+                    break;
+                }
                 let _ = line_tx.blocking_send("quit".to_string());
                 break;
             }
             Ok(_) => {
-                if line_tx
-                    .blocking_send(buf.trim_end_matches('\n').to_string())
-                    .is_err()
-                    || ack_rx.recv().is_err()
-                {
+                pending.push_str(&line);
+                if crate::command::is_incomplete(&pending) {
+                    continue;
+                }
+                if !dispatch_piped(&mut pending, line_tx, ack_rx) {
                     break;
                 }
             }
         }
     }
+}
+
+fn dispatch_piped(
+    pending: &mut String,
+    line_tx: &tokio::sync::mpsc::Sender<String>,
+    ack_rx: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    let mut command = std::mem::take(pending);
+    if command.ends_with('\n') {
+        command.pop();
+        if command.ends_with('\r') {
+            command.pop();
+        }
+    }
+    line_tx.blocking_send(command).is_ok() && ack_rx.recv().is_ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,6 +1224,46 @@ mod tests {
             validator.validate("call echo {1]"),
             ValidationResult::Complete
         ));
+    }
+
+    #[test]
+    fn piped_input_accumulates_multiline_commands_and_keeps_command_boundaries() {
+        let mut input =
+            std::io::Cursor::new("call echo {\n  \"message\": \"hello from a pipe\"\n}\ntools\n");
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(4);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        ack_tx.send(()).unwrap();
+        ack_tx.send(()).unwrap();
+
+        run_piped_with(
+            |buf| std::io::BufRead::read_line(&mut input, buf),
+            &line_tx,
+            &ack_rx,
+        );
+
+        assert_eq!(
+            line_rx.blocking_recv().as_deref(),
+            Some("call echo {\n  \"message\": \"hello from a pipe\"\n}")
+        );
+        assert_eq!(line_rx.blocking_recv().as_deref(), Some("tools"));
+        assert_eq!(line_rx.blocking_recv().as_deref(), Some("quit"));
+    }
+
+    #[test]
+    fn piped_input_submits_an_unfinished_final_command_at_eof() {
+        let mut input = std::io::Cursor::new("call echo {\n");
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(2);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        ack_tx.send(()).unwrap();
+
+        run_piped_with(
+            |buf| std::io::BufRead::read_line(&mut input, buf),
+            &line_tx,
+            &ack_rx,
+        );
+
+        assert_eq!(line_rx.blocking_recv().as_deref(), Some("call echo {"));
+        assert_eq!(line_rx.blocking_recv().as_deref(), Some("quit"));
     }
 
     #[test]
