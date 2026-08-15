@@ -33,7 +33,7 @@ name = "mcp-repl"
 path = "src/main.rs"
 
 [dependencies]
-tower-mcp = { version = "0.20.1", features = ["http-client", "oauth-client", "protocol-2026-07-28"] }
+tower-mcp = { version = "0.21.0", features = ["http-client", "oauth-client", "protocol-2026-07-28"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -73,6 +73,6 @@ libc = "0.2"
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's
 # server-side features and the fixture's own HTTP dependencies.
-tower-mcp = { version = "0.20.1", features = ["http", "protocol-2026-07-28"] }
+tower-mcp = { version = "0.21.0", features = ["http", "protocol-2026-07-28"] }
 axum = { version = "0.8", features = ["json"] }
 schemars = "1.2"
