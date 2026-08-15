@@ -201,6 +201,63 @@ async fn wait_for_file(path: &Path, label: &str) -> String {
     .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
 }
 
+async fn wait_for_file_count(path: &Path, minimum: usize, label: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(contents)
+                    if contents
+                        .parse::<usize>()
+                        .is_ok_and(|count| count >= minimum) =>
+                {
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("read {label}: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label} to reach {minimum}"));
+}
+
+async fn wait_for_output(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    captured: &mut Vec<u8>,
+    expected: &str,
+    label: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut chunk = [0u8; 4096];
+        loop {
+            if String::from_utf8_lossy(captured).contains(expected) {
+                break;
+            }
+            let read = reader
+                .read(&mut chunk)
+                .await
+                .unwrap_or_else(|error| panic!("read {label}: {error}"));
+            assert_ne!(
+                read,
+                0,
+                "{label} reached EOF before {expected:?}:\n{}",
+                String::from_utf8_lossy(captured)
+            );
+            captured.extend_from_slice(&chunk[..read]);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for {expected:?} in {label}:\n{}",
+            String::from_utf8_lossy(captured)
+        )
+    });
+}
+
 async fn run_stdio(fixture: &Path, temp: &TempDir, case: &str, repl_args: &[&str]) -> Output {
     let exit_file = temp.path().join(format!("{case}.exit"));
     let mut command = repl_command();
@@ -1262,6 +1319,22 @@ async fn exercise_no_target(temp: &TempDir) {
     assert!(stdout.contains("final-connect"), "{stdout}");
 }
 
+async fn exercise_multiline_piped_input() {
+    let mut command = repl_command();
+    command.args(["--demo", "--no-history", "--color", "never"]);
+    let output = run_with_input(
+        command,
+        "call echo {\n  \"message\": \"hello from a pipe\"\n}\nquit\n",
+        "multiline piped input",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, "multiline piped input");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("hello from a pipe"), "{stdout}");
+    assert!(!stdout.contains("unknown command"), "{stdout}");
+}
+
 async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir) {
     let fixture_string = fixture.display().to_string();
     let fixture_literal = serde_json::to_string(&fixture_string).expect("quote fixture path");
@@ -2036,25 +2109,83 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
         .kill_on_drop(true);
     let mut child = command.spawn().expect("spawn interactive final mcp-repl");
     let mut stdin = child.stdin.take().expect("interactive stdin");
+    let mut stdout = child.stdout.take().expect("interactive stdout");
+    let mut stderr = child.stderr.take().expect("interactive stderr");
+    let stderr_task = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        stderr
+            .read_to_end(&mut captured)
+            .await
+            .expect("read interactive stderr");
+        captured
+    });
+
+    // Prove the piped editor is accepting and acknowledging commands before
+    // starting the task. Writing immediately after spawn made the old test
+    // depend on startup scheduling, and its subscription marker was already
+    // satisfied by the final protocol's surface subscription.
+    stdin
+        .write_all(b"jobs\n")
+        .await
+        .expect("write readiness command");
+    let mut stdout_capture = Vec::new();
+    wait_for_output(
+        &mut stdout,
+        &mut stdout_capture,
+        "no background tasks",
+        "interactive final readiness",
+    )
+    .await;
+
     stdin
         .write_all(b"slow_add a=2 b=3 &\n")
         .await
         .expect("write task command");
-    wait_for_file(&http.subscription_file, "final subscription").await;
-    // The subscription is immediate, while the bounded task poller remains a
-    // fallback. The fixture advertises a two-second poll interval, so leave a
-    // full extra second for the fallback to observe completion before asking
-    // the editor thread to exit.
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    wait_for_output(
+        &mut stdout,
+        &mut stdout_capture,
+        "started",
+        "interactive final task start",
+    )
+    .await;
+    // One long-lived subscription follows surface changes and a second,
+    // task-scoped subscription follows this task. Counting them prevents the
+    // surface stream from impersonating proof that the task watcher opened.
+    wait_for_file_count(&http.subscription_file, 2, "final task subscription").await;
+    stdin
+        .write_all(b"builtin wait 1\n")
+        .await
+        .expect("write task wait command");
+    wait_for_output(
+        &mut stdout,
+        &mut stdout_capture,
+        "completed",
+        "interactive final task completion",
+    )
+    .await;
+
     stdin
         .write_all(b"jobs\nquit\n")
         .await
         .expect("write task status and quit commands");
     drop(stdin);
-    let output = tokio::time::timeout(CASE_TIMEOUT, child.wait_with_output())
+    let status = tokio::time::timeout(CASE_TIMEOUT, child.wait())
         .await
         .expect("interactive final case timed out")
         .expect("wait for interactive final case");
+    stdout
+        .read_to_end(&mut stdout_capture)
+        .await
+        .expect("drain interactive stdout");
+    let stderr = tokio::time::timeout(CASE_TIMEOUT, stderr_task)
+        .await
+        .expect("interactive stderr capture timed out")
+        .expect("join interactive stderr capture");
+    let output = Output {
+        status,
+        stdout: stdout_capture,
+        stderr,
+    };
     assert_success(&output, "interactive final task");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("started"), "{stdout}");
@@ -2392,6 +2523,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_repl_config(&temp).await;
         exercise_login_json(&temp).await;
         exercise_no_target(&temp).await;
+        exercise_multiline_piped_input().await;
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_absent_cursor(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
