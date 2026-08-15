@@ -162,11 +162,12 @@ Inside the REPL, `help` lists the built-ins and `help <command>` explains one."
 struct Args {
     /// Protocol lifecycle to use. `stable` uses initialize/initialized;
     /// `2026-07-28` (alias: `final`) uses the sessionless discover lifecycle.
-    #[arg(long, value_enum, default_value = "stable")]
+    #[arg(long, value_enum, default_value = "stable", hide_short_help = true)]
     protocol: ProtocolMode,
 
-    /// Connect to a streamable HTTP server at this URL instead of spawning
-    /// a stdio child process.
+    /// Connect to a streamable HTTP server at this URL.
+    ///
+    /// Used instead of spawning a stdio child process.
     #[arg(long)]
     http: Option<String>,
 
@@ -174,7 +175,9 @@ struct Args {
     #[arg(long, conflicts_with_all = ["http", "command", "server"])]
     demo: bool,
 
-    /// Connect using a native profile name, or import `PATH.json:ENTRY` from a
+    /// Connect using a saved profile name, or an imported config entry.
+    ///
+    /// Takes a native profile name, or `PATH.json:ENTRY` to import from a
     /// standard MCP JSON config. Either selector also works as a lone
     /// positional.
     #[arg(long, value_name = "NAME")]
@@ -182,15 +185,16 @@ struct Args {
 
     /// Read server profiles from this file instead of the platform default
     /// (`$XDG_CONFIG_HOME` on Unix or `%APPDATA%` on Windows).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", hide_short_help = true)]
     config: Option<String>,
 
     /// Print the configured server profiles and exit.
     #[arg(long)]
     list_servers: bool,
 
-    /// Print the servers other MCP clients have configured, as selectors you
-    /// can pass straight back, and exit.
+    /// Print the servers other MCP clients have configured, and exit.
+    ///
+    /// Each one prints as a selector you can pass straight back.
     ///
     /// Reads the well-known config files and describes them. It connects to
     /// nothing and runs nothing.
@@ -201,131 +205,143 @@ struct Args {
     ///
     /// The REPL completes a server's surface from the moment it connects;
     /// this is the other half, for the invocation that gets you there.
-    #[arg(long, value_name = "SHELL")]
+    #[arg(long, value_name = "SHELL", hide_short_help = true)]
     completions: Option<clap_complete::Shell>,
 
     /// Print the CLI and REPL built-in reference, in roff, and exit.
     ///
     /// Packagers redirect it: `mcp-repl --man > mcp-repl.1`.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     man: bool,
 
     /// When to emit ANSI colors (auto detects tty and NO_COLOR).
-    #[arg(long, value_enum, default_value = "auto")]
+    #[arg(long, value_enum, default_value = "auto", hide_short_help = true)]
     color: style::ColorMode,
 
     /// Bearer token for an authenticated `--http` server (sets
     /// `Authorization: Bearer <token>`). Falls back to the `MCP_BEARER`
     /// environment variable, which is safer than argv; on Unix, --bearer-fd
     /// also avoids exporting the token in the startup environment.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     bearer: Option<String>,
 
     /// Read an HTTP bearer token from this inherited file descriptor, then
     /// close it before connecting. Unix only. Conflicts with every other
     /// bearer, Authorization header, and OAuth credential source.
-    #[arg(long, value_name = "FD")]
+    #[arg(long, value_name = "FD", hide_short_help = true)]
     bearer_fd: Option<i32>,
 
     /// Extra header for an authenticated `--http` server, as `Name: Value`
     /// (repeatable). Split on the first colon.
-    #[arg(long = "header", value_name = "NAME: VALUE")]
+    #[arg(long = "header", value_name = "NAME: VALUE", hide_short_help = true)]
     headers: Vec<String>,
 
     /// Use a named OAuth credential profile for this HTTP connection.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", hide_short_help = true)]
     oauth: Option<String>,
 
     /// Authorize and securely save a named OAuth profile, then exit without
     /// opening an MCP session. Supply --http for a new profile.
-    #[arg(long, value_name = "NAME", conflicts_with = "logout")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "logout",
+        hide_short_help = true
+    )]
     login: Option<String>,
 
     /// Remove a named OAuth profile and its credentials, then exit without
     /// opening an MCP session.
-    #[arg(long, value_name = "NAME", conflicts_with = "login")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "login",
+        hide_short_help = true
+    )]
     logout: Option<String>,
 
     /// Initial OAuth scope to request during --login (repeatable). Existing
     /// profile scopes are retained when this is omitted.
-    #[arg(long = "oauth-scope", value_name = "SCOPE")]
+    #[arg(long = "oauth-scope", value_name = "SCOPE", hide_short_help = true)]
     oauth_scopes: Vec<String>,
 
     /// HTTPS Client ID Metadata Document URL to try before Dynamic Client
     /// Registration during --login.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", hide_short_help = true)]
     oauth_client_id_metadata_document: Option<String>,
 
     /// Exact authorization-server issuer to select when discovery advertises
     /// more than one during --login.
-    #[arg(long, value_name = "ISSUER")]
+    #[arg(long, value_name = "ISSUER", hide_short_help = true)]
     oauth_authorization_server: Option<String>,
 
     /// Print the authorization URL instead of launching a browser. The
     /// loopback callback is still used.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     no_browser: bool,
 
     /// Run a command and exit instead of starting the interactive prompt.
+    ///
     /// Repeatable; commands run in order against the same session, including
     /// after a failure. The final status is the most severe command outcome.
     /// Combine with --http/--demo or a stdio child.
     #[arg(short = 'e', long = "exec", value_name = "COMMAND")]
     exec: Vec<String>,
 
-    /// In --exec mode, emit one compact JSON value per command (NDJSON), for
-    /// piping to tools like jq.
+    /// Emit one compact JSON value per command, for piping to tools like jq.
+    ///
+    /// Applies in --exec mode, and the format is NDJSON.
     #[arg(long)]
     json: bool,
 
     /// In human --exec mode, still print the startup banner and surface
     /// listing. JSON stdout is always machine-only.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     verbose: bool,
 
     /// Validate matching tools and prompts before invocation using this saved
     /// schema snapshot (repeatable).
-    #[arg(long = "schema-contract", value_name = "PATH")]
+    #[arg(long = "schema-contract", value_name = "PATH", hide_short_help = true)]
     schema_contracts: Vec<std::path::PathBuf>,
 
     /// Enforcement used by --schema-contract snapshots.
-    #[arg(long, value_enum, default_value = "compatible")]
+    #[arg(long, value_enum, default_value = "compatible", hide_short_help = true)]
     schema_mode: schema_contract::ValidationMode,
 
     /// How to answer a server's `sampling/createMessage` request: `prompt`
     /// shows it and reads the assistant message on stdin, `canned` answers
     /// with a fixed placeholder, `decline` refuses. Defaults to `prompt`
     /// interactively and `decline` under --exec.
-    #[arg(long, value_enum, value_name = "STRATEGY")]
+    #[arg(long, value_enum, value_name = "STRATEGY", hide_short_help = true)]
     sampling: Option<sampling::SamplingMode>,
 
     /// How to answer a server's `elicitation/create` request: `prompt` shows
     /// what the server is asking and reads the answers on stdin, `decline`
     /// refuses every request. Defaults to `prompt` interactively and
     /// `decline` under --exec.
-    #[arg(long, value_enum, value_name = "STRATEGY")]
+    #[arg(long, value_enum, value_name = "STRATEGY", hide_short_help = true)]
     elicitation: Option<elicit::ElicitationMode>,
 
     /// Use a server named by an imported client config without asking first.
     /// Imported stdio entries choose a process to run; imported HTTP entries
     /// choose a remote origin and headers. Approval is interactive by default
     /// and remembered per entry without storing credential values.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     trust_import: bool,
 
     /// Do not persist command history in the platform state directory.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     no_history: bool,
 
     /// Do not transparently re-establish an interrupted HTTP connection
     /// (restart, OOM, or a 502/503 from the edge in front of it).
     /// Connection-loss errors surface as-is instead.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     no_reconnect: bool,
 
     /// Print every JSON-RPC frame sent and received, to stderr. Equivalent to
     /// starting with `wire on`; toggle it mid-session with `wire on|off`.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     trace: bool,
 
     /// Give up on a request that has produced no response after this many
@@ -334,7 +350,7 @@ struct Args {
     /// `0` waits indefinitely. `wait <id>` is exempt, since outliving the
     /// call is what a task is for; give it its own `--timeout`.
     /// Defaults to `[repl] request_timeout` in the config file, or 120.
-    #[arg(long, value_name = "SECONDS")]
+    #[arg(long, value_name = "SECONDS", hide_short_help = true)]
     timeout: Option<u64>,
 
     /// Command (and arguments) of a stdio MCP server to spawn.
