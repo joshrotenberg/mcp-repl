@@ -7,6 +7,7 @@
 //! writes the resulting URL to `MCP_REPL_FIXTURE_READY_FILE`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::Request;
@@ -27,6 +28,8 @@ struct AddInput {
     a: i64,
     b: i64,
 }
+
+static LISTEN_SUBSCRIPTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn fixture_router() -> McpRouter {
     McpRouter::new()
@@ -218,7 +221,8 @@ async fn observe_subscription(request: Request, next: Next) -> Response {
         .map(str::to_string);
     match method.as_deref() {
         Some("subscriptions/listen") => {
-            write_marker("MCP_REPL_FIXTURE_SUBSCRIPTION_FILE", b"seen");
+            let count = LISTEN_SUBSCRIPTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+            write_marker("MCP_REPL_FIXTURE_SUBSCRIPTION_FILE", count.to_string());
         }
         Some("resources/subscribe") => {
             increment_marker("MCP_REPL_FIXTURE_RESOURCE_SUBSCRIPTIONS_FILE");
