@@ -162,9 +162,9 @@ pub(crate) fn resolve_ref<'a>(
 
 fn suggestion(value: impl Into<String>, description: Option<String>, span: Span) -> Suggestion {
     Suggestion {
-        value: style::sanitize(&value.into()).into_owned(),
+        value: crate::untrusted::sanitize(&value.into()).into_owned(),
         display_override: None,
-        description: description.map(|d| style::sanitize(&d).into_owned()),
+        description: description.map(|d| crate::untrusted::sanitize(&d).into_owned()),
         style: None,
         extra: None,
         span,

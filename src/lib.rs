@@ -68,6 +68,7 @@ mod style;
 mod subscribe;
 mod surface_subscription;
 mod tool_args;
+mod untrusted;
 mod vars;
 mod wire;
 
@@ -104,7 +105,8 @@ use exit_status::ExitStatus;
 use jobs::Jobs;
 use output::AsyncOutput;
 use session::{Connector, Session, is_not_initialized, is_session_lost};
-use style::{json_pretty, paint, sanitize, tag, task_status_style};
+use style::{json_pretty, paint, tag, task_status_style};
+use untrusted::sanitize;
 use wire::{TracingTransport, wire};
 
 /// Lifecycle selected for this REPL connection.

@@ -8,7 +8,8 @@ use tower_mcp::protocol::{TaskObject, TaskStatus, TaskStatusParams};
 use tower_mcp::tasks::TaskStatusNotificationParams;
 
 use crate::output::AsyncOutput;
-use crate::style::{paint, sanitize, tag, task_status_style};
+use crate::style::{paint, tag, task_status_style};
+use crate::untrusted::sanitize;
 
 const MAX_PENDING_NOTIFICATIONS: usize = 128;
 
