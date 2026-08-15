@@ -2440,8 +2440,15 @@ async fn exercise_bearer_fd(fixture: &Path, temp: &TempDir) {
 async fn exercise_generators() {
     // Each shell spells a long option its own way: bash and zsh emit
     // `--protocol`, fish emits `-l protocol`.
+    //
+    // The bash marker is the `complete -F` builtin rather than the generated
+    // function name. clap_complete renamed that function from `_mcp-repl` to
+    // `_mcp__repl` in 4.6.9, which broke this case while the script itself
+    // stayed correct: it defines the function and registers it under the same
+    // name. Pinning the name here tests clap_complete's spelling rather than
+    // the script's shape.
     for (shell, marker, protocol_flag, demo_flag) in [
-        ("bash", "complete -F _mcp-repl", "--protocol", "--demo"),
+        ("bash", "complete -F", "--protocol", "--demo"),
         ("zsh", "#compdef mcp-repl", "--protocol", "--demo"),
         ("fish", "complete -c mcp-repl", "-l protocol", "-l demo"),
     ] {
