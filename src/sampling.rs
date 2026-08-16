@@ -19,7 +19,8 @@ use tower_mcp::protocol::{
     SamplingMessage,
 };
 
-use crate::style::{paint, sanitize, tag};
+use crate::style::{paint, tag};
+use crate::untrusted::sanitize;
 
 /// How to answer a `sampling/createMessage` request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

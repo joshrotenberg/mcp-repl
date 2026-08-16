@@ -31,7 +31,8 @@ use tower_mcp::protocol::{
 
 use crate::output::AsyncOutput;
 use crate::sampling::{self, SamplingMode};
-use crate::style::{paint, sanitize, tag};
+use crate::style::{paint, tag};
+use crate::untrusted::sanitize;
 
 /// How to answer `elicitation/create`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]

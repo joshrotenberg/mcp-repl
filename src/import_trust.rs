@@ -20,7 +20,8 @@ use nu_ansi_term::{Color, Style};
 use serde::{Deserialize, Serialize};
 
 use crate::secure_file;
-use crate::style::{paint, sanitize, tag};
+use crate::style::{paint, tag};
+use crate::untrusted::sanitize;
 
 /// What a selected import resolved to, and what approval is checked against.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

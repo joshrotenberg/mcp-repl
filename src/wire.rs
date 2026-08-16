@@ -27,8 +27,9 @@ use serde_json::Value;
 use tower_mcp::client::ClientTransport;
 use tower_mcp::error::Result;
 
-use crate::style::{paint, sanitize, tag};
+use crate::style::{paint, tag};
 use crate::timing;
+use crate::untrusted::sanitize;
 
 /// Which way a frame went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
