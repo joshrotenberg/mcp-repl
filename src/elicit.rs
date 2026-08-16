@@ -393,6 +393,10 @@ fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
                     }
                 }
             }
+            if let Some(complaint) = reject_answer(schema, raw) {
+                eprintln!("{}", sanitize(&complaint));
+                continue;
+            }
             content.insert(name.clone(), coerce_field(schema, raw));
             break;
         }
@@ -427,6 +431,59 @@ fn describe_field(schema: &PrimitiveSchemaDefinition) -> (String, Option<String>
         None => "value".to_string(),
     };
     (label, description, default)
+}
+
+/// The values a field will accept, when it names them, and whether it takes
+/// several.
+///
+/// Only an `enum`, which is the one case where the schema states the whole
+/// answer and a wrong one cannot be salvaged. Everything else is sent as
+/// typed, because mcp-repl is not a JSON Schema validator and should not grow
+/// into one.
+///
+/// Booleans are deliberately excluded even though their values enumerate.
+/// `coerce_field` accepts `y`, `yes`, and `on` and converts them, so the
+/// generous spellings are a feature of answering a prompt by hand rather than
+/// a mistake to correct.
+fn accepted_values(schema: &PrimitiveSchemaDefinition) -> Option<(Vec<String>, bool)> {
+    let raw = field_json(schema);
+    let multi = raw.get("type").and_then(|t| t.as_str()) == Some("array");
+    let values = raw
+        .get("enum")
+        .or_else(|| raw.pointer("/items/enum"))
+        .and_then(|e| e.as_array())?;
+    Some((values.iter().map(render_default).collect(), multi))
+}
+
+/// Why an answer cannot be sent, when the field named what it accepts.
+///
+/// A prompt exists to give an answer back immediately. Sending a value the
+/// schema on screen already rules out, and waiting to see whether the server
+/// happens to check, is worse than saying so at the point of typing.
+fn reject_answer(schema: &PrimitiveSchemaDefinition, raw: &str) -> Option<String> {
+    let (choices, multi) = accepted_values(schema)?;
+    let mut unknown: Vec<&str> = Vec::new();
+    let answers: Vec<&str> = if multi {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec![raw]
+    };
+    for answer in answers {
+        if !choices.iter().any(|choice| choice == answer) {
+            unknown.push(answer);
+        }
+    }
+    if unknown.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  {} is not one of: {}",
+        unknown.join(", "),
+        choices.join(", ")
+    ))
 }
 
 /// A field schema as plain JSON.
@@ -502,6 +559,54 @@ mod tests {
         assert_eq!(label, "integer");
         assert_eq!(description.as_deref(), Some("How many"));
         assert_eq!(default.as_deref(), Some("3"));
+    }
+
+    /// The complaint an answer draws, or `None` when it is acceptable.
+    fn rejected(field: serde_json::Value, raw: &str) -> Option<String> {
+        reject_answer(&field_from_wire(field), raw)
+    }
+
+    #[test]
+    fn an_answer_outside_the_choices_is_refused_with_the_choices() {
+        let field = serde_json::json!({"type": "string", "enum": ["staging", "production"]});
+        let complaint = rejected(field.clone(), "stagi").expect("refused");
+        assert!(complaint.contains("stagi"), "{complaint}");
+        assert!(complaint.contains("staging, production"), "{complaint}");
+        assert!(rejected(field, "staging").is_none());
+    }
+
+    #[test]
+    fn a_boolean_keeps_its_generous_spellings() {
+        // `coerce_field` accepts y/yes/on and converts them, so answering a
+        // boolean by hand is deliberately forgiving. Checking it against
+        // `true`/`false` would reject answers that already work, which is what
+        // the elicitation e2e case feeds.
+        let field = serde_json::json!({"type": "boolean"});
+        for answer in ["y", "yes", "on", "true", "false", "n"] {
+            assert!(rejected(field.clone(), answer).is_none(), "{answer}");
+        }
+    }
+
+    #[test]
+    fn a_multi_select_checks_every_element() {
+        let field = serde_json::json!({
+            "type": "array",
+            "items": {"type": "string", "enum": ["a", "b", "c"]},
+        });
+        assert!(rejected(field.clone(), "a, c").is_none());
+        let complaint = rejected(field.clone(), "a, z").expect("refused");
+        assert!(complaint.contains('z'), "{complaint}");
+        // The complaint names only what was wrong, not the whole answer.
+        assert!(!complaint.starts_with("  a,"), "{complaint}");
+    }
+
+    #[test]
+    fn an_unconstrained_field_accepts_anything() {
+        // mcp-repl is not a JSON Schema validator; only fields that state
+        // their whole answer are checked.
+        assert!(rejected(serde_json::json!({"type": "string"}), "whatever").is_none());
+        assert!(rejected(serde_json::json!({"type": "integer"}), "not a number").is_none());
+        assert!(rejected(serde_json::json!({}), "").is_none());
     }
 
     /// The value as it goes back on the wire, which is what the server
