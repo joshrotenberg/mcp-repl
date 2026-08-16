@@ -858,6 +858,17 @@ pub(crate) const BUILTINS: Builtins = Builtins(&[
         detail: "List values captured from command results.",
     },
     Builtin {
+        name: "for",
+        summary: "run a command once per element of a captured list",
+        usage: "for $var in $list: <command>",
+        detail: "Bind each element of a captured array to a variable and run one \
+                 command for it. The command is an ordinary line, so tool calls, \
+                 built-ins, and $ references all work as usual. Every element runs \
+                 even if one fails, and the exit status is the most severe outcome. \
+                 There is no conditional form: select what to iterate with a path \
+                 rather than testing inside the loop.",
+    },
+    Builtin {
         name: "unset",
         summary: "clear a captured variable",
         usage: "unset <name>",
@@ -4591,6 +4602,151 @@ enum CommandNamespace {
     Builtin,
 }
 
+/// A `for` header, before the body has been looked at.
+#[derive(Debug)]
+struct ForLoop<'a> {
+    /// The name bound each pass, without its `$`.
+    var: &'a str,
+    /// The `$name.path` the elements come from, with its `$`.
+    source: &'a str,
+    /// The command to run per element, still holding `$var` references.
+    body: &'a str,
+}
+
+/// A typo should not become a thousand tool calls. Nothing between the prompt
+/// and the server rate-limits a loop, and tools can be destructive.
+const FOR_LIMIT: usize = 1000;
+
+/// Recognize `for $x in $list: command`, before substitution runs.
+///
+/// This has to be parsed early: `$x` is not bound until the loop runs, so
+/// letting the usual `$var` substitution see the header would fail on the loop
+/// variable before the loop could bind it.
+///
+/// Returns `None` for a line that is not a `for` at all, so an MCP server may
+/// still have a tool named `for`.
+fn parse_for(line: &str) -> Option<Result<ForLoop<'_>, String>> {
+    let rest = line.strip_prefix("for")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // Split on the first colon: a body may contain colons (URLs, `PATH:ENTRY`),
+    // but a header never does.
+    let Some((header, body)) = rest.split_once(':') else {
+        return Some(Err(
+            "usage: for $var in $list: <command>  (the `:` before the command is required)".into(),
+        ));
+    };
+    let body = body.trim();
+    if body.is_empty() {
+        return Some(Err("`for` has no command to run".into()));
+    }
+    let header: Vec<&str> = header.split_whitespace().collect();
+    let [var, "in", source] = header.as_slice() else {
+        return Some(Err("usage: for $var in $list: <command>".into()));
+    };
+    let Some(var) = var.strip_prefix('$') else {
+        return Some(Err(format!("`for` binds a variable, so write `${var}`")));
+    };
+    if !source.starts_with('$') {
+        return Some(Err(format!(
+            "`for` iterates a captured value, so write `${source}`"
+        )));
+    }
+    Some(Ok(ForLoop { var, source, body }))
+}
+
+/// Resolve the `$name.path` a `for` iterates, to the array it names.
+fn for_elements(source: &str) -> Result<Vec<serde_json::Value>, String> {
+    let reference = &source[1..];
+    let (name, path) = match reference.split_once(['.', '[']) {
+        // Keep the bracket: `items[0]` is a path segment, `items.x` is not.
+        Some((name, _)) => (name, &reference[name.len()..]),
+        None => (reference, ""),
+    };
+    let value =
+        vars::get(name).ok_or_else(|| format!("no such variable `${name}`; `vars` lists them"))?;
+    let selected = vars::get_path(&value, path.trim_start_matches('.'))?
+        .ok_or_else(|| format!("`{source}` is not set"))?;
+    match selected {
+        serde_json::Value::Array(items) => Ok(items),
+        other => Err(format!(
+            "`for` iterates an array, and `{source}` is {}",
+            match other {
+                serde_json::Value::Object(_) => "an object",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Bool(_) => "a boolean",
+                _ => "null",
+            }
+        )),
+    }
+}
+
+/// Run one command per element, binding each to the loop variable.
+///
+/// Every element runs even when one fails, matching `--exec`, which runs every
+/// command and exits with the most severe outcome. Stopping at the first
+/// failure would leave a bulk operation half applied with no record of where.
+async fn run_for(
+    session: &Arc<Session>,
+    surface: &Arc<RwLock<Surface>>,
+    aliases: &Arc<RwLock<Aliases>>,
+    jobs: &Arc<Jobs>,
+    schema_contracts: &schema_contract::ContractSet,
+    connect_runtime: &ConnectRuntime,
+    loop_: ForLoop<'_>,
+) -> bool {
+    let items = match for_elements(loop_.source) {
+        Ok(items) => items,
+        Err(error) => {
+            report_error(ExitStatus::Usage, &error);
+            return false;
+        }
+    };
+    let total = items.len();
+    let capped = total.min(FOR_LIMIT);
+    if total > FOR_LIMIT {
+        report_error(
+            ExitStatus::Usage,
+            &format!(
+                "`{}` has {total} elements, over the {FOR_LIMIT} `for` runs; \
+                 narrow it with a path before iterating",
+                loop_.source
+            ),
+        );
+        return false;
+    }
+    // The loop variable is an ordinary capture while the loop runs, so the body
+    // needs no special syntax. Anything it shadows is put back afterwards.
+    let shadowed = vars::get(loop_.var);
+    let mut quit = false;
+    for item in items.into_iter().take(capped) {
+        vars::set(loop_.var, item);
+        if Box::pin(handle_line(
+            session,
+            surface,
+            aliases,
+            jobs,
+            schema_contracts,
+            connect_runtime,
+            loop_.body,
+        ))
+        .await
+        {
+            quit = true;
+            break;
+        }
+    }
+    match shadowed {
+        Some(previous) => vars::set(loop_.var, previous),
+        None => {
+            vars::unset(loop_.var);
+        }
+    }
+    quit
+}
+
 async fn handle_line(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
@@ -4621,6 +4777,28 @@ async fn handle_line(
             return false;
         }
     };
+    // `for` is read before substitution, since its loop variable is not bound
+    // until the loop binds it and the usual `$var` pass would fail on it first.
+    if let Some(parsed) = parse_for(line) {
+        return match parsed {
+            Ok(loop_) => {
+                run_for(
+                    session,
+                    surface,
+                    aliases,
+                    jobs,
+                    schema_contracts,
+                    connect_runtime,
+                    loop_,
+                )
+                .await
+            }
+            Err(error) => {
+                report_error(ExitStatus::Usage, &error);
+                false
+            }
+        };
+    }
     // Capture (`name = cmd`), pipe (`cmd | path`), and `$var` references make
     // the REPL a small shell: routing and substitution run before dispatch so
     // every command sees resolved arguments. Capture and pipe act on tool
@@ -7630,6 +7808,65 @@ mod tests {
         // Anything with a separator is taken as a path and not searched.
         assert!(!program_is_runnable("./mcp-repl-definitely-not-here"));
         assert!(program_is_runnable("/bin/sh"));
+    }
+
+    #[test]
+    fn only_a_for_line_is_read_as_a_loop() {
+        // A server may name a tool `for`, and a word merely starting with
+        // "for" is not one, so the prefix alone must not claim the line.
+        assert!(parse_for("forward name=x").is_none());
+        assert!(parse_for("format").is_none());
+        assert!(parse_for("for").is_none());
+        assert!(parse_for("describe for").is_none());
+        assert!(parse_for("for $x in $t: describe $x").is_some());
+    }
+
+    #[test]
+    fn a_for_header_binds_a_variable_to_a_source() {
+        let parsed = parse_for("for $t in $tools.items: describe $t.name")
+            .expect("a for line")
+            .expect("a valid header");
+        assert_eq!(parsed.var, "t");
+        assert_eq!(parsed.source, "$tools.items");
+        assert_eq!(parsed.body, "describe $t.name");
+    }
+
+    #[test]
+    fn a_body_may_contain_colons() {
+        // Only the first colon separates, so URLs and PATH:ENTRY selectors
+        // survive in the body.
+        let parsed = parse_for("for $u in $list: read https://example/a:b")
+            .expect("a for line")
+            .expect("a valid header");
+        assert_eq!(parsed.body, "read https://example/a:b");
+    }
+
+    #[test]
+    fn a_malformed_for_says_what_it_wanted() {
+        let err = |line: &str| parse_for(line).expect("a for line").unwrap_err();
+        assert!(err("for $x in $t describe $x").contains("usage:"));
+        assert!(err("for x in $t: describe $x").contains("$x"));
+        assert!(err("for $x in t: describe $x").contains("$t"));
+        assert!(err("for $x in $t:").contains("no command"));
+        assert!(err("for $x $t: describe $x").contains("usage:"));
+    }
+
+    #[test]
+    fn a_for_source_must_name_an_array() {
+        vars::set("for_test_obj", serde_json::json!({"a": 1}));
+        vars::set("for_test_arr", serde_json::json!([1, 2, 3]));
+
+        let err = for_elements("$for_test_obj").unwrap_err();
+        assert!(err.contains("an object"), "{err}");
+        assert_eq!(for_elements("$for_test_arr").unwrap().len(), 3);
+        assert!(
+            for_elements("$for_test_missing")
+                .unwrap_err()
+                .contains("no such variable")
+        );
+
+        vars::unset("for_test_obj");
+        vars::unset("for_test_arr");
     }
 
     /// Generate into a buffer the way the flag generates onto stdout.
