@@ -120,6 +120,47 @@ typed exit statuses so a failure is distinguishable from an empty result.
 
 ![two JSON invocations piped through jq, followed by a schema violation exiting with status 3](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/scripting.png)
 
+## The shell model
+
+mcp-repl is a shell whose command set is the connected server. That is the
+organizing idea, and most of the grammar arrived by following it rather than
+by deciding it:
+
+| mcp-repl | the shell equivalent |
+| --- | --- |
+| `name = command`, then `$name.path[0].field` | variables |
+| `command \| path` | a pipe into a filter |
+| `command &`, `jobs`, `wait`, `cancel` | job control |
+| `alias`, `unalias` | aliases |
+| `for $var in $list: command` | `for` |
+| `tool <name>`, `builtin <name>` | `command` and `builtin`, for shadowed names |
+| `history`, Ctrl-R | history |
+| `-e` with typed exit statuses | a non-interactive shell |
+
+Naming the model is useful because it settles scope questions in advance
+rather than one at a time. Things that are shell constructs fit: `&&` and
+`||`, redirecting output to a file, reading commands from a file, a richer
+path selector. Things that are programming-language constructs do not:
+functions, arithmetic, `if`, string manipulation, an embedded scripting
+language.
+
+That boundary is not a limitation to be worked around later. A shell's own
+answer to a task that outgrows it is to hand off to a real language, and here
+that language already exists: an MCP SDK in Python or TypeScript, called from
+a real program. Growing a second one inside this prompt would cost a whole
+ecosystem to arrive somewhere worse.
+
+The known exception is small and worth stating. An external script cannot
+hand a value back to a live prompt you are sitting at, so anything whose
+entire point is interactive continuity belongs here rather than in a script.
+Nothing else does.
+
+`for` is the worked example. It ships with no conditional form on purpose:
+iteration is a shell construct, but `if` is what would force expressions,
+comparison, and truthiness into the language. When the need is "only the
+high-priority ones," the answer is a more capable path selector, which is
+bounded, rather than a test inside the loop, which is not.
+
 ## Documentation
 
 | | |
