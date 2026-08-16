@@ -3600,6 +3600,55 @@ fn resolve_import(args: &Args) -> Option<import_config::ImportedConnection> {
     )
 }
 
+/// Whether a program name could be executed, so a missing one can be reported
+/// as itself rather than as a transport failure.
+///
+/// Existence rather than executability: a file that is present but not
+/// executable fails later with its own accurate message, while an absent one
+/// is the case that currently surfaces as `No such file or directory` with no
+/// mention of what was being run.
+fn program_is_runnable(program: &str) -> bool {
+    if program.contains('/') || program.contains('\\') {
+        return std::path::Path::new(program).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+/// The flag a bare word was probably meant to be, for `mcp-repl demo`.
+///
+/// An exact match against a long flag with the dashes stripped, deliberately
+/// not fuzzy: suggesting `--server` for a mistyped program name would be
+/// noise, while `demo` for `--demo` is unambiguous.
+fn flag_for_bare_word(word: &str) -> Option<String> {
+    <Args as clap::CommandFactory>::command()
+        .get_arguments()
+        .filter_map(|arg| arg.get_long())
+        .any(|long| long == word)
+        .then(|| format!("--{word}"))
+}
+
+/// Explain a program that cannot be run, in terms of why it was being run.
+///
+/// A lone argument reaches the spawn path only after failing to resolve as a
+/// profile name and as a `PATH.json:ENTRY` selector, which is not something a
+/// reader can be expected to know from `No such file or directory`.
+fn explain_unrunnable_program(command: &[String]) -> String {
+    let program = &command[0];
+    let mut message = format!("no such program {program:?}");
+    if command.len() == 1 {
+        message.push_str(
+            "\n  a lone argument is run as a stdio MCP server, after being tried as a \
+             server profile name and as a PATH.json:ENTRY selector",
+        );
+    }
+    if let Some(flag) = flag_for_bare_word(program) {
+        message.push_str(&format!("\n  did you mean {flag}?"));
+    }
+    message
+}
+
 /// The levels `logging/setLevel` accepts, in the spec's order of severity.
 /// Ordered rather than alphabetical, so the completion menu reads as a scale.
 pub(crate) const LOG_LEVELS: &[&str] = &[
@@ -3902,11 +3951,33 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 oauth: Some(name.to_string()),
             })
         }
-        (None, None) if !args.command.is_empty() => Some(config::Connection::Stdio {
-            command: args.command.clone(),
-            env: std::collections::BTreeMap::new(),
-            cwd: None,
-        }),
+        // `mcp-repl help` and `mcp-repl version` are what someone types before
+        // they have read anything, and neither is a plausible program name for
+        // an MCP server. Reaching this arm means nothing resolved them as a
+        // profile or an import, so a real server of either name still wins.
+        (None, None) if matches!(args.command.as_slice(), [only] if only == "help" || only == "version") =>
+        {
+            let mut command = <Args as clap::CommandFactory>::command();
+            if args.command[0] == "version" {
+                print!("{}", command.render_version());
+            } else {
+                command.print_help().expect("write help to stdout");
+            }
+            std::process::exit(ExitStatus::Success as i32);
+        }
+        (None, None) if !args.command.is_empty() => {
+            if !program_is_runnable(&args.command[0]) {
+                exit_with_error(
+                    ExitStatus::Usage,
+                    &explain_unrunnable_program(&args.command),
+                );
+            }
+            Some(config::Connection::Stdio {
+                command: args.command.clone(),
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+            })
+        }
         (None, None) => None,
     };
 
@@ -7518,6 +7589,47 @@ mod tests {
     #[test]
     fn find_is_a_completable_builtin() {
         assert!(BUILTINS.contains("find"));
+    }
+
+    #[test]
+    fn a_bare_word_is_matched_to_a_flag_only_when_it_is_one() {
+        // `mcp-repl demo` is the case worth catching.
+        assert_eq!(flag_for_bare_word("demo").as_deref(), Some("--demo"));
+        assert_eq!(flag_for_bare_word("json").as_deref(), Some("--json"));
+        // Exact, not fuzzy: suggesting `--server` for a mistyped program name
+        // would be noise rather than help.
+        assert!(flag_for_bare_word("serv").is_none());
+        assert!(flag_for_bare_word("tools").is_none());
+        assert!(flag_for_bare_word("./my-server").is_none());
+    }
+
+    #[test]
+    fn a_missing_program_is_explained_by_why_it_was_being_run() {
+        let lone = explain_unrunnable_program(&["demo".to_string()]);
+        assert!(lone.contains("no such program"), "{lone}");
+        assert!(lone.contains("did you mean --demo?"), "{lone}");
+        assert!(lone.contains("lone argument"), "{lone}");
+
+        // An explicit command is not a misread selector, so the explanation
+        // about lone arguments would be wrong there.
+        let explicit = explain_unrunnable_program(&["./sever".to_string(), "--stdio".to_string()]);
+        assert!(explicit.contains("no such program"), "{explicit}");
+        assert!(!explicit.contains("lone argument"), "{explicit}");
+
+        // A word that is not a flag gets the explanation and no suggestion.
+        let plain = explain_unrunnable_program(&["tools".to_string()]);
+        assert!(plain.contains("lone argument"), "{plain}");
+        assert!(!plain.contains("did you mean"), "{plain}");
+    }
+
+    #[test]
+    fn a_program_is_runnable_by_path_or_by_name() {
+        // Bare names are searched on PATH.
+        assert!(program_is_runnable("sh"));
+        assert!(!program_is_runnable("mcp-repl-definitely-not-installed"));
+        // Anything with a separator is taken as a path and not searched.
+        assert!(!program_is_runnable("./mcp-repl-definitely-not-here"));
+        assert!(program_is_runnable("/bin/sh"));
     }
 
     /// Generate into a buffer the way the flag generates onto stdout.
