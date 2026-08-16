@@ -70,6 +70,34 @@ fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::V
     }
 }
 
+/// Fill in defaults from `binds` for schema-declared parameters a call did
+/// not supply. An explicit argument always wins: only properties absent from
+/// `arguments` are filled in, whether the call arrived as `key=value` tokens
+/// or a single JSON object literal -- both produce a JSON object here, and
+/// this runs on the result either way, so a bind fills the same gaps
+/// regardless of which form supplied the rest.
+pub(crate) fn apply_binds(
+    schema: &serde_json::Value,
+    binds: &crate::bind::Binds,
+    mut arguments: serde_json::Value,
+) -> serde_json::Value {
+    let Some(object) = arguments.as_object_mut() else {
+        return arguments;
+    };
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return arguments;
+    };
+    for name in properties.keys() {
+        if object.contains_key(name) {
+            continue;
+        }
+        if let Some(raw) = binds.get(name) {
+            object.insert(name.clone(), coerce_arg(schema, name, raw));
+        }
+    }
+    arguments
+}
+
 fn split_kv_arg(token: &str) -> Result<(&str, &str), String> {
     let Some((key, value)) = token.split_once('=') else {
         return Err(format!("argument {token:?} must use `key=value` syntax"));
@@ -145,5 +173,50 @@ mod tests {
         for token in ["missing", "=value"] {
             assert!(parse_prompt_args(&[token]).is_err());
         }
+    }
+
+    fn binds(pairs: &[(&str, &str)]) -> crate::bind::Binds {
+        let mut binds = crate::bind::Binds::default();
+        for (name, value) in pairs {
+            binds.set(name, value);
+        }
+        binds
+    }
+
+    #[test]
+    fn an_explicit_argument_always_wins_over_a_bind() {
+        let parsed = parse_kv_args(&schema(), &["count=2"]).unwrap();
+        let filled = apply_binds(&schema(), &binds(&[("count", "9")]), parsed);
+        assert_eq!(filled["count"], 2);
+    }
+
+    #[test]
+    fn a_bind_fills_a_declared_property_the_call_omitted_coerced_to_its_type() {
+        let parsed = parse_kv_args(&schema(), &["ratio=1.5"]).unwrap();
+        let filled = apply_binds(&schema(), &binds(&[("count", "2")]), parsed);
+        // A real JSON number, not the string "2": the same coercion a typed
+        // `k=v` argument already gets.
+        assert_eq!(filled["count"], json!(2));
+        assert!(filled["count"].is_number());
+        assert_eq!(filled["ratio"], 1.5);
+    }
+
+    #[test]
+    fn a_bind_for_an_undeclared_parameter_is_never_inserted() {
+        let parsed = parse_kv_args(&schema(), &["count=2"]).unwrap();
+        let filled = apply_binds(&schema(), &binds(&[("nope", "1")]), parsed);
+        assert!(filled.get("nope").is_none());
+    }
+
+    #[test]
+    fn a_bind_fills_gaps_in_a_json_object_literal_the_same_way() {
+        let parsed = parse_kv_args(&schema(), &[r#"{"count":2}"#]).unwrap();
+        let filled = apply_binds(&schema(), &binds(&[("ratio", "1.5")]), parsed);
+        // The literal's own key is untouched...
+        assert_eq!(filled["count"], json!(2));
+        // ...and the bind still fills the property the object omitted, typed
+        // from the schema rather than left as text.
+        assert_eq!(filled["ratio"], json!(1.5));
+        assert!(filled["ratio"].is_number());
     }
 }

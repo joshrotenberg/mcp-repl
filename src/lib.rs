@@ -43,6 +43,7 @@
 mod alias;
 mod bearer_fd;
 mod bench;
+mod bind;
 mod builtin;
 mod command;
 pub mod config;
@@ -99,6 +100,7 @@ use tower_mcp::protocol::{
 use tower_mcp::{ProtocolSupport, ProtocolSupportError};
 
 use alias::Aliases;
+use bind::Binds;
 use builtin::{Builtin, Builtins};
 use elicit::ReplClientHandler;
 use exit_status::ExitStatus;
@@ -801,6 +803,28 @@ pub(crate) const BUILTINS: Builtins = Builtins(&[
         detail: "Remove the alias that is in effect for a name.",
     },
     Builtin {
+        name: "bind",
+        summary: "set a default value for a tool parameter",
+        usage: "bind <param>=<value>",
+        detail: "Set a default value for any tool parameter of that name, applied when a \
+         call does not supply one. An explicit argument always wins; a bind for a \
+         parameter no tool declares warns rather than failing silently. Binds are \
+         per connection and cleared when `connect` switches servers.",
+    },
+    Builtin {
+        name: "binds",
+        summary: "list the default values currently bound",
+        usage: "binds",
+        detail: "List the parameter defaults set with `bind` for the current \
+         connection.",
+    },
+    Builtin {
+        name: "unbind",
+        summary: "clear a bound default value",
+        usage: "unbind <param>",
+        detail: "Remove the default value bound to a parameter name.",
+    },
+    Builtin {
         name: "ping",
         summary: "check the server is answering",
         usage: "ping",
@@ -971,6 +995,17 @@ const BUILTIN_GUIDES: &[BuiltinGuide] = &[
             "alias dl=get_downloads",
             "alias w=tool wait",
             "alias --global t=tools",
+        ],
+    },
+    BuiltinGuide {
+        name: "bind",
+        details: &[
+            "A bind fills a schema-declared parameter a call omits; an explicit argument always wins. The value is typed from the specific tool's inputSchema at call time, the same way a k=v argument coerces, so a bind can apply to several tools that share a parameter name even if they type it differently.",
+            "Binds are per connection: connect clears them, so a session id bound for one server cannot leak into a same-named parameter on the next. bind <name> with no value shows what is bound; binds lists everything; unbind <name> clears one.",
+        ],
+        examples: &[
+            "bind session=74da9505-36db-4639-9b99-0f0bc04703d8",
+            "unbind session",
         ],
     },
     BuiltinGuide {
@@ -3925,6 +3960,10 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         config_file,
     )));
 
+    // Binds are pure session state: no config file, no scopes. `connect`
+    // clears them, so there is nothing to seed here.
+    let binds = Arc::new(RwLock::new(Binds::default()));
+
     let connection = match (args.http.clone(), connection) {
         (
             Some(url),
@@ -4333,6 +4372,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                 &session,
                 &surface,
                 &aliases,
+                &binds,
                 &jobs,
                 &schema_contracts,
                 &connect_runtime,
@@ -4420,6 +4460,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
                     &session,
                     &surface,
                     &aliases,
+                    &binds,
                     &jobs,
                     &schema_contracts,
                     &connect_runtime,
@@ -4550,6 +4591,7 @@ async fn run_cancellable(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
     aliases: &Arc<RwLock<Aliases>>,
+    binds: &Arc<RwLock<Binds>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
@@ -4563,6 +4605,7 @@ async fn run_cancellable(
             session,
             surface,
             aliases,
+            binds,
             jobs,
             schema_contracts,
             connect_runtime,
@@ -4688,10 +4731,12 @@ fn for_elements(source: &str) -> Result<Vec<serde_json::Value>, String> {
 /// Every element runs even when one fails, matching `--exec`, which runs every
 /// command and exits with the most severe outcome. Stopping at the first
 /// failure would leave a bulk operation half applied with no record of where.
+#[allow(clippy::too_many_arguments)]
 async fn run_for(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
     aliases: &Arc<RwLock<Aliases>>,
+    binds: &Arc<RwLock<Binds>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
@@ -4727,6 +4772,7 @@ async fn run_for(
             session,
             surface,
             aliases,
+            binds,
             jobs,
             schema_contracts,
             connect_runtime,
@@ -4747,10 +4793,12 @@ async fn run_for(
     quit
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_line(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
     aliases: &Arc<RwLock<Aliases>>,
+    binds: &Arc<RwLock<Binds>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
@@ -4786,6 +4834,7 @@ async fn handle_line(
                     session,
                     surface,
                     aliases,
+                    binds,
                     jobs,
                     schema_contracts,
                     connect_runtime,
@@ -4930,6 +4979,7 @@ async fn handle_line(
                 let cleared_vars = vars::clear();
                 let cleared_jobs = jobs.clear();
                 let cleared_subscriptions = subscribe::clear();
+                let cleared_binds = binds.write().unwrap().clear();
                 aliases
                     .write()
                     .unwrap()
@@ -4950,6 +5000,7 @@ async fn handle_line(
                     (cleared_vars, "captured variable"),
                     (cleared_jobs, "background task"),
                     (cleared_subscriptions, "resource subscription"),
+                    (cleared_binds, "bind"),
                 ]
                 .into_iter()
                 .filter(|(count, _)| *count > 0)
@@ -4975,6 +5026,9 @@ async fn handle_line(
         "help"
             | "alias"
             | "unalias"
+            | "bind"
+            | "binds"
+            | "unbind"
             | "wire"
             | "last"
             | "history"
@@ -4996,6 +5050,7 @@ async fn handle_line(
         dispatch_direct_tool(
             session,
             surface,
+            binds,
             jobs,
             schema_contracts,
             cmd,
@@ -5081,6 +5136,7 @@ async fn handle_line(
             println!("  <tool> [k=v...] &                         run task-augmented (SEP-2663)");
             println!("  jobs | task <id> | wait <id> | cancel <id>  manage tasks");
             println!("  alias [<name>=<expansion>] | unalias <name>  command aliases");
+            println!("  bind <param>=<value> | binds | unbind <param>  sticky parameter defaults");
             println!("  wire [on|off]                             trace raw JSON-RPC frames");
             println!("  last                                      reprint the previous exchange");
             println!(
@@ -5745,6 +5801,45 @@ async fn handle_line(
             let raw = command_line.strip_prefix(cmd).unwrap_or("").trim();
             handle_alias(aliases, surface, cmd, raw);
         }
+        "bind" | "unbind" => {
+            handle_bind(binds, surface, session.is_connected(), cmd, rest);
+        }
+        "binds" => {
+            let binds = binds.read().unwrap();
+            if json_output() {
+                let map: serde_json::Map<String, serde_json::Value> = binds
+                    .entries()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string(),
+                            serde_json::Value::String(value.to_string()),
+                        )
+                    })
+                    .collect();
+                print_json(&serde_json::Value::Object(map));
+            } else if binds.is_empty() {
+                println!(
+                    "{}",
+                    paint(
+                        Style::new().dimmed(),
+                        "no binds set (try `bind <param>=<value>`)"
+                    )
+                );
+            } else {
+                let width = binds
+                    .entries()
+                    .map(|(name, _)| name.len())
+                    .max()
+                    .unwrap_or(0);
+                for (name, value) in binds.entries() {
+                    println!(
+                        "{}  {}",
+                        style::column(Style::new().fg(Color::Cyan), name, width),
+                        value
+                    );
+                }
+            }
+        }
         "wire" => {
             match rest.first().copied() {
                 Some("on") => wire().set_trace(true),
@@ -6021,6 +6116,7 @@ async fn handle_line(
             dispatch_direct_tool(
                 session,
                 surface,
+                binds,
                 jobs,
                 schema_contracts,
                 tool_name,
@@ -6038,6 +6134,7 @@ async fn handle_line(
 async fn dispatch_direct_tool(
     session: &Arc<Session>,
     surface: &Arc<RwLock<Surface>>,
+    binds: &Arc<RwLock<Binds>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     tool_name: &str,
@@ -6074,6 +6171,7 @@ async fn dispatch_direct_tool(
             return;
         }
     };
+    let arguments = tool_args::apply_binds(&schema, &binds.read().unwrap(), arguments);
     run_tool(
         session,
         surface,
@@ -6368,6 +6466,96 @@ fn report_alias_warning(warning: Option<&str>) {
     if let Some(w) = warning {
         eprintln!("warning: {w}");
     }
+}
+
+/// The `bind` and `unbind` built-ins. `binds` (listing) is handled directly
+/// in `handle_line`'s match, since it needs no name/value to parse.
+///
+/// Unlike an alias's expansion, a bind's value is a single scalar, already
+/// unquoted and de-escaped by `command::parse`, so `rest` arrives as at most
+/// one `name=value` token rather than the raw remainder of the line.
+fn handle_bind(
+    binds: &Arc<RwLock<Binds>>,
+    surface: &Arc<RwLock<Surface>>,
+    connected: bool,
+    cmd: &str,
+    rest: &[&str],
+) {
+    if cmd == "unbind" {
+        let [name] = rest else {
+            command_error("usage: unbind <param>");
+            return;
+        };
+        if name.contains('=') {
+            command_error("usage: unbind <param>");
+            return;
+        }
+        match binds.write().unwrap().remove(name) {
+            Some(previous) => {
+                if json_output() {
+                    print_json(&serde_json::json!({ "removed": name, "value": previous }));
+                } else {
+                    println!("removed {}", paint(Style::new().fg(Color::Cyan), name));
+                }
+            }
+            None => command_error(&format!("no bind named `{name}` (see `binds`)")),
+        }
+        return;
+    }
+
+    // `bind` with nothing after it does not list: that is what the separate
+    // `binds` built-in is for.
+    let [token] = rest else {
+        command_error("usage: bind <param>=<value> (see `binds` to list them)");
+        return;
+    };
+
+    // `bind <name>` with no `=` shows what is bound, rather than defining.
+    let Some((name, value)) = token.split_once('=') else {
+        let binds = binds.read().unwrap();
+        match binds.get(token) {
+            Some(value) if json_output() => {
+                print_json(&serde_json::json!({ "name": token, "value": value }))
+            }
+            Some(value) => println!("{} = {}", paint(Style::new().fg(Color::Cyan), token), value),
+            None => command_error(&format!(
+                "no bind named `{token}` (define one with `bind {token}=<value>`)"
+            )),
+        }
+        return;
+    };
+    if name.is_empty() {
+        command_error("usage: bind <param>=<value>");
+        return;
+    }
+
+    let previous = binds.write().unwrap().set(name, value);
+    // The surface is already loaded, so an undeclared parameter is
+    // checkable immediately rather than discovered silently at call time.
+    // Disconnected, there is no surface to check against, so no warning.
+    if connected {
+        let declared = surface.read().unwrap().tools.iter().any(|tool| {
+            tool.input_schema
+                .get("properties")
+                .and_then(|properties| properties.get(name))
+                .is_some()
+        });
+        if !declared {
+            eprintln!(
+                "warning: no tool on this server declares a parameter named `{name}`; \
+                 it will apply once one does"
+            );
+        }
+    }
+    if json_output() {
+        print_json(&serde_json::json!({
+            "name": name,
+            "value": value,
+            "replaced": previous,
+        }));
+        return;
+    }
+    println!("{} = {}", paint(Style::new().fg(Color::Cyan), name), value);
 }
 
 fn command_error(message: &str) {
@@ -8233,7 +8421,7 @@ world",
                 "{routable} returns a documented value"
             );
         }
-        for reporting in ["help", "alias", "wire", "refresh", "quit", "unset"] {
+        for reporting in ["help", "alias", "binds", "wire", "refresh", "quit", "unset"] {
             assert!(
                 !ROUTABLE_BUILTINS.contains(&reporting),
                 "{reporting} has no value to capture"
