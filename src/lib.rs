@@ -1558,6 +1558,54 @@ fn print_counts(surface: &Surface) {
         plural(surface.resources.len(), "resource"),
         plural(surface.templates.len(), "template")
     );
+    if let Some(note) = collision_note(surface) {
+        println!("{}", paint(Style::new().dimmed(), &note));
+    }
+}
+
+/// The message for `print_counts`' collision note, or nothing if no server
+/// tool shadows a built-in.
+///
+/// `is_ambiguous_command` already reports this per-name, but only when a
+/// shadowed word is actually typed: the same fact is knowable the moment a
+/// connection is up, since `BUILTINS` is a fixed table and the surface is
+/// already in hand. Saying it once here, at connect, turns a mid-task error
+/// into something known before typing starts. Kept to one line regardless of
+/// how many names collide, so a server that shadows nine built-ins does not
+/// push the rest of the banner off the screen.
+///
+/// A tool name is untrusted input from the server, so each one is
+/// sanitized before it reaches this line, the same as every other
+/// server-supplied string the banner prints.
+fn collision_note(surface: &Surface) -> Option<String> {
+    let shadowed: Vec<String> = surface
+        .tools
+        .iter()
+        .filter(|tool| is_builtin(&tool.name))
+        .map(|tool| sanitize(&tool.name).into_owned())
+        .collect();
+    if shadowed.is_empty() {
+        return None;
+    }
+    let names = and_join(&shadowed);
+    let also = if shadowed.len() == 1 {
+        "is also a built-in"
+    } else {
+        "are also built-ins"
+    };
+    Some(format!(
+        "note: {names} {also}; reach the server's with `tool <name>`"
+    ))
+}
+
+/// Join names the way a sentence would: `a`, `a and b`, `a, b, and c`.
+fn and_join(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 /// The one-line nudge toward the features that are not obvious from a
@@ -7090,6 +7138,17 @@ mod tests {
         }))
     }
 
+    /// A bare tool definition with nothing but a name, for tests that only
+    /// care whether that name collides with a built-in.
+    fn tool_named(name: &str) -> ToolDefinition {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "description": "",
+            "inputSchema": { "type": "object" },
+        }))
+        .expect("tool definition")
+    }
+
     /// The hint after an interrupt is only useful where backgrounding is
     /// actually available, and wrong everywhere else.
     #[test]
@@ -7175,6 +7234,44 @@ mod tests {
         assert!(is_ambiguous_command(&surface, "wait"));
         assert!(!is_ambiguous_command(&surface, "slow_add"));
         assert!(!is_ambiguous_command(&surface, "jobs"));
+    }
+
+    #[test]
+    fn the_collision_note_names_the_one_shadowed_built_in() {
+        let surface = surface_with_a_task_capable_tool();
+        let surface = surface.read().unwrap();
+        // slow_add and echo are plain tool names; only `wait` is also a
+        // built-in, so the note names it and nothing else.
+        assert_eq!(
+            collision_note(&surface).as_deref(),
+            Some("note: wait is also a built-in; reach the server's with `tool <name>`")
+        );
+    }
+
+    #[test]
+    fn the_collision_note_is_silent_when_nothing_collides() {
+        let surface = Surface {
+            tools: vec![tool_named("slow_add"), tool_named("echo")],
+            ..Default::default()
+        };
+        assert_eq!(collision_note(&surface), None);
+    }
+
+    #[test]
+    fn the_collision_note_stays_one_line_for_many_collisions() {
+        let surface = Surface {
+            tools: vec![
+                tool_named("connect"),
+                tool_named("tool"),
+                tool_named("wait"),
+            ],
+            ..Default::default()
+        };
+        let note = collision_note(&surface).expect("a note when tools collide");
+        assert_eq!(note.lines().count(), 1);
+        assert!(note.contains("connect"));
+        assert!(note.contains("tool"));
+        assert!(note.contains("wait"));
     }
 
     #[test]
