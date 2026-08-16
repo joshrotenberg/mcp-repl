@@ -1,5 +1,24 @@
 # Contributing to mcp-repl
 
+## Scope
+
+Before building a feature, read [The shell model](README.md#the-shell-model).
+mcp-repl is a shell whose command set is the connected server, and that model
+decides most scope questions on its own.
+
+In short: shell constructs fit, programming-language constructs do not. `&&`
+and `||`, output redirection, a file of commands, and a more capable path
+selector are all in character. Functions, arithmetic, `if`, string
+manipulation, and an embedded scripting language are not, and an embedded
+language has already been proposed, spiked, and declined on those grounds in
+[#145](https://github.com/joshrotenberg/mcp-repl/issues/145), which is worth
+reading before reopening it.
+
+A proposal that falls outside the model is not automatically refused, but it
+does have to argue with the model rather than around it. Saying which shell
+construct a feature corresponds to, or why the correspondence should not
+apply here, is the useful form for that discussion.
+
 ## Getting Started
 
 ```bash
