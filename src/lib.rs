@@ -1017,6 +1017,14 @@ const BUILTIN_GUIDES: &[BuiltinGuide] = &[
         examples: &["wire on", "wire off"],
     },
     BuiltinGuide {
+        name: "for",
+        details: &[
+            "Selecting what to iterate belongs in the path, not in a test inside the loop. That is what keeps this a shell construct rather than the beginning of an expression language.",
+            "Every element runs even if one fails, matching --exec, and iteration is capped so a typo cannot become a thousand calls.",
+        ],
+        examples: &["n = notes", "for $note in $n.notes: read $note.uri"],
+    },
+    BuiltinGuide {
         name: "vars",
         details: &[
             "Capture with name = command, filter with command | path, and reference a value later as $name or $name.path[index]. Captures are cleared when connect switches servers.",
@@ -2126,6 +2134,8 @@ fn demo_router() -> tower_mcp::McpRouter {
                          - `slow_add a=2 b=3 &` runs **task-augmented**\n\
                          - `scan steps=5` reports **progress** while it runs\n\
                          - `sign_in` asks *you* for the answers (elicitation)\n\
+                         - `notes` answers with **structured content** and a declared output schema\n\
+                         - `n = notes` then `for $x in $n.notes: read $x.uri` loops over a result\n\
                          - `describe slow_add` shows the tool's schemas\n",
                     ))
                 })
@@ -2192,6 +2202,78 @@ fn demo_router() -> tower_mcp::McpRouter {
         //
         //   mcp-repl --demo -e fail                 # tool error, exit 3
         //   mcp-repl --demo -e 'fail &' -e wait     # failed task, exit 3
+        // The one tool here that answers with structured content and declares
+        // an output schema for it. Both are real protocol features the REPL
+        // renders (`describe` shows the output schema, and a structured
+        // result is displayed as such), and without this nothing in the demo
+        // exercised either. It is also the only demo tool returning a list,
+        // which is what `for $note in $n.notes: ...` needs to have a runnable
+        // example against a server that ships with the binary.
+        .tool(
+            ToolBuilder::new("notes")
+                .description("List the demo notes, with structured output")
+                .annotations(local_read_only())
+                .output_schema(serde_json::json!({
+                    "type": "object",
+                    "title": "NotesOutput",
+                    "description": "Every note this server holds, also readable as a resource.",
+                    "properties": {
+                        "notes": {
+                            "type": "array",
+                            "description": "One entry per note, in declaration order.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "The note's short name.",
+                                    },
+                                    "uri": {
+                                        "type": "string",
+                                        "description": "Read the full text with `read <uri>`.",
+                                    },
+                                    "lines": {
+                                        "type": "integer",
+                                        "description": "How many lines the note holds.",
+                                    },
+                                },
+                                "required": ["name", "uri", "lines"],
+                            },
+                        },
+                    },
+                    "required": ["notes"],
+                }))
+                .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                    let notes: Vec<serde_json::Value> = NOTES
+                        .iter()
+                        .map(|(name, body)| {
+                            serde_json::json!({
+                                "name": name,
+                                "uri": format!("note://{name}"),
+                                "lines": body.lines().count(),
+                            })
+                        })
+                        .collect();
+                    // A text fallback as well as the structure: a client that
+                    // ignores `structuredContent` still gets an answer, which
+                    // is what the field is specified to allow.
+                    let summary = NOTES
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Ok(CallToolResult {
+                        content: vec![tower_mcp::protocol::Content::text(format!(
+                            "{} notes: {summary}",
+                            NOTES.len()
+                        ))],
+                        is_error: false,
+                        structured_content: Some(serde_json::json!({ "notes": notes })),
+                        meta: None,
+                    })
+                })
+                .build(),
+        )
         .tool(
             ToolBuilder::new("fail")
                 .description("Always fails (try `fail &` then `wait`)")
@@ -8107,6 +8189,68 @@ mod tests {
                 "`{module}` source looks empty; include_str! may be pointing at the wrong file"
             );
         }
+    }
+
+    /// The demo is what a contributor can run, so a client feature with no
+    /// demo coverage is a client feature nothing exercises locally.
+    #[tokio::test]
+    async fn the_demo_answers_with_structured_content_and_an_output_schema() {
+        let client = client_builder(ProtocolMode::Stable)
+            .unwrap()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .expect("connect to the demo router");
+        establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .expect("handshake with the demo router");
+
+        let listed = client.list_tools().await.expect("list tools");
+        let notes = listed
+            .tools
+            .iter()
+            .find(|t| t.name == "notes")
+            .expect("the demo offers `notes`");
+        // `describe` renders this, and before `notes` existed no demo tool
+        // declared one, so that rendering had no local coverage.
+        assert!(
+            notes.output_schema.is_some(),
+            "`notes` declares an output schema"
+        );
+
+        let result = client
+            .call_tool("notes", serde_json::json!({}))
+            .await
+            .expect("call notes");
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("`notes` answers with structured content");
+        let items = structured["notes"]
+            .as_array()
+            .expect("the structured answer holds an array");
+        assert_eq!(items.len(), 3, "one entry per demo note");
+        for item in items {
+            assert!(item["name"].is_string());
+            assert!(
+                item["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("note://")),
+                "each entry points at a readable resource: {item}"
+            );
+            assert!(item["lines"].is_number());
+        }
+
+        // A text fallback as well, which is what the field is specified to
+        // allow: a client ignoring `structuredContent` still gets an answer.
+        assert!(!result.content.is_empty(), "a text fallback is present");
+
+        // This is the only demo tool returning a list, and `for` needs one to
+        // have a runnable example.
+        assert_eq!(
+            result_value(&result)["notes"].as_array().map(|a| a.len()),
+            Some(3),
+            "a capture of `notes` is iterable by `for`"
+        );
     }
 
     #[test]
