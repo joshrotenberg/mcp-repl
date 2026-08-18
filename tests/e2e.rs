@@ -2561,6 +2561,120 @@ async fn exercise_generators() {
     assert_eq!(values[0]["examples"][1], "wait --timeout 30");
 }
 
+/// `bind`/`binds`/`unbind`: a default value for a tool parameter, applied
+/// when a call omits it and typed from the schema rather than sent as text,
+/// an explicit argument always wins over it, and everything clears when
+/// `connect` switches servers (#161).
+async fn exercise_bind(fixture: &Path, temp: &TempDir) {
+    let mut command = repl_command();
+    command.args(["--demo", "--json", "--exec", "binds"]);
+    let output = run(command, "empty binds", CASE_TIMEOUT).await;
+    assert_success(&output, "empty binds");
+    assert_eq!(json_lines(&output, "empty binds"), [serde_json::json!({})]);
+
+    // `repeat` on the demo's `echo` tool is a u8: a bind sent as the text
+    // "3" rather than the JSON number 3 would fail deserialization
+    // server-side instead of repeating three times, so a successful repeat
+    // proves the coercion, not just that the bind applied.
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "--exec",
+        "bind repeat=3",
+        "--exec",
+        "echo message=hi",
+        "--exec",
+        "echo message=hi repeat=1",
+        "--exec",
+        "unbind repeat",
+        "--exec",
+        "echo message=hi",
+    ]);
+    let output = run(command, "bind fills a gap and explicit wins", CASE_TIMEOUT).await;
+    assert_success(&output, "bind fills a gap and explicit wins");
+    let values = json_lines(&output, "bind fills a gap and explicit wins");
+    assert_eq!(values[0]["name"], "repeat");
+    assert_eq!(values[0]["value"], "3");
+    assert_eq!(
+        values[1].pointer("/content/0/text"),
+        Some(&serde_json::json!("hi hi hi")),
+        "the bind filled repeat, coerced to an integer: {:?}",
+        values[1]
+    );
+    assert_eq!(
+        values[2].pointer("/content/0/text"),
+        Some(&serde_json::json!("hi")),
+        "an explicit repeat=1 wins over the bind: {:?}",
+        values[2]
+    );
+    assert_eq!(values[3]["removed"], "repeat");
+    assert_eq!(
+        values[4].pointer("/content/0/text"),
+        Some(&serde_json::json!("hi")),
+        "unbind removed the default, so echo's own default (one repeat) applies: {:?}",
+        values[4]
+    );
+
+    // A bind for a parameter no tool declares warns at bind time rather than
+    // failing silently at call time, and still succeeds.
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "--exec",
+        "bind nope=1",
+        "--exec",
+        "binds",
+    ]);
+    let output = run(
+        command,
+        "bind warns on an undeclared parameter",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, "bind warns on an undeclared parameter");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no tool") && stderr.contains("nope"),
+        "{stderr}"
+    );
+    let values = json_lines(&output, "bind warns on an undeclared parameter");
+    assert_eq!(values[1]["nope"], "1");
+
+    // Binds are per connection: connecting to a different server clears
+    // them, the same way captured variables and background tasks already
+    // do, so a value bound for one server cannot leak into a same-named
+    // parameter on the next.
+    let fixture_string = fixture.display().to_string();
+    let exit_file = temp.path().join("bind-reconnect.exit");
+    let input = format!(
+        "bind repeat=3\n\
+         binds\n\
+         connect -- {fixture_string}\n\
+         binds\n\
+         quit\n"
+    );
+    let mut command = repl_command();
+    command
+        .args(["--demo", "--no-history", "--color", "never"])
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let output = run_with_input(command, &input, "binds clear on reconnect", CASE_TIMEOUT).await;
+    assert_success(&output, "binds clear on reconnect");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("repeat"), "{stdout}");
+    assert!(
+        stdout.contains("server-scoped state cleared") && stdout.contains("1 bind"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("no binds set"), "{stdout}");
+    assert_eq!(
+        wait_for_file(&exit_file, "bind reconnect fixture shutdown").await,
+        "clean",
+        "switching servers did not orderly close the stdio child"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
@@ -2591,6 +2705,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         #[cfg(unix)]
         exercise_bearer_fd(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;
+        exercise_bind(&fixture, &temp).await;
     })
     .await
     .expect("mcp-repl E2E suite exceeded its job-level timeout");
