@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-08-18
+
+### Bug Fixes
+
+- Arm the interrupt handler before a command starts ([#135](https://github.com/joshrotenberg/mcp-repl/pull/135))
+- Accumulate multi-line piped commands ([#148](https://github.com/joshrotenberg/mcp-repl/pull/148))
+- Answer `mcp-repl help` with help, and name what could not be spawned ([#157](https://github.com/joshrotenberg/mcp-repl/pull/157))
+- Refuse an elicitation answer the field's enum rules out ([#162](https://github.com/joshrotenberg/mcp-repl/pull/162))
+- Name tool/built-in collisions in the connect banner (closes #163) ([#165](https://github.com/joshrotenberg/mcp-repl/pull/165))
+
+### Documentation
+
+- Make -h a beginner's view and keep the detail in --help ([#151](https://github.com/joshrotenberg/mcp-repl/pull/151))
+- Write down the shell model and what it decides ([#166](https://github.com/joshrotenberg/mcp-repl/pull/166))
+- Lead with the one-shot client, not only the REPL ([#172](https://github.com/joshrotenberg/mcp-repl/pull/172))
+
+### Features
+
+- For, to run one command per element of a captured list ([#158](https://github.com/joshrotenberg/mcp-repl/pull/158))
+- Bind, sticky parameter values across calls (closes #161) ([#168](https://github.com/joshrotenberg/mcp-repl/pull/168))
+- Complete elicitation answers from the field schema (closes #160) ([#167](https://github.com/joshrotenberg/mcp-repl/pull/167))
+- Publish a container image alongside the binaries ([#173](https://github.com/joshrotenberg/mcp-repl/pull/173))
+
+### Miscellaneous Tasks
+
+- Test the release guards instead of only linting them ([#129](https://github.com/joshrotenberg/mcp-repl/pull/129))
+
+### Refactor
+
+- Give a built-in one record instead of two parallel tables ([#134](https://github.com/joshrotenberg/mcp-repl/pull/134))
+- Move sanitize out of style, into its own module ([#156](https://github.com/joshrotenberg/mcp-repl/pull/156))
+
+### Testing
+
+- Stabilize interactive final-task e2e ([#149](https://github.com/joshrotenberg/mcp-repl/pull/149))
+- Pin that the core does not reach for presentation ([#174](https://github.com/joshrotenberg/mcp-repl/pull/174))
+
+
+
 ## [0.3.0] - 2026-08-09
 
 ### Bug Fixes
