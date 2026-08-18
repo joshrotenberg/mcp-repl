@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-binaries-${{ inputs.tag }}
@@ -56,3 +57,102 @@ jobs:
           # Its absence is what left v0.3.0 stuck as a draft.
           GH_REPO: ${{ github.repository }}
         run: ./scripts/publish-release.sh "${{ inputs.tag }}" dist
+
+  # The image ships only after the binary release has published, so a tag can
+  # never exist on ghcr.io without the matching binaries on the release page.
+  container:
+    name: Build container image (${{ matrix.platform }})
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners per architecture, for the same reason the binaries
+          # use them: a Rust release build under QEMU emulation is slow enough
+          # to be its own failure mode.
+          - platform: linux/amd64
+            os: ubuntu-22.04
+          - platform: linux/arm64
+            os: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Each architecture pushes by digest only. The tags are attached later,
+      # once both digests exist, so a half-published manifest is not reachable
+      # under a version tag.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+
+      # The prefix is stripped in the shell: `${{ }}` expressions do not do
+      # parameter expansion, so doing it there silently produces a filename
+      # with the prefix still on it and the manifest step builds a bad ref.
+      - name: Preserve the digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  container-manifest:
+    name: Publish container manifest
+    needs: container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` moves with the tag being published, matching how the release
+      # page treats the newest release.
+      - name: Create and push the manifest
+        working-directory: /tmp/digests
+        run: |
+          image=ghcr.io/${{ github.repository }}
+          version="${{ inputs.tag }}"
+          # One ref per digest file. An array rather than word splitting an
+          # unquoted substitution, which is the same thing and passes review.
+          refs=()
+          for digest in *; do
+            refs+=("$image@sha256:$digest")
+          done
+          docker buildx imagetools create \
+            -t "$image:${version#v}" \
+            -t "$image:latest" \
+            "${refs[@]}"
+
+      - name: Show what was published
+        run: docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:latest"

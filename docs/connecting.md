@@ -95,6 +95,44 @@ cratesio-mcp> read crates://tokio/info
 cratesio-mcp> prompt analyze_crate crate_name=axum
 ```
 
+### In a container
+
+```bash
+docker run --rm -it ghcr.io/joshrotenberg/mcp-repl --demo
+docker run --rm ghcr.io/joshrotenberg/mcp-repl --http https://host/mcp -e tools
+```
+
+The image is published for `linux/amd64` and `linux/arm64` alongside each
+release, tagged with the version and `latest`. It runs as an unprivileged
+user and contains the binary and CA certificates, nothing else.
+
+Three things work differently inside a container, and it is worth knowing
+which before reaching for it:
+
+**A stdio server has to be in the image.** `mcp-repl -- ./my-server` spawns a
+child process, and that process must exist in the container's filesystem. A
+server on the host is not visible. Either mount it, or build an image that
+derives from this one and adds the server. `--http` and `--demo` have no such
+problem and are the transports the image is really for.
+
+**`--scan` finds nothing.** It reads the client config files in your platform
+user directories, which are on the host. It reports that it found none, which
+is accurate rather than broken, but it does mean the discovery path is not
+useful here without mounting those files in.
+
+**OAuth profiles have nowhere to go.** `--login` saves credentials to the
+operating system's credential store, and a container has none, so it fails
+rather than silently keeping a token somewhere unprotected. For an
+authenticated server, pass `MCP_BEARER` into the container instead:
+
+```bash
+docker run --rm -e MCP_BEARER ghcr.io/joshrotenberg/mcp-repl --http https://host/mcp -e tools
+```
+
+Interactivity needs `-it`. Without a TTY the prompt cannot run, so a
+container without one should pass `-e`, which is the mode that suits a CI job
+anyway.
+
 ### Authenticated servers
 
 Attach credentials to an `--http` connection:

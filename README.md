@@ -38,6 +38,16 @@ Or install from source on any supported platform:
 cargo install mcp-repl
 ```
 
+Or run it without installing anything:
+
+```bash
+docker run --rm -it ghcr.io/joshrotenberg/mcp-repl --demo
+```
+
+The image suits `--http` and `--demo`; a stdio server would have to live
+inside it, and OAuth has no credential store there. See
+[docs/connecting.md](docs/connecting.md#in-a-container) for what differs.
+
 Completions and a man page come from the binary itself, and ship in the
 release archives. The man page includes both startup options and the same
 REPL built-in reference shown by `help <command>`:

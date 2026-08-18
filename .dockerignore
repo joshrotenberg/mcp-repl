@@ -1,0 +1,14 @@
+# Everything the build does not read. `target` above all: copying a host build
+# into the context is slow and its artifacts are for the wrong platform.
+target
+.git
+.github
+docs
+tests
+*.md
+!README.md
+.dockerignore
+Dockerfile
+install.sh
+deny.toml
+scripts
