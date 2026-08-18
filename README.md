@@ -12,6 +12,9 @@ resources get built-ins, tab completion is powered by the server itself where
 the protocol allows, and the command table refreshes live when the server's
 surface changes.
 
+It also runs a single command and exits, so the same binary is a scriptable
+MCP client for a shell script, a CI job, or an agent.
+
 ![mcp-repl starting disconnected, connecting to the demo server, completing schema-driven arguments, reporting progress, and running a tool as a background task](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/hero.gif)
 
 ## Install
@@ -44,6 +47,38 @@ mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
 mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
 ```
 
+## One call, no prompt
+
+The prompt is one of two ways to use this. `-e` runs a command and exits:
+
+```console
+$ mcp-repl --demo -e 'convert value=100 from=celsius to=fahrenheit'
+212.00
+[0ms]
+```
+
+`--json` makes stdout [NDJSON](https://github.com/ndjson/ndjson-spec), one
+value per command, and silences the banner and the timing line. Each value is
+the tool result as the protocol returns it:
+
+```console
+$ mcp-repl --demo --json -e 'convert value=100 from=celsius to=fahrenheit'
+{"content":[{"type":"text","text":"212.00"}]}
+
+$ mcp-repl --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
+    | jq -r '.content[0].text'
+212.00
+```
+
+**A one-shot run cannot block waiting for a person.** Under `-e`, elicitation
+and sampling both default to `decline`, so a server that asks a question gets
+an immediate refusal instead of hanging the caller. `--timeout` bounds
+everything else, and exit statuses are typed, so a tool error (3) is
+distinguishable from an empty result.
+
+See [docs/scripting.md](docs/scripting.md) for tasks, waiting on them, and
+schema contracts.
+
 ## Start here
 
 Open the REPL first and choose a server from inside it:
@@ -60,8 +95,8 @@ mcp-repl> connect demo
 `path.json:entry`, or stdio command. Run it again to switch servers without
 losing command history or global aliases. Captured variables, background task
 ids, resource subscriptions, and profile-scoped aliases are cleared because
-they belong to the server being left. The original direct forms remain useful
-for scripts and one-server sessions:
+they belong to the server being left. The direct forms connect straight to one
+server, which is what a script or a single-server session wants:
 
 ```bash
 mcp-repl --demo
