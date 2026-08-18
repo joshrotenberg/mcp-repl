@@ -5,23 +5,39 @@
 //! parked on the ack channel, not reading stdin, so plain blocking reads
 //! are safe. If the editor currently owns the terminal (a background task
 //! elicited while the user sits at the prompt), the request is declined
-//! rather than fighting reedline for raw-mode stdin.
+//! rather than fighting reedline for raw-mode stdin. That parked state is
+//! also why a form field's answer can be read through its own `Reedline`
+//! instance instead of a raw stdin read: the main prompt's editor is idle
+//! for the same reason, so a second one reading the same terminal is not a
+//! conflict, and it is what lets Tab complete a field to what its schema
+//! already told the operator to type. That editor is only built when stdin
+//! is a real terminal; piped stdin (scripts, `-e`, the test suite) keeps
+//! reading raw lines, which is also what `--elicitation decline` and every
+//! other prompt here still do.
 //!
 //! Everything shown here is written by the server: the message, the field
 //! names, their descriptions, and any URL. A form is therefore a phishing
 //! surface, so requests carry a line naming which server asked, fields whose
 //! names look like credentials are called out before they are answered, and
-//! `--elicitation decline` refuses the whole mechanism. Answers are read from
-//! raw stdin rather than through reedline, which also keeps them out of the
-//! command history.
+//! `--elicitation decline` refuses the whole mechanism. A field's answer
+//! never reaches command history either way: the raw-stdin path never
+//! touches reedline's history, and the field's own `Reedline` is built with
+//! `NoHistory`, a backend that discards everything it is handed.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use nu_ansi_term::{Color, Style};
+use reedline::{
+    ColumnarMenu, DefaultCompleter, Emacs, History, HistoryItem, HistoryItemId, HistorySessionId,
+    KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, Reedline,
+    ReedlineError, ReedlineErrorVariants, ReedlineEvent, ReedlineMenu, SearchQuery, Signal,
+    default_emacs_keybindings,
+};
 use tower_mcp::client::{ClientHandler, NotificationHandler, ServerNotification};
 use tower_mcp::error::JsonRpcError;
 use tower_mcp::protocol::{
@@ -31,7 +47,7 @@ use tower_mcp::protocol::{
 
 use crate::output::AsyncOutput;
 use crate::sampling::{self, SamplingMode};
-use crate::style::{paint, tag};
+use crate::style::{self, paint, tag};
 use crate::untrusted::sanitize;
 
 /// How to answer `elicitation/create`.
@@ -322,12 +338,207 @@ fn confirm_url(server: &str, message: &str, url: &str) -> ElicitResult {
     }
 }
 
+/// Menu name for the Tab-triggered completion popup on a field's answer.
+/// Separate from `editor.rs`'s constant of the same purpose: a different
+/// `Reedline` instance, a different menu.
+const FIELD_MENU_NAME: &str = "elicit_completion_menu";
+
+/// A history backend that discards everything it is handed.
+///
+/// `Reedline::create()` already defaults to an in-memory history nothing
+/// outside this process could read, but relying on that default is exactly
+/// the kind of thing a later change could quietly undo by adding
+/// `.with_history(...)`. Wiring this in explicitly, and pinning it with a
+/// test, makes "an elicitation answer never enters history" a decision
+/// rather than an accident -- this is the path that reads credentials.
+struct NoHistory;
+
+impl History for NoHistory {
+    fn save(&mut self, h: HistoryItem) -> reedline::Result<HistoryItem> {
+        // Reedline calls this on every accepted line and `.expect()`s the
+        // result, so returning the item unmodified -- rather than an error
+        // -- is what keeps a field's answer from turning into a panic.
+        // Nothing is stored anywhere.
+        Ok(h)
+    }
+
+    fn load(&self, _id: HistoryItemId) -> reedline::Result<HistoryItem> {
+        Err(ReedlineError(
+            ReedlineErrorVariants::HistoryFeatureUnsupported {
+                history: "elicit::NoHistory",
+                feature: "load",
+            },
+        ))
+    }
+
+    fn count(&self, _query: SearchQuery) -> reedline::Result<i64> {
+        Ok(0)
+    }
+
+    fn search(&self, _query: SearchQuery) -> reedline::Result<Vec<HistoryItem>> {
+        Ok(Vec::new())
+    }
+
+    fn update(
+        &mut self,
+        _id: HistoryItemId,
+        _updater: &dyn Fn(HistoryItem) -> HistoryItem,
+    ) -> reedline::Result<()> {
+        Ok(())
+    }
+
+    fn clear(&mut self) -> reedline::Result<()> {
+        Ok(())
+    }
+
+    fn delete(&mut self, _id: HistoryItemId) -> reedline::Result<()> {
+        Ok(())
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn session(&self) -> Option<HistorySessionId> {
+        None
+    }
+}
+
+/// The prompt for one field's answer: the same `  <name>> ` text the raw
+/// stdin path prints, so switching to reedline does not change what is on
+/// screen.
+struct FieldPrompt {
+    left: String,
+}
+
+impl FieldPrompt {
+    fn new(display_name: &str) -> Self {
+        Self {
+            left: format!("  {display_name}"),
+        }
+    }
+}
+
+impl Prompt for FieldPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.left)
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("> ")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("::: ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        _history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        // Unreachable with `NoHistory` backing the editor -- there is
+        // nothing to search -- but the trait still requires an
+        // implementation.
+        Cow::Borrowed("")
+    }
+}
+
+/// The words a field's answer completes to: the same choices
+/// `accepted_values` hands `reject_answer`, so completion and validation
+/// cannot list two different answers for the same field. Booleans complete
+/// to `true`/`false` even though `coerce_field` also accepts `y`, `yes`,
+/// `on` -- Tab offers the canonical spelling without narrowing what typing
+/// the rest by hand still accepts. A field with a default gets it added too,
+/// including fields with neither an enum nor a boolean type. A pure function
+/// so the word list is testable without a terminal.
+fn completion_words(schema: &PrimitiveSchemaDefinition, default: Option<&str>) -> Vec<String> {
+    let is_boolean = field_json(schema).get("type").and_then(|t| t.as_str()) == Some("boolean");
+    let mut words = if is_boolean {
+        vec!["true".to_string(), "false".to_string()]
+    } else {
+        accepted_values(schema)
+            .map(|(choices, _multi)| choices)
+            .unwrap_or_default()
+    };
+    if let Some(d) = default
+        && !words.iter().any(|w| w == d)
+    {
+        words.push(d.to_string());
+    }
+    words
+}
+
+/// Build the `Reedline` instance that reads one field's answer.
+///
+/// Only called when stdin is a real terminal (`prompt_form` checks once,
+/// before the fields loop): a second instance is safe here because the main
+/// prompt's editor is idle for the same reason a background elicitation is
+/// declined -- see the module doc. Piped stdin keeps reading raw lines
+/// instead; a `Reedline` cannot read one (confirmed empirically: it errors
+/// immediately rather than blocking, unlike a raw `read_line` on the same
+/// pipe).
+fn field_editor(schema: &PrimitiveSchemaDefinition, default: Option<&str>) -> Reedline {
+    let completer = DefaultCompleter::new_with_wordlen(completion_words(schema, default), 1);
+    let menu = ColumnarMenu::default().with_name(FIELD_MENU_NAME);
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu(FIELD_MENU_NAME.to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    Reedline::create()
+        .with_history(Box::new(NoHistory))
+        .with_completer(Box::new(completer))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        .with_ansi_colors(style::colors_enabled())
+}
+
+/// Read one field's raw input: through its `Reedline` when one was built for
+/// this field, otherwise a blocking line off stdin as before. `None` means
+/// cancel the whole form -- EOF either way, or `Ctrl-C`/`Ctrl-D` at the
+/// editor.
+fn read_field_answer(editor: Option<&mut Reedline>, display_name: &str) -> Option<String> {
+    match editor {
+        Some(ed) => {
+            let prompt = FieldPrompt::new(display_name);
+            match ed.read_line(&prompt) {
+                Ok(Signal::Success(line)) => Some(line),
+                Ok(_) | Err(_) => None,
+            }
+        }
+        None => {
+            eprint!("  {display_name}> ");
+            let _ = std::io::stderr().flush();
+            let mut buf = String::new();
+            let read = {
+                let mut lock = std::io::stdin().lock();
+                std::io::BufRead::read_line(&mut lock, &mut buf)
+            };
+            match read {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(buf),
+            }
+        }
+    }
+}
+
 /// Prompt for each field of a form elicitation on stdin. EOF at any point
 /// cancels. Empty input picks the default when one exists, otherwise skips
 /// optional fields.
 fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
     eprintln!("{}", provenance(server));
     eprintln!("  {}", sanitize(&form.message));
+    // A `Reedline` cannot read a pipe (see `field_editor`), so this is
+    // checked once rather than per field.
+    let interactive = std::io::stdin().is_terminal();
     let mut content: HashMap<String, ElicitFieldValue> = HashMap::new();
     // Declaration order, not alphabetical. The schema is an `IndexMap` and
     // the order is protocol-significant: a server puts the fields in the
@@ -367,18 +578,11 @@ fn prompt_form(server: &str, form: &ElicitFormParams) -> ElicitResult {
                 paint(Style::new().fg(Color::Yellow).bold(), "warning:")
             );
         }
+        let mut editor = interactive.then(|| field_editor(schema, default.as_deref()));
         loop {
-            eprint!("  {display_name}> ");
-            let _ = std::io::stderr().flush();
-            let mut buf = String::new();
-            let read = {
-                let mut lock = std::io::stdin().lock();
-                std::io::BufRead::read_line(&mut lock, &mut buf)
+            let Some(buf) = read_field_answer(editor.as_mut(), &display_name) else {
+                return ElicitResult::cancel();
             };
-            match read {
-                Ok(0) | Err(_) => return ElicitResult::cancel(),
-                Ok(_) => {}
-            }
             let raw = buf.trim();
             if raw.is_empty() {
                 match (&default, required) {
@@ -537,6 +741,7 @@ fn coerce_field(schema: &PrimitiveSchemaDefinition, raw: &str) -> ElicitFieldVal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reedline::{Completer, SearchDirection};
 
     /// Build a field the way a server does: as JSON on the wire, parsed
     /// into the protocol type. Constructing the type directly would hide
@@ -725,5 +930,110 @@ mod tests {
         for name in ["city", "message", "count", "email"] {
             assert!(!crate::wire::looks_like_credential(name), "{name}");
         }
+    }
+
+    #[test]
+    fn completion_words_match_what_the_field_accepts() {
+        // The same list `reject_answer` checks against, so Tab and
+        // validation cannot disagree about a field's enum.
+        let field = field_from_wire(serde_json::json!({
+            "type": "string",
+            "enum": ["staging", "production"],
+        }));
+        assert_eq!(
+            completion_words(&field, None),
+            vec!["staging", "production"]
+        );
+
+        // A boolean completes to the canonical spelling even though
+        // `coerce_field` accepts more.
+        let field = field_from_wire(serde_json::json!({"type": "boolean"}));
+        assert_eq!(completion_words(&field, None), vec!["true", "false"]);
+
+        // A field with neither still completes to its default.
+        let field = field_from_wire(serde_json::json!({"type": "string", "default": "ada"}));
+        assert_eq!(completion_words(&field, Some("ada")), vec!["ada"]);
+
+        // A field with neither an enum, a boolean type, nor a default has
+        // nothing to offer.
+        let field = field_from_wire(serde_json::json!({"type": "string"}));
+        assert!(completion_words(&field, None).is_empty());
+
+        // The default is not duplicated when it is already one of the
+        // enum's choices.
+        let field = field_from_wire(serde_json::json!({
+            "type": "string",
+            "enum": ["staging", "production"],
+            "default": "staging",
+        }));
+        assert_eq!(
+            completion_words(&field, Some("staging")),
+            vec!["staging", "production"]
+        );
+    }
+
+    #[test]
+    fn tab_completes_an_enum_field_to_its_values() {
+        let field = field_from_wire(serde_json::json!({
+            "type": "string",
+            "enum": ["staging", "production"],
+        }));
+        let mut completer = DefaultCompleter::new_with_wordlen(completion_words(&field, None), 1);
+        let suggestions: Vec<String> = completer
+            .complete("s", 1)
+            .into_iter()
+            .map(|s| s.value)
+            .collect();
+        assert_eq!(suggestions, vec!["staging"]);
+    }
+
+    #[test]
+    fn tab_completes_a_boolean_field_to_true_and_false() {
+        let field = field_from_wire(serde_json::json!({"type": "boolean"}));
+        let mut completer = DefaultCompleter::new_with_wordlen(completion_words(&field, None), 1);
+        let mut suggestions: Vec<String> = completer
+            .complete("t", 1)
+            .into_iter()
+            .map(|s| s.value)
+            .collect();
+        suggestions.extend(completer.complete("f", 1).into_iter().map(|s| s.value));
+        assert!(suggestions.contains(&"true".to_string()), "{suggestions:?}");
+        assert!(
+            suggestions.contains(&"false".to_string()),
+            "{suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_editor_never_remembers_an_answer() {
+        // The exact function `prompt_form` calls, so this pins the
+        // production construction rather than `NoHistory` in isolation.
+        let field = field_from_wire(serde_json::json!({"type": "string"}));
+        let mut editor = field_editor(&field, None);
+        editor
+            .history_mut()
+            .save(HistoryItem::from_command_line("s3cr3t-answer"))
+            .expect("a no-op history still reports success");
+        assert_eq!(
+            editor.history().count_all().expect("count"),
+            0,
+            "an answer must not be retrievable from the field's history"
+        );
+    }
+
+    #[test]
+    fn no_history_reports_success_but_keeps_nothing() {
+        let mut history = NoHistory;
+        let saved = history
+            .save(HistoryItem::from_command_line("hunter2"))
+            .expect("save must not error, or reedline's engine panics");
+        assert_eq!(saved.command_line, "hunter2", "the item is handed back");
+        assert_eq!(history.count_all().expect("count"), 0);
+        assert!(
+            history
+                .search(SearchQuery::everything(SearchDirection::Forward, None))
+                .expect("search")
+                .is_empty()
+        );
     }
 }
