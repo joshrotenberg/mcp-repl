@@ -1,0 +1,88 @@
+# mcp-repl configuration, with every key the parser accepts.
+#
+# Copy this to the platform path and edit it:
+#
+#   Unix     $XDG_CONFIG_HOME/mcp-repl/config.toml, or ~/.config/mcp-repl/config.toml
+#   macOS    ~/Library/Application Support/mcp-repl/config.toml
+#   Windows  %APPDATA%\mcp-repl\config.toml
+#
+# Or point at any file with --config PATH.
+#
+# Unknown keys are an error rather than being ignored, so a typo here is
+# reported when the file loads instead of silently doing nothing. That also
+# means this file is complete: a key that is not below is not accepted.
+#
+# `mcp-repl --list-servers` prints what a config resolves to.
+
+# Every profile is a named target for `--server <name>`, for `connect <name>`
+# at the prompt, or as a lone argument: `mcp-repl prod`.
+
+# A stdio server: mcp-repl spawns the command and speaks the protocol over its
+# standard input and output. `transport` is inferred from `command`, so it is
+# written here only to show that it can be.
+[servers.local]
+transport = "stdio"
+command = ["./target/debug/my-server", "--stdio"]
+
+# Aliases that exist only while connected through this profile. They shadow a
+# file-level alias of the same name, so a profile can redefine `t` without
+# affecting anywhere else.
+[servers.local.aliases]
+t = "tool wait"
+issues = "list_issues state=open"
+
+# An HTTP server reading its token from the environment. Prefer this to
+# `bearer`: a token in a config file outlives the session and tends to reach
+# places a file was never meant to go.
+[servers.prod]
+transport = "http"
+url = "https://mcp.example.com/mcp"
+bearer_env = "PROD_MCP_TOKEN"
+
+# Extra headers sent with every request of an HTTP profile.
+[servers.prod.headers]
+X-Tenant = "acme"
+
+# An inline token. mcp-repl warns when a profile uses this, and the warning is
+# the point: it is here for completeness, not as a recommendation.
+[servers.legacy]
+url = "https://legacy.example.com/mcp"
+bearer = "put-a-token-here-and-mcp-repl-will-tell-you-not-to"
+
+# An HTTP server authorized through OAuth. The value names an entry in the
+# `[oauth]` table below. Run `mcp-repl --login secured` to authorize it.
+[servers.secured]
+url = "https://secured.example.com/mcp"
+oauth = "secured"
+
+# Non-secret OAuth metadata, written by `--login` and read on reconnect.
+# Access tokens, refresh tokens, and any registered client secret live in the
+# operating system's credential store, never in this file.
+[oauth.secured]
+url = "https://secured.example.com/mcp"
+scopes = ["mcp:read", "mcp:write"]
+# An HTTPS Client ID Metadata Document URL, tried before dynamic client
+# registration during --login.
+client_id_metadata_document = "https://example.com/oauth/client.json"
+# The exact issuer to use when discovery advertises more than one.
+authorization_server = "https://auth.example.com"
+
+# Aliases in effect against every server. A profile-level alias of the same
+# name wins over these.
+[aliases]
+t = "tools"
+d = "describe"
+j = "jobs"
+
+# Settings for the REPL itself rather than for any one connection.
+[repl]
+# Lines of command history to keep across sessions. 0 disables persistence as
+# surely as --no-history does.
+history_capacity = 1000
+# Seconds to allow a request before reporting a transport error, when
+# --timeout does not say. 0 waits indefinitely, exactly as the flag's 0 does.
+request_timeout = 120
+# Milliseconds to wait for a server to answer completion/complete while you
+# are mid-word. Short on purpose: this runs between keystrokes, and a menu
+# that arrives late is worse than one that does not arrive.
+completion_timeout_ms = 150
