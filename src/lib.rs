@@ -4480,7 +4480,35 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         if let Ok(mut label) = server_label.write() {
             *label = "mcp-repl".to_string();
         }
-        println!("not connected — run `connect` to see targets, or try `connect demo`");
+        // A bare invocation lands here, so for many people this is the first
+        // thing mcp-repl ever says. One command was not enough to go on: it
+        // named neither `help` nor `-h`, and implied `connect` took only
+        // `demo`.
+        println!("not connected. To get started:");
+        for (command, description) in [
+            ("connect demo", "a bundled server, nothing to install"),
+            (
+                "connect <url|profile|command...>",
+                "an HTTP URL, saved profile, or stdio server",
+            ),
+            ("help", "the commands available here"),
+            ("quit", "leave"),
+        ] {
+            println!(
+                "  {}  {}",
+                style::column(Style::new().bold(), command, 32),
+                paint(Style::new().dimmed(), description)
+            );
+        }
+        // A blank line separates what to type here from what to have typed
+        // instead, which are different kinds of advice.
+        println!();
+        for line in [
+            "Or start connected: mcp-repl --demo, --http <url>, --server <name>",
+            "`mcp-repl -h` lists the startup flags.",
+        ] {
+            println!("{}", paint(Style::new().dimmed(), line));
+        }
         (
             Arc::new(Session::disconnected()),
             Arc::new(RwLock::new(Surface::default())),

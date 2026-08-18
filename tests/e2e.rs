@@ -1333,6 +1333,19 @@ async fn exercise_no_target(temp: &TempDir) {
         stdout.contains("not connected") && stdout.contains("connect demo"),
         "a bare invocation explains the disconnected prompt:\n{stdout}"
     );
+    // For many people this is the first thing mcp-repl says, so it has to
+    // name more than one command: where the rest of them are, where the
+    // startup flags are, and how to leave.
+    for pointer in ["help", "-h", "quit", "--demo"] {
+        assert!(
+            stdout.contains(pointer),
+            "the disconnected prompt must point at `{pointer}`:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains('\u{2014}'),
+        "user-facing output uses no em dashes:\n{stdout}"
+    );
 
     // Under --json it is the standard envelope, on stdout, like every other
     // usage failure.
