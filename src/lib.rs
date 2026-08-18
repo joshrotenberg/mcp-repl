@@ -8054,6 +8054,61 @@ mod tests {
         assert!(BUILTINS.contains("find"));
     }
 
+    /// Modules that talk to a server rather than to a terminal.
+    ///
+    /// Sources are included at compile time rather than read at runtime, so a
+    /// renamed module breaks the build instead of silently dropping out of
+    /// the check.
+    const CORE_MODULES: &[(&str, &str)] = &[
+        ("session", include_str!("session.rs")),
+        ("tool_args", include_str!("tool_args.rs")),
+        ("property", include_str!("property.rs")),
+        ("schema_contract", include_str!("schema_contract.rs")),
+        ("subscribe", include_str!("subscribe.rs")),
+        ("untrusted", include_str!("untrusted.rs")),
+    ];
+
+    /// The core does not reach for presentation, and must not start.
+    ///
+    /// These six modules have no dependency on `style` or `output` today.
+    /// That is worth pinning rather than rechecking: the coupling this guards
+    /// against arrives one convenient import at a time, and each one looks
+    /// reasonable on its own. #145 is about extracting a reusable core, and
+    /// the invariant is most of what that buys.
+    ///
+    /// `wire`, `sampling`, `jobs`, and `elicit` are deliberately absent. All
+    /// four format their own output today, and separating that is the
+    /// remaining work in #145 rather than something this test can assert.
+    #[test]
+    fn the_core_does_not_reach_for_presentation() {
+        for (module, source) in CORE_MODULES {
+            for forbidden in ["crate::style", "crate::output"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "`{module}` references `{forbidden}`.\n\n\
+                     Modules in CORE_MODULES render nothing: they return values and \
+                     errors, and the binary decides how those look. If {module} now \
+                     needs to format something, the formatting belongs to the caller. \
+                     If the need is to make server text safe to print, that is \
+                     `untrusted::sanitize`, which is not presentation.",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_purity_check_covers_the_modules_it_claims() {
+        // A test that silently checks nothing is worse than no test. Each
+        // entry must be a real module with real content.
+        assert_eq!(CORE_MODULES.len(), 6);
+        for (module, source) in CORE_MODULES {
+            assert!(
+                source.len() > 500,
+                "`{module}` source looks empty; include_str! may be pointing at the wrong file"
+            );
+        }
+    }
+
     #[test]
     fn a_bare_word_is_matched_to_a_flag_only_when_it_is_one() {
         // `mcp-repl demo` is the case worth catching.
