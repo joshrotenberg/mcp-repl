@@ -2058,7 +2058,15 @@ fn demo_router() -> tower_mcp::McpRouter {
         ("todo", "1. ship it"),
     ];
 
-    tower_mcp::McpRouter::new()
+    // A registry the demo can add a tool to while a client is connected. The
+    // README's headline claim is that the command table refreshes when the
+    // server's surface changes, and until now the bundled server advertised
+    // `tools.listChanged` without anything ever changing a list, so the claim
+    // could not be shown against `--demo`.
+    let (router, extra_tools) = tower_mcp::McpRouter::new().with_dynamic_tools();
+    let registry = extra_tools.clone();
+
+    router
         .server_info("mcp-repl-demo", env!("CARGO_PKG_VERSION"))
         .with_tasks()
         .prompt(
@@ -2182,6 +2190,7 @@ fn demo_router() -> tower_mcp::McpRouter {
                          - `notes` answers with **structured content** and a declared output schema\n\
                          - `n = notes` then `for $x in $n.notes: read $x.uri` loops over a result\n\
                          - `subscribe note://status` then `set_status text=hi` shows a **resource update**\n\
+                         - `toggle_extra` adds a tool while you are connected; `tools` shows it appear\n\
                          - `describe slow_add` shows the tool's schemas\n",
                     ))
                 })
@@ -2350,6 +2359,43 @@ fn demo_router() -> tower_mcp::McpRouter {
                         // resource when this arrives.
                         ctx.notify_resource_updated("note://status");
                         Ok(CallToolResult::text(format!("note://status is now: {text}")))
+                    }
+                })
+                .build(),
+        )
+        // Registering or unregistering broadcasts `tools/list_changed`, so
+        // running this at the prompt makes a command appear or disappear
+        // without reconnecting, and tab completion follows it.
+        .tool(
+            ToolBuilder::new("toggle_extra")
+                .description("Add or remove a tool, to show the surface changing live")
+                .annotations(ToolAnnotations {
+                    read_only_hint: false,
+                    idempotent_hint: false,
+                    destructive_hint: false,
+                    open_world_hint: false,
+                    ..Default::default()
+                })
+                .extractor_handler((), move |RawArgs(_): RawArgs| {
+                    let registry = registry.clone();
+                    async move {
+                        if registry.unregister("extra") {
+                            return Ok(CallToolResult::text(
+                                "removed `extra`; run `tools` and it is gone",
+                            ));
+                        }
+                        registry.register(
+                            ToolBuilder::new("extra")
+                                .description("A tool that was not here when you connected")
+                                .annotations(local_read_only())
+                                .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                                    Ok(CallToolResult::text("the extra tool answers"))
+                                })
+                                .build(),
+                        );
+                        Ok(CallToolResult::text(
+                            "added `extra`; run `tools` and it is there",
+                        ))
                     }
                 })
                 .build(),
@@ -8297,6 +8343,53 @@ mod tests {
                 "`{module}` source looks empty; include_str! may be pointing at the wrong file"
             );
         }
+    }
+
+    /// The tool list actually changes, so `tools.listChanged` is not merely
+    /// advertised.
+    ///
+    /// The REPL refetches on the notification from its interactive loop, so
+    /// the visible half of this only happens at the prompt. What the server
+    /// owes is that the list differs before and after, which is what this
+    /// asserts without needing a terminal.
+    #[tokio::test]
+    async fn the_demo_can_change_its_tool_list() {
+        let client = client_builder(ProtocolMode::Stable)
+            .unwrap()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .expect("connect to the demo router");
+        establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .expect("handshake");
+
+        let names = |listed: tower_mcp::protocol::ListToolsResult| {
+            listed
+                .tools
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let before = names(client.list_tools().await.expect("list tools"));
+        assert!(!before.contains(&"extra".to_string()), "{before:?}");
+
+        client
+            .call_tool("toggle_extra", serde_json::json!({}))
+            .await
+            .expect("toggle_extra");
+        let added = names(client.list_tools().await.expect("list tools"));
+        assert!(added.contains(&"extra".to_string()), "{added:?}");
+        assert_eq!(added.len(), before.len() + 1);
+
+        // And back, so the demo can be run twice without leaving a tool
+        // behind and without the operator reconnecting to clear it.
+        client
+            .call_tool("toggle_extra", serde_json::json!({}))
+            .await
+            .expect("toggle_extra again");
+        let removed = names(client.list_tools().await.expect("list tools"));
+        assert_eq!(removed, before);
     }
 
     /// A capability that is declared and never exercised is a capability
