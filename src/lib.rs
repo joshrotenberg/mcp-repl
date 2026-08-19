@@ -1397,6 +1397,41 @@ async fn connection_info(client: &McpClient) -> Option<ConnectionInfo> {
     Some(ConnectionInfo::from_discovery(discovery, protocol_version))
 }
 
+/// Perform the handshake, retrying once when the failed request was never sent.
+///
+/// `with_reconnect` covers commands, not connection setup, so a connection
+/// dropped partway through the handshake was reported as the server being
+/// unreachable. The observed failure is exactly this: `initialize` succeeds
+/// and `notifications/initialized` dies on a socket that closed underneath
+/// it.
+///
+/// **This retries the handshake, not the connection.** If the very first
+/// request dies, the transport never came up and a second attempt on the same
+/// client returns `Connection closed` without sending anything, because the
+/// client cannot rebuild its own transport. Recovering from that needs the
+/// connection rebuilt by the caller, which is tracked separately.
+///
+/// One retry rather than a loop: if the second attempt also cannot send, the
+/// server is unreachable and saying so promptly beats retrying on a schedule
+/// nobody asked for.
+async fn establish_connection_retrying(
+    client: &McpClient,
+    protocol: ProtocolMode,
+) -> tower_mcp::Result<ConnectionInfo> {
+    let first = match establish_connection(client, protocol).await {
+        Ok(info) => return Ok(info),
+        Err(e) => e,
+    };
+    if !session::is_reconnectable_http_error(&first) {
+        return Err(first);
+    }
+    // The first error is the one worth reporting if this also fails: it says
+    // what originally went wrong, where the second is usually a consequence.
+    establish_connection(client, protocol)
+        .await
+        .map_err(|_| first)
+}
+
 async fn establish_connection(
     client: &McpClient,
     protocol: ProtocolMode,
@@ -2792,7 +2827,7 @@ fn http_connector(
                     handler,
                 )
                 .await?;
-            establish_connection(&client, protocol).await?;
+            establish_connection_retrying(&client, protocol).await?;
             restore_resource_subscriptions(&client).await?;
             Ok(client)
         })
@@ -3085,7 +3120,7 @@ impl ConnectRuntime {
             }
         };
 
-        let info = establish_connection(&client, self.protocol)
+        let info = establish_connection_retrying(&client, self.protocol)
             .await
             .map_err(ConnectFailure::mcp)?;
         let surface = fetch_surface_initial(&client).await;
@@ -4495,7 +4530,7 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         }
     };
     let (session, surface) = if let Some(client) = client {
-        let info = establish_connection(&client, args.protocol).await?;
+        let info = establish_connection_retrying(&client, args.protocol).await?;
         if let Ok(mut label) = server_label.write() {
             label.clone_from(&info.server_info.name);
         }

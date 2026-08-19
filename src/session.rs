@@ -233,14 +233,40 @@ pub fn is_session_lost(e: &tower_mcp::Error) -> bool {
 /// their own message happens to mention an HTTP status.
 pub(crate) fn is_reconnectable_http_error(e: &tower_mcp::Error) -> bool {
     match e {
-        tower_mcp::Error::Transport(message) => status_after(message, "HTTP ")
-            .is_some_and(|status| matches!(status, "410" | "502" | "503")),
+        tower_mcp::Error::Transport(message) => {
+            status_after(message, "HTTP ")
+                .is_some_and(|status| matches!(status, "410" | "502" | "503"))
+                || is_unsent_request(message)
+        }
         tower_mcp::Error::JsonRpc(error) if error.code == -32000 => {
             status_after(&error.message, "server returned HTTP ")
                 .is_some_and(|status| matches!(status, "404" | "410" | "502" | "503"))
+                || is_unsent_request(&error.message)
         }
         _ => false,
     }
+}
+
+/// Whether a transport error means the request never reached the server.
+///
+/// A pooled keep-alive connection can be closed by the peer, or by anything
+/// between, while the client still believes it is usable. The next request
+/// committed to that socket fails before it is sent. Any HTTP MCP server
+/// behind a load balancer with an idle timeout produces this, and it was
+/// previously treated as permanent while a 503 was retried, which is
+/// backwards: a 503 is the server saying no, this is the server saying
+/// nothing.
+///
+/// **This condition rather than transport errors generally.** The message
+/// means the request was not sent, so the server cannot have acted on it and
+/// a retry cannot run a tool twice. A connection that dies while the response
+/// is being read reports differently and is deliberately not matched, because
+/// there the request may already have been carried out.
+///
+/// Matching a message is unfortunate. `tower_mcp::Error::Transport` carries a
+/// `String` and no cause, so there is nothing else to match on here.
+fn is_unsent_request(message: &str) -> bool {
+    message.contains("error sending request")
 }
 
 fn status_after<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
@@ -257,6 +283,52 @@ mod tests {
             message: message.to_string(),
             data: None,
         })
+    }
+
+    /// A connection dropped before the request was sent is retryable.
+    ///
+    /// This is the shape a pooled keep-alive connection produces when the
+    /// peer, or anything between, closes it while the client still believes
+    /// it is usable. Both spellings observed in the wild are covered: the
+    /// bare transport failure, and the one wrapped by the handshake's own
+    /// context.
+    #[test]
+    fn a_connection_that_died_before_sending_is_reconnectable() {
+        for message in [
+            "HTTP request failed: error sending request for url (http://127.0.0.1:8080/)",
+            "failed to deliver notifications/initialized: Transport error: HTTP request \
+             failed: error sending request for url (http://127.0.0.1:37973/)",
+        ] {
+            assert!(
+                is_reconnectable_http_error(&tower_mcp::Error::Transport(message.to_string())),
+                "{message}"
+            );
+        }
+        // The same failure also arrives as a JSON-RPC -32000 from the surface
+        // fetch path, and should be treated the same way.
+        assert!(is_reconnectable_http_error(&jsonrpc(
+            -32000,
+            "HTTP request failed: error sending request for url (http://x/)"
+        )));
+    }
+
+    /// A response that failed while being read is deliberately not retried.
+    ///
+    /// There the request reached the server, which may already have run a
+    /// tool, so retrying risks doing it twice. Only a request that was never
+    /// sent is safe to repeat.
+    #[test]
+    fn a_failure_after_the_request_was_sent_is_not_retried() {
+        for message in [
+            "error reading response body",
+            "connection closed before message completed",
+            "Connection closed",
+        ] {
+            assert!(
+                !is_reconnectable_http_error(&tower_mcp::Error::Transport(message.to_string())),
+                "{message}"
+            );
+        }
     }
 
     #[test]
