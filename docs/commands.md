@@ -89,7 +89,7 @@ so what a tool does to the world is visible while choosing it rather than one
 cratesio> tools
 get_crate_info           Get detailed crate information [read-only idempotent]
 publish_crate            Publish a crate [destructive open-world]
-slow_add                 Add two numbers, slowly [task-capable]
+slow_add                 Add two numbers, slowly [read-only idempotent task-capable]
 ```
 
 A server that declares no annotations gets no tags.
