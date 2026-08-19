@@ -349,6 +349,73 @@ fn config_path_with(
 
 #[cfg(test)]
 mod tests {
+    /// The example config at the repository root, parsed as a fixture.
+    ///
+    /// `deny_unknown_fields` means a key that drifts away from the parser is a
+    /// hard failure rather than a line that quietly does nothing, so parsing
+    /// the example here is what keeps it honest. Included at compile time, so
+    /// deleting or renaming it breaks the build rather than skipping the test.
+    const EXAMPLE: &str = include_str!("../config.example.toml");
+
+    #[test]
+    fn the_example_config_parses() {
+        let config = Config::parse(EXAMPLE).expect("config.example.toml parses");
+        assert_eq!(
+            config.servers.len(),
+            4,
+            "four profiles, one per shape shown"
+        );
+        assert_eq!(config.oauth.len(), 1);
+        assert!(!config.aliases.is_empty());
+    }
+
+    /// Every key the parser accepts appears in the example.
+    ///
+    /// Without this the example decays one field at a time: a new key is
+    /// added, nobody documents it, and the file quietly stops being complete
+    /// while still parsing perfectly.
+    #[test]
+    fn the_example_config_exercises_every_key() {
+        let config = Config::parse(EXAMPLE).expect("parses");
+
+        // Profile: each optional key set by at least one profile, and each
+        // collection non-empty somewhere.
+        let servers: Vec<&Profile> = config.servers.values().collect();
+        let any = |f: &dyn Fn(&Profile) -> bool| servers.iter().any(|p| f(p));
+        assert!(any(&|p| p.transport.is_some()), "transport");
+        assert!(any(&|p| p.url.is_some()), "url");
+        assert!(any(&|p| p.bearer.is_some()), "bearer");
+        assert!(any(&|p| p.bearer_env.is_some()), "bearer_env");
+        assert!(any(&|p| p.oauth.is_some()), "oauth");
+        assert!(any(&|p| !p.headers.is_empty()), "headers");
+        assert!(any(&|p| !p.command.is_empty()), "command");
+        assert!(any(&|p| !p.aliases.is_empty()), "profile aliases");
+
+        // Both transports are represented, since they are configured
+        // differently and showing only one leaves the other undocumented.
+        assert!(
+            servers.iter().any(|p| !p.command.is_empty())
+                && servers.iter().any(|p| p.url.is_some()),
+            "a stdio profile and an http profile"
+        );
+
+        let oauth = config.oauth.values().next().expect("an oauth profile");
+        assert!(!oauth.url.is_empty(), "oauth url");
+        assert!(!oauth.scopes.is_empty(), "oauth scopes");
+        assert!(
+            oauth.client_id_metadata_document.is_some(),
+            "client_id_metadata_document"
+        );
+        assert!(oauth.authorization_server.is_some(), "authorization_server");
+
+        assert!(config.repl.history_capacity.is_some(), "history_capacity");
+        assert!(config.repl.request_timeout.is_some(), "request_timeout");
+        assert!(
+            config.repl.completion_timeout_ms.is_some(),
+            "completion_timeout_ms"
+        );
+    }
+
     use super::*;
     use crate::directories::{Directories, Platform};
     use std::ffi::OsString;

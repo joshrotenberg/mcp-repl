@@ -240,6 +240,13 @@ lives at `$XDG_CONFIG_HOME/mcp-repl/config.toml` on Unix, falling back to
 `~/.config/mcp-repl/config.toml`. On Windows it lives at
 `%APPDATA%\mcp-repl\config.toml`. `--config <path>` reads a different one.
 
+A fully commented [`config.example.toml`](../config.example.toml) at the
+repository root shows every key the parser accepts, with an explanation for
+each. Copy it to the path above and edit it. Unknown keys are an error rather
+than being ignored, so that file is complete by construction: a test parses it
+and asserts it exercises every key, which is what stops it drifting away from
+the parser.
+
 ```toml
 [servers.cratesio]
 transport = "http"                 # http | stdio
