@@ -33,7 +33,15 @@ name = "mcp-repl"
 path = "src/main.rs"
 
 [dependencies]
-tower-mcp = { version = "0.22.0", features = ["http-client", "oauth-client", "protocol-2026-07-28"] }
+# `dynamic-tools` carries no dependencies of its own; it compiles the registry
+# the demo server uses to add a tool while a client is connected, which is what
+# lets `--demo` show the command table refreshing live.
+tower-mcp = { version = "0.22.0", features = [
+    "dynamic-tools",
+    "http-client",
+    "oauth-client",
+    "protocol-2026-07-28",
+] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
