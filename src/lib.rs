@@ -2064,7 +2064,13 @@ fn demo_router() -> tower_mcp::McpRouter {
     // `tools.listChanged` without anything ever changing a list, so the claim
     // could not be shown against `--demo`.
     let (router, extra_tools) = tower_mcp::McpRouter::new().with_dynamic_tools();
-    let registry = extra_tools.clone();
+    let (router, extra_prompts) = router.with_dynamic_prompts();
+    let (router, extra_resources) = router.with_dynamic_resources();
+    let (tools, prompts, resources) = (
+        extra_tools.clone(),
+        extra_prompts.clone(),
+        extra_resources.clone(),
+    );
 
     router
         .server_info("mcp-repl-demo", env!("CARGO_PKG_VERSION"))
@@ -2190,7 +2196,7 @@ fn demo_router() -> tower_mcp::McpRouter {
                          - `notes` answers with **structured content** and a declared output schema\n\
                          - `n = notes` then `for $x in $n.notes: read $x.uri` loops over a result\n\
                          - `subscribe note://status` then `set_status text=hi` shows a **resource update**\n\
-                         - `toggle_extra` adds a tool while you are connected; `tools` shows it appear\n\
+                         - `toggle_extra` adds a tool, prompt, and resource while you are connected\n\
                          - `describe slow_add` shows the tool's schemas\n",
                     ))
                 })
@@ -2368,7 +2374,7 @@ fn demo_router() -> tower_mcp::McpRouter {
         // without reconnecting, and tab completion follows it.
         .tool(
             ToolBuilder::new("toggle_extra")
-                .description("Add or remove a tool, to show the surface changing live")
+                .description("Add or remove a tool, prompt, and resource, to show the surface changing live")
                 .annotations(ToolAnnotations {
                     read_only_hint: false,
                     idempotent_hint: false,
@@ -2377,14 +2383,20 @@ fn demo_router() -> tower_mcp::McpRouter {
                     ..Default::default()
                 })
                 .extractor_handler((), move |RawArgs(_): RawArgs| {
-                    let registry = registry.clone();
+                    let (tools, prompts, resources) =
+                        (tools.clone(), prompts.clone(), resources.clone());
                     async move {
-                        if registry.unregister("extra") {
+                        // One command for all three surfaces. The demo would
+                        // otherwise need three near-identical toggles, and the
+                        // point being shown is the same each time.
+                        if tools.unregister("extra") {
+                            prompts.unregister("extra_prompt");
+                            resources.unregister("note://extra");
                             return Ok(CallToolResult::text(
-                                "removed `extra`; run `tools` and it is gone",
+                                "removed the extra tool, prompt, and resource",
                             ));
                         }
-                        registry.register(
+                        tools.register(
                             ToolBuilder::new("extra")
                                 .description("A tool that was not here when you connected")
                                 .annotations(local_read_only())
@@ -2393,8 +2405,32 @@ fn demo_router() -> tower_mcp::McpRouter {
                                 })
                                 .build(),
                         );
+                        prompts.register(
+                            PromptBuilder::new("extra_prompt")
+                                .description("A prompt that was not here when you connected")
+                                .handler(|_args| async move {
+                                    Ok(tower_mcp::GetPromptResult::user_message(
+                                        "the extra prompt answers",
+                                    ))
+                                })
+                                .build(),
+                        );
+                        resources.register(
+                            tower_mcp::resource::ResourceBuilder::new("note://extra")
+                                .name("Extra")
+                                .description("A resource that was not here when you connected")
+                                .mime_type("text/plain")
+                                .handler(|| async {
+                                    Ok(ReadResourceResult::text(
+                                        "note://extra",
+                                        "the extra resource answers",
+                                    ))
+                                })
+                                .build(),
+                        );
                         Ok(CallToolResult::text(
-                            "added `extra`; run `tools` and it is there",
+                            "added an extra tool, prompt, and resource; `tools`, `prompts`, \
+                             and `resources` each show one more",
                         ))
                     }
                 })
@@ -8345,15 +8381,15 @@ mod tests {
         }
     }
 
-    /// The tool list actually changes, so `tools.listChanged` is not merely
-    /// advertised.
+    /// The tool, prompt, and resource lists actually change, so `listChanged`
+    /// on all three is not merely advertised.
     ///
     /// The REPL refetches on the notification from its interactive loop, so
     /// the visible half of this only happens at the prompt. What the server
     /// owes is that the list differs before and after, which is what this
     /// asserts without needing a terminal.
     #[tokio::test]
-    async fn the_demo_can_change_its_tool_list() {
+    async fn the_demo_can_change_its_lists() {
         let client = client_builder(ProtocolMode::Stable)
             .unwrap()
             .connect_simple(ChannelTransport::new(demo_router()))
@@ -8371,8 +8407,23 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        let counts = |t: usize, p: usize, r: usize| (t, p, r);
+        let sizes = async |client: &tower_mcp::client::McpClient| {
+            (
+                client.list_tools().await.expect("tools").tools.len(),
+                client.list_prompts().await.expect("prompts").prompts.len(),
+                client
+                    .list_resources()
+                    .await
+                    .expect("resources")
+                    .resources
+                    .len(),
+            )
+        };
+
         let before = names(client.list_tools().await.expect("list tools"));
         assert!(!before.contains(&"extra".to_string()), "{before:?}");
+        let (t0, p0, r0) = sizes(&client).await;
 
         client
             .call_tool("toggle_extra", serde_json::json!({}))
@@ -8380,9 +8431,11 @@ mod tests {
             .expect("toggle_extra");
         let added = names(client.list_tools().await.expect("list tools"));
         assert!(added.contains(&"extra".to_string()), "{added:?}");
-        assert_eq!(added.len(), before.len() + 1);
+        // All three surfaces advertise listChanged, so all three have to
+        // actually change, not just the one that was easiest to wire.
+        assert_eq!(sizes(&client).await, counts(t0 + 1, p0 + 1, r0 + 1));
 
-        // And back, so the demo can be run twice without leaving a tool
+        // And back, so the demo can be run twice without leaving anything
         // behind and without the operator reconnecting to clear it.
         client
             .call_tool("toggle_extra", serde_json::json!({}))
@@ -8390,6 +8443,7 @@ mod tests {
             .expect("toggle_extra again");
         let removed = names(client.list_tools().await.expect("list tools"));
         assert_eq!(removed, before);
+        assert_eq!(sizes(&client).await, counts(t0, p0, r0));
     }
 
     /// A capability that is declared and never exercised is a capability
