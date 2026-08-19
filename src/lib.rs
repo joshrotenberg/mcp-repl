@@ -2008,6 +2008,15 @@ fn demo_router() -> tower_mcp::McpRouter {
     /// One transparent pixel, base64 as it travels on the wire.
     const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
+    // `note://status` exists so `subscribe` has a target. Until something can
+    // change it, a subscriber is notified of nothing, so the capability is
+    // declared and unobservable. One piece of state fixes that, created per
+    // router so two demo routers in one process do not share it.
+    let status = Arc::new(std::sync::Mutex::new(String::from(
+        "all quiet on the demo server",
+    )));
+    let status_for_read = Arc::clone(&status);
+
     const NOTES: &[(&str, &str)] = &[
         ("groceries", "- eggs\n- coffee"),
         ("ideas", "# Ideas\n\n- a REPL for MCP servers"),
@@ -2038,11 +2047,12 @@ fn demo_router() -> tower_mcp::McpRouter {
                 .name("Status")
                 .description("A one-line status note (subscribe to it)")
                 .mime_type("text/plain")
-                .handler(|| async {
-                    Ok(ReadResourceResult::text(
-                        "note://status",
-                        "all quiet on the demo server",
-                    ))
+                .handler(move || {
+                    let status = Arc::clone(&status_for_read);
+                    async move {
+                        let text = status.lock().expect("status lock").clone();
+                        Ok(ReadResourceResult::text("note://status", text))
+                    }
                 })
                 .build(),
         )
@@ -2136,6 +2146,7 @@ fn demo_router() -> tower_mcp::McpRouter {
                          - `sign_in` asks *you* for the answers (elicitation)\n\
                          - `notes` answers with **structured content** and a declared output schema\n\
                          - `n = notes` then `for $x in $n.notes: read $x.uri` loops over a result\n\
+                         - `subscribe note://status` then `set_status text=hi` shows a **resource update**\n\
                          - `describe slow_add` shows the tool's schemas\n",
                     ))
                 })
@@ -2271,6 +2282,40 @@ fn demo_router() -> tower_mcp::McpRouter {
                         structured_content: Some(serde_json::json!({ "notes": notes })),
                         meta: None,
                     })
+                })
+                .build(),
+        )
+        // The demo's only tool that changes anything, and the only one that
+        // publishes `notifications/resources/updated`. Without it the server
+        // advertises `resources.subscribe` and never sends a subscriber
+        // anything, so `subscribe` could be run but not observed.
+        //
+        // Also the only tool here that is not read-only, which is what makes
+        // the annotation visible in a listing rather than uniform.
+        .tool(
+            ToolBuilder::new("set_status")
+                .description("Change note://status and notify its subscribers")
+                .annotations(ToolAnnotations {
+                    read_only_hint: false,
+                    idempotent_hint: true,
+                    destructive_hint: false,
+                    open_world_hint: false,
+                    ..Default::default()
+                })
+                .extractor_handler((), move |ctx: Context, RawArgs(args): RawArgs| {
+                    let status = Arc::clone(&status);
+                    async move {
+                        let text = args
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("all quiet on the demo server")
+                            .to_string();
+                        *status.lock().expect("status lock") = text.clone();
+                        // The point of the tool. A subscriber re-reads the
+                        // resource when this arrives.
+                        ctx.notify_resource_updated("note://status");
+                        Ok(CallToolResult::text(format!("note://status is now: {text}")))
+                    }
                 })
                 .build(),
         )
@@ -8217,6 +8262,62 @@ mod tests {
                 "`{module}` source looks empty; include_str! may be pointing at the wrong file"
             );
         }
+    }
+
+    /// A capability that is declared and never exercised is a capability
+    /// nobody can check. The demo advertised `resources.subscribe` while
+    /// nothing could ever change a resource, so a subscriber was notified of
+    /// nothing.
+    #[tokio::test]
+    async fn the_demo_can_change_a_resource_and_say_so() {
+        let client = client_builder(ProtocolMode::Stable)
+            .unwrap()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .expect("connect to the demo router");
+        establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .expect("handshake");
+
+        async fn status_text(client: &tower_mcp::client::McpClient) -> String {
+            client
+                .read_resource("note://status")
+                .await
+                .expect("read status")
+                .contents
+                .first()
+                .expect("one content")
+                .text
+                .clone()
+                .expect("note://status is a text resource")
+        }
+
+        let before = status_text(&client).await;
+        client
+            .call_tool("set_status", serde_json::json!({ "text": "deploying" }))
+            .await
+            .expect("set_status");
+        let after = status_text(&client).await;
+
+        assert_ne!(before, after, "the resource actually changes");
+        assert_eq!(after, "deploying");
+
+        // Not read-only, and the only demo tool that is not. That is what
+        // makes the annotation visible in a listing rather than uniform.
+        let tools = client.list_tools().await.expect("list tools");
+        let set_status = tools
+            .tools
+            .iter()
+            .find(|t| t.name == "set_status")
+            .expect("the demo offers `set_status`");
+        let annotations = set_status
+            .annotations
+            .as_ref()
+            .expect("set_status is annotated");
+        assert!(
+            !annotations.read_only_hint,
+            "a tool that changes a resource is not read-only"
+        );
     }
 
     /// The demo is what a contributor can run, so a client feature with no
