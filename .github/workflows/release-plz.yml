@@ -36,6 +36,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - name: Dispatch required CI on release-plz branches
+        # Bot-created pull_request runs wait for approval. The trusted
+        # release-ci-status workflow mirrors this dispatch onto the PR head.
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
