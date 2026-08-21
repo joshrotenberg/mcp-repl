@@ -1702,6 +1702,50 @@ async fn exercise_loglevel(fixture: &Path, temp: &TempDir) {
         "and its log is below the level that was set:\n{stderr}"
     );
 
+    // Final MCP removed the session-wide RPC. The same built-in now updates
+    // the metadata on later typed requests: one call opts into Info and the
+    // next threshold suppresses it, without replacing `call_tool` with a raw
+    // request that would lose task/MRTR/schema-retry behavior.
+    let final_output = run_stdio(
+        fixture,
+        temp,
+        "loglevel-final",
+        &[
+            "--protocol",
+            "2026-07-28",
+            "--no-history",
+            "--color",
+            "never",
+            "--exec",
+            "loglevel debug",
+            "--exec",
+            "announce",
+            "--exec",
+            "loglevel emergency",
+            "--exec",
+            "announce",
+        ],
+    )
+    .await;
+    assert_success(&final_output, "final loglevel");
+    let stdout = String::from_utf8_lossy(&final_output.stdout);
+    let stderr = String::from_utf8_lossy(&final_output.stderr);
+    assert_eq!(
+        stdout.matches("log level set to").count(),
+        2,
+        "both final thresholds are accepted:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("announced").count(),
+        2,
+        "both typed tool calls still complete:\n{stdout}"
+    );
+    assert_eq!(
+        stderr.matches("log info").count(),
+        1,
+        "only the request prepared with the debug threshold receives Info:\n{stderr}"
+    );
+
     // A server that never declared the capability is told so, rather than
     // being sent a request it will only reject.
     let mut undeclared = repl_command();

@@ -26,6 +26,8 @@ mcp-repl-demo> echo message="hi there"     # args coerced by inputSchema
 mcp-repl-demo> echo msg=hi                 # refused: `message` is required
 mcp-repl-demo> convert value=100 from=celsius to=<Tab>  # completes the enum values
 mcp-repl-demo> slow_add a=2 b=3 &          # runs task-augmented; `jobs`, `wait 1`
+mcp-repl-demo> logs                        # four severities; `loglevel` filters them
+mcp-repl-demo> content_types               # text, image, audio, embedded resource, link
 mcp-repl-demo> fail                        # what a tool error looks like
 mcp-repl-demo> sign_in                     # the server asks *you* (elicitation)
 mcp-repl-demo> summarize text="..."        # the server asks your *client* (sampling)
@@ -216,12 +218,17 @@ demo> slow_add a=2 b=3
 Ctrl-C also tells the server, so the work stops on both ends rather than
 continuing against a client that has stopped listening.
 
-`loglevel <level>` asks the server to change how much it logs, through
-`logging/setLevel`:
+`loglevel <level>` asks the server to change how much it logs. A stable
+connection sends `logging/setLevel`; protocol 2026-07-28 stores the threshold
+on the client and attaches it to each subsequent request:
 
 ```text
-cratesio> loglevel warning
+demo> loglevel warning
 log level set to warning [12ms]
+demo> logs
+[log warning] "something needs attention"
+[log error] "an example error"
+emitted debug, info, warning, and error logs
 ```
 
 The levels are the syslog severities the MCP spec uses, least severe first:
@@ -229,11 +236,17 @@ The levels are the syslog severities the MCP spec uses, least severe first:
 `emergency`. Setting one means that level and everything more severe, so
 `warning` silences `info` and `debug` but keeps errors. Tab completion offers
 them in that order rather than alphabetically, so the menu reads as a scale.
+The demo's `logs` command emits debug, info, warning, and error in that order,
+so running it before and after `loglevel warning` makes the filtering visible.
+On protocol 2026-07-28, no log notifications are authorized until `loglevel`
+sets the per-request threshold. The selected value applies to requests
+prepared afterward; a request already in flight keeps the value it started
+with.
 
 A server that does not declare the `logging` capability is reported as such
 rather than sent a request it would only reject. Its notifications, if it
-sends any, arrive regardless: the level is a request, not a filter this end
-applies.
+sends any, arrive regardless. The threshold tells the server what to send;
+mcp-repl does not silently discard log notifications after receiving them.
 
 Progress and log notifications print inline as they arrive:
 
@@ -249,7 +262,9 @@ scanned 4 items
 A server only sends progress when the client asks for it, so mcp-repl
 attaches a progress token to every request it issues. `list_changed`
 notifications refresh the command table mid-session, so dynamic servers grow
-and shrink the REPL's vocabulary live. Stable connections receive those notifications on
+and shrink the REPL's vocabulary live. Run `toggle_extra` in the demo to add
+or remove one tool, prompt, and resource without reconnecting. Stable
+connections receive those notifications on
 their ordinary transport. An interactive final connection opens one
 `subscriptions/listen` stream for tool, prompt, and resource list changes
 after its initial surface fetch, validates the server's acknowledged subset,
@@ -412,12 +427,17 @@ Capture and filtering act on tool calls and on the built-ins that return a
 documented value: `tools`, `prompts`, `resources`, `templates`, `describe`,
 `read`, `find`, and `info`.
 
+`for` walks an array selected from a captured value. The demo's `notes` result
+contains a structured `notes` array, so the entire example is runnable as-is:
+
 ```text
-demo> t = tools
-$t = [3 items]
-demo> tools | [0].name
-about
+demo> n = notes
+$n = {1 field}
+demo> for $note in $n.notes: read $note.uri
 ```
+
+For example, `notes | notes[0].name` prints `groceries` without relying on a
+tool count that changes as the bundled demo grows.
 
 A command that reports rather than returning a value (`help`, `alias`,
 `wire`, `refresh`, ...) refuses the request instead of ignoring it:
@@ -441,7 +461,9 @@ demo> subscribe note://status
 subscribed note://status
 demo> subscriptions
 note://status
+demo> set_status text=deploying
 [resource updated] note://status
+note://status is now: deploying
 demo> unsubscribe note://status
 unsubscribed note://status
 ```

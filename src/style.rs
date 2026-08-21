@@ -132,7 +132,12 @@ fn write_json(out: &mut String, value: &serde_json::Value, indent: usize) {
             out.push_str(&paint(Style::new().fg(Color::Yellow), &n.to_string()));
         }
         serde_json::Value::String(s) => {
-            let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}"));
+            // JSON quoting escapes C0 bytes but leaves C1 control characters
+            // such as the C1 CSI control intact. Neutralize server text
+            // before adding our own optional ANSI styling.
+            let safe = sanitize(s);
+            let quoted =
+                serde_json::to_string(safe.as_ref()).unwrap_or_else(|_| format!("{safe:?}"));
             out.push_str(&paint(Style::new().fg(Color::Green), &quoted));
         }
         serde_json::Value::Array(items) => {
@@ -159,7 +164,9 @@ fn write_json(out: &mut String, value: &serde_json::Value, indent: usize) {
             }
             out.push_str("{\n");
             for (i, (key, val)) in map.iter().enumerate() {
-                let quoted = serde_json::to_string(key).unwrap_or_else(|_| format!("{key:?}"));
+                let safe = sanitize(key);
+                let quoted =
+                    serde_json::to_string(safe.as_ref()).unwrap_or_else(|_| format!("{safe:?}"));
                 out.push_str(&inner_pad);
                 out.push_str(&paint(Style::new().fg(Color::Cyan), &quoted));
                 out.push_str(": ");
@@ -368,6 +375,19 @@ mod tests {
         let rendered = render_markdown(hostile);
         assert!(!rendered.contains("]52;"));
         assert!(!rendered.contains("[2K"));
+        assert!(rendered.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn json_rendering_neutralizes_hostile_keys_and_values() {
+        let hostile = serde_json::json!({
+            "key\u{9b}2Jafter": "value\u{1b}]52;c;evil\u{7}after",
+        });
+        let rendered = json_pretty(&hostile);
+        assert!(!rendered.contains('\u{9b}'));
+        assert!(!rendered.contains("2J"));
+        assert!(!rendered.contains("]52;"));
+        assert!(!rendered.contains("evil"));
         assert!(rendered.contains('\u{FFFD}'));
     }
 }

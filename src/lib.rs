@@ -836,7 +836,9 @@ pub(crate) const BUILTINS: Builtins = Builtins(&[
         summary: "set the server's log verbosity",
         usage: "loglevel \
          <debug|info|notice|warning|error|critical|alert|emergency>",
-        detail: "Ask the server to change how much it logs, via `logging/setLevel`. \
+        detail: "Set how much the server logs. Stable MCP uses \
+         `logging/setLevel`; protocol 2026-07-28 attaches the threshold to \
+         each subsequent request. \
          Levels are the syslog severities the MCP spec uses, least severe \
          first: a level means that one and everything more severe. Needs \
          the server to declare the `logging` capability.",
@@ -1099,25 +1101,38 @@ fn render_content(content: &[Content]) {
                     println!("{}", sanitize(text));
                 }
             }
-            other => {
-                let v = serde_json::to_value(other).unwrap_or_default();
-                let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("content");
-                match ty {
-                    "image" | "audio" => {
-                        let mime = v.get("mimeType").and_then(|m| m.as_str()).unwrap_or("?");
-                        let len = v.get("data").and_then(|d| d.as_str()).map_or(0, str::len);
-                        println!(
-                            "{}",
-                            tag(
-                                Style::new(),
-                                &format!("{ty} {}, {len} base64 chars", sanitize(mime))
-                            )
-                        );
-                    }
-                    _ => println!("{}", json_pretty(&v)),
-                }
-            }
+            other => println!("{}", render_non_text_content(other)),
         }
+    }
+}
+
+/// Render one non-text block without ever printing an image or audio payload.
+///
+/// Kept separate from the output loop so the demo's mixed-content result can
+/// pin this safety/property directly: binary content is useful to identify,
+/// but dumping base64 into a terminal is neither useful nor friendly.
+fn render_non_text_content(content: &Content) -> String {
+    let value = serde_json::to_value(content).unwrap_or_default();
+    let ty = value
+        .get("type")
+        .and_then(|ty| ty.as_str())
+        .unwrap_or("content");
+    match ty {
+        "image" | "audio" => {
+            let mime = value
+                .get("mimeType")
+                .and_then(|mime| mime.as_str())
+                .unwrap_or("?");
+            let len = value
+                .get("data")
+                .and_then(|data| data.as_str())
+                .map_or(0, str::len);
+            tag(
+                Style::new(),
+                &format!("{ty} {}, {len} base64 chars", sanitize(mime)),
+            )
+        }
+        _ => json_pretty(&value),
     }
 }
 
@@ -2015,6 +2030,15 @@ fn build_http_config_with_env(
     )
 }
 
+/// One transparent pixel, base64 as it travels on the demo wire.
+const DEMO_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/// An empty but valid mono WAV stream: a 44-byte PCM header and no frames.
+const DEMO_SILENT_WAV: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+
+/// Small enough that the demo tool catalogue spans several pages.
+const DEMO_PAGE_SIZE: usize = 4;
+
 fn demo_router() -> tower_mcp::McpRouter {
     use tower_mcp::context::RequestContext;
     use tower_mcp::extract::{Context, Json, RawArgs};
@@ -2026,10 +2050,9 @@ fn demo_router() -> tower_mcp::McpRouter {
     use tower_mcp::resource::ResourceTemplateBuilder;
     use tower_mcp::{CallToolResult, PromptBuilder, TaskSupportMode, ToolBuilder};
 
-    /// Reads nothing outside this process and changes nothing: true of every
-    /// tool here except `sign_in`. Spelled out rather than using
-    /// `read_only_safe()`, which leaves `open_world_hint` at the spec default
-    /// of true and would tag all six tools identically.
+    /// Reads nothing outside this process and changes nothing. Spelled out
+    /// rather than using `read_only_safe()`, which leaves `open_world_hint`
+    /// at the spec default of true.
     fn local_read_only() -> ToolAnnotations {
         ToolAnnotations {
             read_only_hint: true,
@@ -2039,9 +2062,6 @@ fn demo_router() -> tower_mcp::McpRouter {
             ..Default::default()
         }
     }
-
-    /// One transparent pixel, base64 as it travels on the wire.
-    const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
     // `note://status` exists so `subscribe` has a target. Until something can
     // change it, a subscriber is notified of nothing, so the capability is
@@ -2074,6 +2094,7 @@ fn demo_router() -> tower_mcp::McpRouter {
 
     router
         .server_info("mcp-repl-demo", env!("CARGO_PKG_VERSION"))
+        .page_size(DEMO_PAGE_SIZE)
         .with_tasks()
         .prompt(
             PromptBuilder::new("greet")
@@ -2119,7 +2140,7 @@ fn demo_router() -> tower_mcp::McpRouter {
                             uri: "img://pixel".to_string(),
                             mime_type: Some("image/png".to_string()),
                             text: None,
-                            blob: Some(PIXEL_PNG.to_string()),
+                            blob: Some(DEMO_PIXEL_PNG.to_string()),
                             meta: None,
                         }],
                         ..Default::default()
@@ -2192,8 +2213,10 @@ fn demo_router() -> tower_mcp::McpRouter {
                          - `convert value=100 to=<Tab>` completes the enum values\n\
                          - `slow_add a=2 b=3 &` runs **task-augmented**\n\
                          - `scan steps=5` reports **progress** while it runs\n\
+                         - `logs` emits several severities; try `loglevel warning` first\n\
                          - `sign_in` asks *you* for the answers (elicitation)\n\
                          - `notes` answers with **structured content** and a declared output schema\n\
+                         - `content_types` returns text, image, audio, an embedded resource, and a link\n\
                          - `n = notes` then `for $x in $n.notes: read $x.uri` loops over a result\n\
                          - `subscribe note://status` then `set_status text=hi` shows a **resource update**\n\
                          - `toggle_extra` adds a tool, prompt, and resource while you are connected\n\
@@ -2256,13 +2279,48 @@ fn demo_router() -> tower_mcp::McpRouter {
                 )
                 .build(),
         )
-        // The demo server otherwise always succeeds, which leaves two things
-        // with no example: how a tool error renders, and that a failed task
-        // fails the script that waited for it. Task-capable so both are
-        // reachable from the one tool.
-        //
-        //   mcp-repl --demo -e fail                 # tool error, exit 3
-        //   mcp-repl --demo -e 'fail &' -e wait     # failed task, exit 3
+        // This command makes the logging capability observable and gives
+        // `loglevel` an immediate demonstration: at `warning`, the first two
+        // messages are filtered while the last two still arrive. Stable MCP
+        // stores that threshold server-side; final MCP authorizes each request
+        // with the threshold in its metadata.
+        .tool(
+            ToolBuilder::new("logs")
+                .description("Emit logs at debug, info, warning, and error")
+                .annotations(local_read_only())
+                .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                    use tower_mcp::protocol::{LogLevel, LoggingMessageParams};
+
+                    if ctx.per_request_meta().is_some_and(|meta| {
+                        meta.protocol_version.as_deref()
+                            == Some(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
+                            && meta.log_level.is_none()
+                    }) {
+                        return Ok(CallToolResult::text(
+                            "no logs emitted: protocol 2026-07-28 authorizes logging per request, \
+                             and this client did not request a log level",
+                        ));
+                    }
+                    for (level, message) in [
+                        (LogLevel::Debug, "debug detail"),
+                        (LogLevel::Info, "ordinary information"),
+                        (LogLevel::Warning, "something needs attention"),
+                        (LogLevel::Error, "an example error"),
+                    ] {
+                        ctx.send_log(
+                            LoggingMessageParams::new(level, serde_json::json!(message))
+                                .with_logger("demo"),
+                        );
+                    }
+                    // Let one-shot runs render the notification frames before
+                    // their terminal tool response makes the process exit.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(CallToolResult::text(
+                        "emitted debug, info, warning, and error logs",
+                    ))
+                })
+                .build(),
+        )
         // The one tool here that answers with structured content and declares
         // an output schema for it. Both are real protocol features the REPL
         // renders (`describe` shows the output schema, and a structured
@@ -2335,13 +2393,67 @@ fn demo_router() -> tower_mcp::McpRouter {
                 })
                 .build(),
         )
-        // The demo's only tool that changes anything, and the only one that
-        // publishes `notifications/resources/updated`. Without it the server
+        // One result containing every MCP content shape. Apart from making
+        // each renderer reachable with `--demo`, the ordered blocks show that
+        // a result is a sequence rather than a single text-or-binary choice.
+        .tool(
+            ToolBuilder::new("content_types")
+                .description("Return a multi-block result containing every MCP content type")
+                .annotations(local_read_only())
+                .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                    use tower_mcp::protocol::{Content, ResourceContent};
+
+                    Ok(CallToolResult {
+                        content: vec![
+                            Content::text("this result has five blocks in protocol order"),
+                            Content::Image {
+                                data: DEMO_PIXEL_PNG.to_string(),
+                                mime_type: "image/png".to_string(),
+                                annotations: None,
+                                meta: None,
+                            },
+                            Content::Audio {
+                                data: DEMO_SILENT_WAV.to_string(),
+                                mime_type: "audio/wav".to_string(),
+                                annotations: None,
+                                meta: None,
+                            },
+                            Content::Resource {
+                                resource: ResourceContent {
+                                    uri: "note://ideas".to_string(),
+                                    mime_type: Some("text/markdown".to_string()),
+                                    text: Some("# Ideas\n\n- a REPL for MCP servers".to_string()),
+                                    blob: None,
+                                    meta: None,
+                                },
+                                annotations: None,
+                                meta: None,
+                            },
+                            Content::ResourceLink {
+                                uri: "note://status".to_string(),
+                                name: "Status".to_string(),
+                                title: Some("Demo status".to_string()),
+                                description: Some(
+                                    "The mutable resource used by the subscription demo".to_string(),
+                                ),
+                                mime_type: Some("text/plain".to_string()),
+                                size: None,
+                                icons: None,
+                                annotations: None,
+                                meta: None,
+                            },
+                        ],
+                        is_error: false,
+                        structured_content: None,
+                        meta: None,
+                    })
+                })
+                .build(),
+        )
+        // Publishes `notifications/resources/updated`. Without it the server
         // advertises `resources.subscribe` and never sends a subscriber
-        // anything, so `subscribe` could be run but not observed.
-        //
-        // Also the only tool here that is not read-only, which is what makes
-        // the annotation visible in a listing rather than uniform.
+        // anything, so `subscribe` could be run but not observed. Deliberately
+        // not read-only, so its annotation matches the state change.
         .tool(
             ToolBuilder::new("set_status")
                 .description("Change note://status and notify its subscribers")
@@ -2436,6 +2548,13 @@ fn demo_router() -> tower_mcp::McpRouter {
                 })
                 .build(),
         )
+        // The demo server otherwise always succeeds, which leaves two things
+        // with no example: how a tool error renders, and that a failed task
+        // fails the script that waited for it. Task-capable so both are
+        // reachable from the one tool.
+        //
+        //   mcp-repl --demo -e fail                 # tool error, exit 3
+        //   mcp-repl --demo -e 'fail &' -e wait     # failed task, exit 3
         .tool(
             ToolBuilder::new("fail")
                 .description("Always fails (try `fail &` then `wait`)")
@@ -4011,6 +4130,32 @@ fn parse_log_level(word: &str) -> Option<LogLevel> {
         "alert" => Some(LogLevel::Alert),
         "emergency" => Some(LogLevel::Emergency),
         _ => None,
+    }
+}
+
+fn supports_logging_set_level(protocol_version: &str) -> bool {
+    protocol_version != tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
+}
+
+/// Apply the lifecycle's logging control without bypassing the typed client.
+///
+/// Stable servers own a session-wide threshold. Final clients instead attach
+/// their current threshold to each later typed request, preserving task, MRTR,
+/// and schema-retry behavior that a raw `tools/call` would lose.
+async fn apply_log_level(
+    client: &McpClient,
+    protocol_version: &str,
+    level: LogLevel,
+) -> tower_mcp::Result<()> {
+    if supports_logging_set_level(protocol_version) {
+        let params = serde_json::json!({ "level": level });
+        client
+            .request::<_, serde_json::Value>("logging/setLevel", &params)
+            .await
+            .map(|_| ())
+    } else {
+        client.set_request_log_level(Some(level)).await;
+        Ok(())
     }
 }
 
@@ -6260,13 +6405,19 @@ async fn handle_line(
                 );
                 return false;
             };
+            let client = client.as_deref().expect("connected above");
             // The server said whether it has logging at all. Sending anyway
             // would earn a "method not found" the operator would have to
             // interpret; saying so first is the same information, sooner.
-            let declared = connection_info(client.as_deref().expect("connected above"))
-                .await
-                .is_some_and(|info| info.capabilities.logging.is_some());
-            if !declared {
+            let Some(info) = connection_info(client).await else {
+                report_error(
+                    ExitStatus::Server,
+                    "this server does not declare the `logging` capability, so it has no \
+                     level to set (any notifications it sends arrive regardless)",
+                );
+                return false;
+            };
+            if info.capabilities.logging.is_none() {
                 report_error(
                     ExitStatus::Server,
                     "this server does not declare the `logging` capability, so it has no \
@@ -6275,15 +6426,7 @@ async fn handle_line(
                 return false;
             }
             let started = std::time::Instant::now();
-            let params = serde_json::json!({ "level": level });
-            match with_deadline(
-                client
-                    .as_deref()
-                    .expect("connected above")
-                    .request::<_, serde_json::Value>("logging/setLevel", &params),
-            )
-            .await
-            {
+            match with_deadline(apply_log_level(client, &info.protocol_version, level)).await {
                 Ok(_) => {
                     if json_output() {
                         print_json(&serde_json::json!({ "level": level }));
@@ -8381,6 +8524,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn logging_set_level_is_only_a_stable_protocol_method() {
+        assert!(supports_logging_set_level("2025-11-25"));
+        assert!(supports_logging_set_level("2025-03-26"));
+        assert!(!supports_logging_set_level(
+            tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
+        ));
+    }
+
+    /// The bundled surface is large enough to require cursors, and the same
+    /// bounded collector the REPL uses at startup follows every page.
+    #[tokio::test]
+    async fn the_demo_exercises_surface_pagination() {
+        let client = client_builder(ProtocolMode::Stable)
+            .unwrap()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .expect("connect to the demo router");
+        establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .expect("handshake");
+
+        let first = client.list_tools().await.expect("first tool page");
+        assert_eq!(first.tools.len(), DEMO_PAGE_SIZE);
+        assert!(
+            first.next_cursor.is_some(),
+            "the demo catalogue must require another page"
+        );
+
+        let (surface, not_initialized) = fetch_surface_once(&client).await;
+        assert!(!not_initialized);
+        assert!(
+            surface.tools.len() > first.tools.len(),
+            "the REPL follows the demo cursor instead of presenting one page"
+        );
+        for expected in ["content_types", "logs", "notes", "toggle_extra"] {
+            assert!(
+                surface.tools.iter().any(|tool| tool.name == expected),
+                "the paged surface lost {expected}: {:?}",
+                surface
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// The tool, prompt, and resource lists actually change, so `listChanged`
     /// on all three is not merely advertised.
     ///
@@ -8399,29 +8590,20 @@ mod tests {
             .await
             .expect("handshake");
 
-        let names = |listed: tower_mcp::protocol::ListToolsResult| {
-            listed
-                .tools
-                .iter()
-                .map(|t| t.name.clone())
-                .collect::<Vec<_>>()
+        let names = |listed: Vec<tower_mcp::protocol::ToolDefinition>| {
+            listed.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
         };
 
         let counts = |t: usize, p: usize, r: usize| (t, p, r);
         let sizes = async |client: &tower_mcp::client::McpClient| {
             (
-                client.list_tools().await.expect("tools").tools.len(),
-                client.list_prompts().await.expect("prompts").prompts.len(),
-                client
-                    .list_resources()
-                    .await
-                    .expect("resources")
-                    .resources
-                    .len(),
+                client.list_all_tools().await.expect("tools").len(),
+                client.list_all_prompts().await.expect("prompts").len(),
+                client.list_all_resources().await.expect("resources").len(),
             )
         };
 
-        let before = names(client.list_tools().await.expect("list tools"));
+        let before = names(client.list_all_tools().await.expect("list tools"));
         assert!(!before.contains(&"extra".to_string()), "{before:?}");
         let (t0, p0, r0) = sizes(&client).await;
 
@@ -8429,7 +8611,7 @@ mod tests {
             .call_tool("toggle_extra", serde_json::json!({}))
             .await
             .expect("toggle_extra");
-        let added = names(client.list_tools().await.expect("list tools"));
+        let added = names(client.list_all_tools().await.expect("list tools"));
         assert!(added.contains(&"extra".to_string()), "{added:?}");
         // All three surfaces advertise listChanged, so all three have to
         // actually change, not just the one that was easiest to wire.
@@ -8441,7 +8623,7 @@ mod tests {
             .call_tool("toggle_extra", serde_json::json!({}))
             .await
             .expect("toggle_extra again");
-        let removed = names(client.list_tools().await.expect("list tools"));
+        let removed = names(client.list_all_tools().await.expect("list tools"));
         assert_eq!(removed, before);
         assert_eq!(sizes(&client).await, counts(t0, p0, r0));
     }
@@ -8486,9 +8668,8 @@ mod tests {
 
         // Not read-only, and the only demo tool that is not. That is what
         // makes the annotation visible in a listing rather than uniform.
-        let tools = client.list_tools().await.expect("list tools");
+        let tools = client.list_all_tools().await.expect("list tools");
         let set_status = tools
-            .tools
             .iter()
             .find(|t| t.name == "set_status")
             .expect("the demo offers `set_status`");
@@ -8515,9 +8696,8 @@ mod tests {
             .await
             .expect("handshake with the demo router");
 
-        let listed = client.list_tools().await.expect("list tools");
+        let listed = client.list_all_tools().await.expect("list tools");
         let notes = listed
-            .tools
             .iter()
             .find(|t| t.name == "notes")
             .expect("the demo offers `notes`");
@@ -8561,6 +8741,178 @@ mod tests {
             result_value(&result)["notes"].as_array().map(|a| a.len()),
             Some(3),
             "a capture of `notes` is iterable by `for`"
+        );
+    }
+
+    /// The remaining result-content variants and multi-block ordering are all
+    /// runnable against the server that ships with the client. Binary payloads
+    /// are summarized rather than sprayed into terminal output.
+    #[tokio::test]
+    async fn the_demo_returns_and_safely_renders_every_content_type() {
+        let client = client_builder(ProtocolMode::Stable)
+            .unwrap()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .expect("connect to the demo router");
+        establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .expect("handshake with the demo router");
+
+        let result = client
+            .call_tool("content_types", serde_json::json!({}))
+            .await
+            .expect("call content_types");
+        assert_eq!(
+            result.content.len(),
+            5,
+            "one ordered block per content type"
+        );
+        assert!(matches!(
+            &result.content[0],
+            Content::Text { text, .. }
+                if text == "this result has five blocks in protocol order"
+        ));
+        assert!(matches!(
+            &result.content[1],
+            Content::Image { data, mime_type, .. }
+                if data == DEMO_PIXEL_PNG && mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &result.content[2],
+            Content::Audio { data, mime_type, .. }
+                if data == DEMO_SILENT_WAV && mime_type == "audio/wav"
+        ));
+        assert!(matches!(
+            &result.content[3],
+            Content::Resource { resource, .. }
+                if resource.uri == "note://ideas"
+                    && resource.mime_type.as_deref() == Some("text/markdown")
+        ));
+        assert!(matches!(
+            &result.content[4],
+            Content::ResourceLink { uri, name, .. }
+                if uri == "note://status" && name == "Status"
+        ));
+
+        let rendered = result.content[1..]
+            .iter()
+            .map(render_non_text_content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("image image/png, 96 base64 chars"));
+        assert!(rendered.contains("audio audio/wav, 60 base64 chars"));
+        assert!(rendered.contains("\"type\": \"resource\""));
+        assert!(rendered.contains("\"type\": \"resource_link\""));
+        assert!(
+            !rendered.contains(DEMO_PIXEL_PNG) && !rendered.contains(DEMO_SILENT_WAV),
+            "binary payloads must be summarized, not dumped: {rendered}"
+        );
+    }
+
+    /// Logging is advertised because the demo transport carries notification
+    /// frames. Emit several levels and prove that each lifecycle's threshold
+    /// changes which of those frames arrive.
+    #[tokio::test]
+    async fn the_demo_logging_capability_is_observable_and_filterable() {
+        let received = Arc::new(std::sync::Mutex::new(Vec::<LogLevel>::new()));
+        let handler = NotificationHandler::new().on_log_message({
+            let received = Arc::clone(&received);
+            move |message| received.lock().expect("log capture").push(message.level)
+        });
+        let client = client_builder(ProtocolMode::Stable)
+            .unwrap()
+            .connect(ChannelTransport::new(demo_router()), handler)
+            .await
+            .expect("connect to the demo router");
+        let info = establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .expect("handshake with the demo router");
+        assert!(
+            info.capabilities.logging.is_some(),
+            "a server that can emit these messages declares logging"
+        );
+
+        async fn wait_for_logs(received: &std::sync::Mutex<Vec<LogLevel>>, count: usize) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if received.lock().expect("log capture").len() >= count {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("demo log notifications");
+        }
+
+        client
+            .call_tool("logs", serde_json::json!({}))
+            .await
+            .expect("emit logs");
+        wait_for_logs(&received, 4).await;
+        assert_eq!(
+            *received.lock().expect("log capture"),
+            vec![
+                LogLevel::Debug,
+                LogLevel::Info,
+                LogLevel::Warning,
+                LogLevel::Error,
+            ]
+        );
+
+        received.lock().expect("log capture").clear();
+        apply_log_level(&client, &info.protocol_version, LogLevel::Warning)
+            .await
+            .expect("raise demo log level");
+        client
+            .call_tool("logs", serde_json::json!({}))
+            .await
+            .expect("emit filtered logs");
+        wait_for_logs(&received, 2).await;
+        assert_eq!(
+            *received.lock().expect("log capture"),
+            vec![LogLevel::Warning, LogLevel::Error],
+        );
+
+        // Final MCP has no session-wide logging level. With no per-request
+        // opt-in, the same command says why it was quiet rather than claiming
+        // notifications it was forbidden to send.
+        received.lock().expect("log capture").clear();
+        let final_handler = NotificationHandler::new().on_log_message({
+            let received = Arc::clone(&received);
+            move |message| received.lock().expect("log capture").push(message.level)
+        });
+        let final_client = client_builder(ProtocolMode::Final)
+            .unwrap()
+            .connect(ChannelTransport::new(demo_router()), final_handler)
+            .await
+            .expect("connect a final client to the demo router");
+        let final_info = establish_connection(&final_client, ProtocolMode::Final)
+            .await
+            .expect("discover the demo router");
+        let result = final_client
+            .call_tool("logs", serde_json::json!({}))
+            .await
+            .expect("call logs on final MCP");
+        assert!(result.all_text().contains("no logs emitted"));
+        assert!(received.lock().expect("log capture").is_empty());
+
+        apply_log_level(
+            &final_client,
+            &final_info.protocol_version,
+            LogLevel::Warning,
+        )
+        .await
+        .expect("set the final per-request log level");
+        let result = final_client
+            .call_tool("logs", serde_json::json!({}))
+            .await
+            .expect("call opted-in final logs");
+        wait_for_logs(&received, 2).await;
+        assert!(result.all_text().contains("emitted debug"));
+        assert_eq!(
+            *received.lock().expect("log capture"),
+            vec![LogLevel::Warning, LogLevel::Error],
         );
     }
 
