@@ -36,7 +36,7 @@ path = "src/main.rs"
 # `dynamic-tools` carries no dependencies of its own; it compiles the registry
 # the demo server uses to add a tool while a client is connected, which is what
 # lets `--demo` show the command table refreshing live.
-tower-mcp = { version = "0.22.0", features = [
+tower-mcp = { version = "0.22.1", features = [
     "dynamic-tools",
     "http-client",
     "oauth-client",
@@ -81,6 +81,6 @@ libc = "0.2"
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's
 # server-side features and the fixture's own HTTP dependencies.
-tower-mcp = { version = "0.22.0", features = ["http", "protocol-2026-07-28"] }
+tower-mcp = { version = "0.22.1", features = ["http", "protocol-2026-07-28"] }
 axum = { version = "0.8", features = ["json"] }
 schemars = "1.2"
