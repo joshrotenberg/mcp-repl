@@ -362,9 +362,15 @@ mod tests {
     async fn reconnect_reopens_the_surface_stream_on_the_fresh_client() {
         let listens = Arc::new(AtomicUsize::new(0));
         let connector_listens = listens.clone();
-        let connector: Connector = Arc::new(move || {
+        let connector: Connector = Arc::new(move |_mode| {
             let listens = connector_listens.clone();
-            Box::pin(async move { Ok(final_client(listens, NotificationHandler::new()).await) })
+            Box::pin(async move {
+                let client = final_client(listens, NotificationHandler::new()).await;
+                let info = crate::connection_info(&client)
+                    .await
+                    .expect("final connection info");
+                Ok((client, info))
+            })
         });
         let session = Arc::new(Session::new(
             final_client(listens.clone(), NotificationHandler::new()).await,

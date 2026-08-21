@@ -462,6 +462,12 @@ creates a fresh transport, repeats the selected stable or final handshake,
 re-fetches the surface, and retries the command once. For stable servers this
 also replaces the lost session; final connections are sessionless.
 
+The same bounded recovery covers the first handshake request when it fails in
+the HTTP send path: the original client never acquired a usable transport, so
+mcp-repl constructs one fresh client and handshakes again. Import approval,
+OAuth authorization, and bearer-descriptor input are resolved before this
+point and are not repeated. `--no-reconnect` disables this rebuild too.
+
 ```text
 > search query=tower
 [reconnected]

@@ -22,11 +22,30 @@ use std::sync::{Arc, RwLock};
 
 use tower_mcp::client::McpClient;
 
-/// Builds a fully connected and initialized client. Called once per
-/// reconnect, so it must construct a new transport each time.
+/// Why a fresh connection is being built.
+///
+/// An initial handshake recovery must not inherit state from a different
+/// server that an interactive `connect` is replacing. A live-session
+/// reconnect, on the other hand, restores state that belongs to that server
+/// before publishing the replacement client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectorMode {
+    InitialRecovery,
+    Reconnect,
+}
+
+/// Builds a fully connected and initialized client, together with the exact
+/// handshake metadata that client returned. Every call must construct a new
+/// transport.
 pub type Connector = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Result<McpClient, tower_mcp::Error>> + Send>>
-        + Send
+    dyn Fn(
+            ConnectorMode,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(McpClient, crate::ConnectionInfo), tower_mcp::Error>>
+                    + Send,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -146,7 +165,7 @@ impl Session {
         // A restarting server is usually a second or two from ready; a short
         // pause makes the retry land after the bind rather than during it.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let fresh = connector().await?;
+        let (fresh, _info) = connector(ConnectorMode::Reconnect).await?;
         *self.client.write().unwrap() = Some(Arc::new(fresh));
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
@@ -232,16 +251,30 @@ pub fn is_session_lost(e: &tower_mcp::Error) -> bool {
 /// exact generated prefix keeps ordinary protocol/tool errors out even when
 /// their own message happens to mention an HTTP status.
 pub(crate) fn is_reconnectable_http_error(e: &tower_mcp::Error) -> bool {
+    if is_unsent_request_error(e) {
+        return true;
+    }
     match e {
-        tower_mcp::Error::Transport(message) => {
-            status_after(message, "HTTP ")
-                .is_some_and(|status| matches!(status, "410" | "502" | "503"))
-                || is_unsent_request(message)
-        }
+        tower_mcp::Error::Transport(message) => status_after(message, "HTTP ")
+            .is_some_and(|status| matches!(status, "410" | "502" | "503")),
         tower_mcp::Error::JsonRpc(error) if error.code == -32000 => {
             status_after(&error.message, "server returned HTTP ")
                 .is_some_and(|status| matches!(status, "404" | "410" | "502" | "503"))
-                || is_unsent_request(&error.message)
+        }
+        _ => false,
+    }
+}
+
+/// Whether an HTTP request failed in the transport's send path.
+///
+/// Kept separate from the broader reconnect classifier so rebuilding an
+/// initial client remains narrower than the session-loss cases used after a
+/// successful handshake.
+pub(crate) fn is_unsent_request_error(e: &tower_mcp::Error) -> bool {
+    match e {
+        tower_mcp::Error::Transport(message) => is_unsent_request(message),
+        tower_mcp::Error::JsonRpc(error) if error.code == -32000 => {
+            is_unsent_request(&error.message)
         }
         _ => false,
     }

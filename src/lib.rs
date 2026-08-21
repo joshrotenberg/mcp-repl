@@ -106,7 +106,7 @@ use elicit::ReplClientHandler;
 use exit_status::ExitStatus;
 use jobs::Jobs;
 use output::AsyncOutput;
-use session::{Connector, Session, is_not_initialized, is_session_lost};
+use session::{Connector, ConnectorMode, Session, is_not_initialized, is_session_lost};
 use style::{json_pretty, paint, tag, task_status_style};
 use untrusted::sanitize;
 use wire::{TracingTransport, wire};
@@ -1365,7 +1365,7 @@ async fn respond_to_task(client: &McpClient, id: &str, label: &str) {
 
 /// Lifecycle-neutral connection details used by the banner and `info`.
 #[derive(Clone, Debug)]
-struct ConnectionInfo {
+pub(crate) struct ConnectionInfo {
     protocol_version: String,
     capabilities: ServerCapabilities,
     server_info: Implementation,
@@ -1420,12 +1420,6 @@ async fn connection_info(client: &McpClient) -> Option<ConnectionInfo> {
 /// and `notifications/initialized` dies on a socket that closed underneath
 /// it.
 ///
-/// **This retries the handshake, not the connection.** If the very first
-/// request dies, the transport never came up and a second attempt on the same
-/// client returns `Connection closed` without sending anything, because the
-/// client cannot rebuild its own transport. Recovering from that needs the
-/// connection rebuilt by the caller, which is tracked separately.
-///
 /// One retry rather than a loop: if the second attempt also cannot send, the
 /// server is unreachable and saying so promptly beats retrying on a schedule
 /// nobody asked for.
@@ -1443,6 +1437,33 @@ async fn establish_connection_retrying(
     // The first error is the one worth reporting if this also fails: it says
     // what originally went wrong, where the second is usually a consequence.
     establish_connection(client, protocol)
+        .await
+        .map_err(|_| first)
+}
+
+/// Complete an initial handshake, rebuilding one HTTP client when its first
+/// request could not be sent.
+///
+/// The ordinary handshake retry handles a keep-alive connection that dies
+/// between `initialize` and `notifications/initialized`. If the very first
+/// request dies, that client never acquires a live transport and cannot retry
+/// itself. Only HTTP targets with reconnection enabled have a connector, so
+/// this cannot reauthorize an import, rerun OAuth setup, or respawn a stdio
+/// child. The connector also skips live-session state restoration here: an
+/// interactive `connect` may still be testing a replacement server.
+async fn establish_initial_connection(
+    client: McpClient,
+    connector: Option<&Connector>,
+    protocol: ProtocolMode,
+) -> tower_mcp::Result<(McpClient, ConnectionInfo)> {
+    let first = match establish_connection_retrying(&client, protocol).await {
+        Ok(info) => return Ok((client, info)),
+        Err(error) => error,
+    };
+    let Some(connector) = connector.filter(|_| session::is_unsent_request_error(&first)) else {
+        return Err(first);
+    };
+    connector(ConnectorMode::InitialRecovery)
         .await
         .map_err(|_| first)
 }
@@ -3017,7 +3038,7 @@ fn http_connector(
     make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
     protocol: ProtocolMode,
 ) -> Connector {
-    Arc::new(move || {
+    Arc::new(move |mode| {
         let (url, config, oauth, handler) =
             (url.clone(), config.clone(), oauth.clone(), make_handler());
         Box::pin(async move {
@@ -3028,9 +3049,11 @@ fn http_connector(
                     handler,
                 )
                 .await?;
-            establish_connection_retrying(&client, protocol).await?;
-            restore_resource_subscriptions(&client).await?;
-            Ok(client)
+            let info = establish_connection_retrying(&client, protocol).await?;
+            if mode == ConnectorMode::Reconnect {
+                restore_resource_subscriptions(&client).await?;
+            }
+            Ok((client, info))
         })
     })
 }
@@ -3321,9 +3344,10 @@ impl ConnectRuntime {
             }
         };
 
-        let info = establish_connection_retrying(&client, self.protocol)
-            .await
-            .map_err(ConnectFailure::mcp)?;
+        let (client, info) =
+            establish_initial_connection(client, connector.as_ref(), self.protocol)
+                .await
+                .map_err(ConnectFailure::mcp)?;
         let surface = fetch_surface_initial(&client).await;
         let profile_aliases = profile_name
             .as_ref()
@@ -4757,7 +4781,8 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         }
     };
     let (session, surface) = if let Some(client) = client {
-        let info = establish_connection_retrying(&client, args.protocol).await?;
+        let (client, info) =
+            establish_initial_connection(client, connector.as_ref(), args.protocol).await?;
         if let Ok(mut label) = server_label.write() {
             label.clone_from(&info.server_info.name);
         }
@@ -8081,6 +8106,32 @@ mod tests {
         }
     }
 
+    /// A transport whose first request cannot leave the client. Keeping
+    /// `recv` pending makes the send failure, rather than an eager EOF, the
+    /// reason the client closes.
+    struct UnsentTransport;
+
+    #[async_trait]
+    impl ClientTransport for UnsentTransport {
+        async fn send(&mut self, _message: &str) -> tower_mcp::Result<()> {
+            Err(tower_mcp::Error::Transport(
+                "HTTP request failed: error sending request for url (http://fixture/)".into(),
+            ))
+        }
+
+        async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
+            std::future::pending().await
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn close(&mut self) -> tower_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl ClientTransport for DiscoveryTransport {
         async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
@@ -8198,6 +8249,43 @@ mod tests {
         );
         assert!(client.server_info().await.is_some());
         assert!(client.discovery().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unsent_first_handshake_rebuilds_each_lifecycle_once() {
+        for protocol in [ProtocolMode::Stable, ProtocolMode::Final] {
+            let dead = client_builder(protocol)
+                .unwrap()
+                .connect_simple(UnsentTransport)
+                .await
+                .expect("construct the initially dead client");
+            let modes = Arc::new(Mutex::new(Vec::new()));
+            let seen = modes.clone();
+            let connector: Connector = Arc::new(move |mode| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    seen.lock().unwrap().push(mode);
+                    let client = client_builder(protocol)
+                        .unwrap()
+                        .connect_simple(ChannelTransport::new(demo_router()))
+                        .await
+                        .expect("construct the replacement client");
+                    let info = establish_connection_retrying(&client, protocol).await?;
+                    Ok((client, info))
+                })
+            });
+
+            let (_fresh, info) = establish_initial_connection(dead, Some(&connector), protocol)
+                .await
+                .expect("recover the initial handshake on a fresh client");
+
+            assert_eq!(info.server_info.name, "mcp-repl-demo");
+            assert_eq!(
+                *modes.lock().unwrap(),
+                vec![ConnectorMode::InitialRecovery],
+                "one fresh connection, without live-session state restoration"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9632,11 +9720,15 @@ world",
     async fn demo_session() -> (Arc<Session>, Arc<std::sync::atomic::AtomicUsize>) {
         let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = connects.clone();
-        let connector: Connector = Arc::new(move || {
+        let connector: Connector = Arc::new(move |_mode| {
             let counter = counter.clone();
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
-                Ok(demo_client().await)
+                let client = demo_client().await;
+                let info = connection_info(&client)
+                    .await
+                    .expect("demo connection info");
+                Ok((client, info))
             })
         });
         (
