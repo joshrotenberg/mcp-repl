@@ -3,6 +3,8 @@
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -440,6 +442,86 @@ impl Drop for HttpFixture {
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
         }
+    }
+}
+
+/// Drop the first HTTP request before it reaches the fixture, then proxy every
+/// later connection normally. This reproduces a fresh client's first
+/// handshake request dying in the transport send path without sleeps or a
+/// server-side response.
+struct DropFirstRequestProxy {
+    url: String,
+    accepted: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// An immediate reset is the behavior this fault injector needs. Tokio
+/// deprecates linger because a nonzero timeout can block on drop; zero does
+/// not wait, and this socket carries test traffic only.
+#[allow(deprecated)]
+fn reset_on_drop(stream: &tokio::net::TcpStream) {
+    stream
+        .set_linger(Some(Duration::ZERO))
+        .expect("reset first proxy connection");
+}
+
+impl DropFirstRequestProxy {
+    async fn start(upstream_url: &str) -> Self {
+        let upstream = upstream_url
+            .strip_prefix("http://")
+            .and_then(|address| address.strip_suffix('/'))
+            .expect("fixture URL shape")
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind drop-first-request proxy");
+        let url = format!(
+            "http://{}/",
+            listener
+                .local_addr()
+                .expect("drop-first-request proxy address")
+        );
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let accepted_task = accepted.clone();
+        let dropped_task = dropped.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut downstream, _)) = listener.accept().await else {
+                    break;
+                };
+                let connection = accepted_task.fetch_add(1, Ordering::SeqCst);
+                if connection == 0 {
+                    // Wait until the HTTP request has reached the proxy, then
+                    // reset the socket without opening an upstream connection.
+                    let mut byte = [0u8; 1];
+                    if downstream.peek(&mut byte).await.is_ok_and(|read| read > 0) {
+                        reset_on_drop(&downstream);
+                        dropped_task.fetch_add(1, Ordering::SeqCst);
+                    }
+                    continue;
+                }
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                });
+            }
+        });
+        Self {
+            url,
+            accepted,
+            dropped,
+            task,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
     }
 }
 
@@ -2301,6 +2383,34 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
 }
 
 async fn exercise_http(fixture: &Path, temp: &TempDir) {
+    let http = HttpFixture::start(fixture, temp).await;
+    let first_request = DropFirstRequestProxy::start(&http.url).await;
+    let recovered = run_http(
+        &first_request.url,
+        "first HTTP handshake request dropped",
+        &["--json", "--exec", "add a=20 b=22"],
+    )
+    .await;
+    assert_success(&recovered, "first HTTP handshake request dropped");
+    let values = json_lines(&recovered, "first HTTP handshake request dropped");
+    assert_eq!(values.len(), 1);
+    assert_eq!(
+        values[0].pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+    assert_eq!(first_request.dropped.load(Ordering::SeqCst), 1);
+    assert!(
+        first_request.accepted.load(Ordering::SeqCst) >= 2,
+        "recovery must open a fresh TCP connection"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&http.tool_calls_file)
+            .expect("read first-handshake tool-call count"),
+        "1",
+        "the recovered command must reach the server exactly once"
+    );
+    first_request.shutdown().await;
+
     let reconnecting = HttpFixture::start_with_reconnect(fixture, temp).await;
     let restored = run_http(
         &reconnecting.url,
@@ -2370,7 +2480,6 @@ async fn exercise_http(fixture: &Path, temp: &TempDir) {
     exercise_in_repl_connect(fixture, &switching.url, temp).await;
     switching.shutdown().await;
 
-    let http = HttpFixture::start(fixture, temp).await;
     exercise_imported_http_config(&http, temp).await;
 
     let stable = run_http(
