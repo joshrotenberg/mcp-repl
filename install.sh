@@ -251,8 +251,9 @@ esac
 tar xzf "$tmp/$archive" -C "$extract_dir" "$member" \
     || die "release archive does not contain $member safely"
 candidate=$extract_dir/$member
-[ -f "$candidate" ] && [ ! -L "$candidate" ] \
-    || die "release archive member $member is not a regular file"
+if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
+    die "release archive member $member is not a regular file"
+fi
 
 mkdir -p "$INSTALL_DIR" || die "could not create install directory $INSTALL_DIR"
 destination=$INSTALL_DIR/mcp-repl

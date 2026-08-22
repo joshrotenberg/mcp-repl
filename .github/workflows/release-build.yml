@@ -100,6 +100,7 @@ jobs:
             echo "CC=musl-gcc"
             echo "CC_${cc_key}=musl-gcc"
             echo "CARGO_TARGET_${cargo_key}_LINKER=musl-gcc"
+            echo "RUSTFLAGS=-C target-feature=+crt-static"
           } >> "$GITHUB_ENV"
 
       - name: Build native binary

@@ -6,6 +6,7 @@
 
 /// Large enough for opaque and JWT-style credentials, while remaining below
 /// the header limits commonly enforced by HTTP servers and proxies.
+#[cfg(any(unix, test))]
 pub(crate) const MAX_BEARER_BYTES: usize = 16 * 1024;
 
 #[cfg(unix)]
@@ -63,6 +64,7 @@ pub(crate) fn read(fd: i32) -> Result<String, String> {
     ))
 }
 
+#[cfg(any(unix, test))]
 fn decode(fd: i32, mut bytes: Vec<u8>) -> Result<String, String> {
     if bytes.len() > MAX_BEARER_BYTES {
         return Err(format!(
