@@ -58,6 +58,11 @@ Schema-coerced tool calls, `bench`, and `prompt` require every argument to use
 token, an empty key such as `=value`, or malformed object JSON is a local usage
 error; it is never dropped from a request silently.
 
+The declared property type decides the value sent to the server. In
+particular, a string stays a string even when its text is also a valid JSON
+literal, so `message=true`, `message=123`, and `message=null` send those exact
+strings when `message` is declared as a string.
+
 A line that is merely unfinished keeps the editor reading instead of failing:
 pasting a pretty-printed JSON body works, and the `::: ` continuation prompt
 shows while the quotes or braces are still open. A delimiter that can never
