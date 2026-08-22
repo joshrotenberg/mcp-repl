@@ -153,6 +153,10 @@ class ValidatorInputSecurityTests(unittest.TestCase):
             "ghcr.io/test/project@sha256:" + "a" * 64,
             "ghcr.io/test/project?host=evil.example",
             "ghcr.io/test/project#fragment",
+            "ghcr.io/test\\project/name",
+            "ghcr.io/tést/project",
+            "GHCR.İO/test/project",
+            "GHCR.ıO/test/project",
         )
         for image in invalid_images:
             with self.subTest(image=image):
@@ -173,6 +177,32 @@ class ValidatorInputSecurityTests(unittest.TestCase):
                     )
         create_context.assert_not_called()
         build_opener.assert_not_called()
+
+    def test_malformed_blob_digest_is_rejected_before_network_setup(self) -> None:
+        invalid_digests = (
+            "sha256:" + "a" * 63,
+            "sha256:" + "a" * 65,
+            "sha256:" + "A" * 64,
+            "sha512:" + "a" * 64,
+            "sha256:" + "a" * 64 + "?redirect=https://evil.example",
+        )
+        for digest in invalid_digests:
+            with self.subTest(digest=digest):
+                with mock.patch.object(
+                    VALIDATION.ssl, "create_default_context"
+                ) as create_context:
+                    with mock.patch.object(
+                        VALIDATION.urllib.request, "build_opener"
+                    ) as build_opener:
+                        with self.assertRaises(VALIDATION.ValidationError):
+                            VALIDATION.fetch_registry_blob(
+                                self.IMAGE,
+                                digest,
+                                1,
+                                None,
+                            )
+                create_context.assert_not_called()
+                build_opener.assert_not_called()
 
     def test_oversized_blob_descriptor_is_rejected_before_network_setup(self) -> None:
         digest = "sha256:" + hashlib.sha256(b"x").hexdigest()
@@ -607,14 +637,26 @@ class ValidatorTransportTests(unittest.TestCase):
                     VALIDATION.urllib.request,
                     "build_opener",
                     return_value=registry,
-                ):
+                ) as build_opener:
                     actual = VALIDATION.fetch_registry_blob(
                         "ghcr.io/test/project", digest, len(blob), None
                     )
 
         self.assertEqual(actual, blob)
+        self.assertEqual(build_opener.call_count, 2)
+        self.assertIsInstance(
+            build_opener.call_args_list[0].args[1],
+            VALIDATION.GhcrBlobRedirectHandler,
+        )
+        self.assertIsInstance(
+            build_opener.call_args_list[1].args[1],
+            VALIDATION.RejectTokenRedirectHandler,
+        )
         self.assertEqual(len(registry.calls), 3)
         self.assertIsNone(registry.calls[0].get_header("Authorization"))
+        self.assertEqual(
+            registry.calls[0].get_header("Accept"), "application/octet-stream"
+        )
         self.assertEqual(
             registry.calls[0].full_url,
             f"https://ghcr.io/v2/test/project/blobs/{digest}",
@@ -622,6 +664,19 @@ class ValidatorTransportTests(unittest.TestCase):
         self.assertEqual(
             registry.calls[1].full_url,
             "https://ghcr.io/token?service=ghcr.io&scope=repository%3Atest%2Fproject%3Apull",
+        )
+        self.assertEqual(registry.calls[1].get_header("Accept"), "application/json")
+        self.assertEqual(registry.calls[2].full_url, registry.calls[0].full_url)
+
+    def test_bearer_challenge_returns_only_the_canonical_token_url(self) -> None:
+        challenge = (
+            'Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+            'scope="repository:test/project:pull"'
+        )
+        self.assertEqual(
+            VALIDATION.bearer_challenge(challenge, "test/project"),
+            "https://ghcr.io/token?service=ghcr.io&scope="
+            "repository%3Atest%2Fproject%3Apull",
         )
 
     def test_unsafe_bearer_realms_are_rejected(self) -> None:
@@ -632,30 +687,197 @@ class ValidatorTransportTests(unittest.TestCase):
             "https://user@ghcr.io/token",
             "https://user:opaque@ghcr.io/token",
             "https://ghcr.io/token#fragment",
+            "https://ghcr.io/token?service=ghcr.io",
+            "https://ghcr.io/token/",
         )
         for realm in realms:
             with self.subTest(realm=realm):
                 with self.assertRaises(VALIDATION.ValidationError):
                     VALIDATION.bearer_challenge(
-                        f'Bearer realm="{realm}",service="ghcr.io"',
+                        f'Bearer realm="{realm}",service="ghcr.io",'
+                        'scope="repository:test/project:pull"',
                         "test/project",
                     )
 
-    def test_cross_origin_redirect_drops_registry_authorization(self) -> None:
+    def test_bearer_challenge_requires_exact_fields_service_and_scope(self) -> None:
+        invalid_challenges = (
+            'Bearer realm="https://ghcr.io/token",'
+            'scope="repository:test/project:pull"',
+            'Bearer realm="https://ghcr.io/token",service="evil.example",'
+            'scope="repository:test/project:pull"',
+            'Bearer realm="https://ghcr.io/token",service="ghcr.io"',
+            'Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+            'scope="repository:test/other:pull"',
+            'Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+            'scope="repository:test/project:push"',
+            'Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+            'scope="repository:test/project:pull",error="insufficient_scope"',
+            'Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+            'service="ghcr.io",scope="repository:test/project:pull"',
+        )
+        for challenge in invalid_challenges:
+            with self.subTest(challenge=challenge):
+                with self.assertRaises(VALIDATION.ValidationError):
+                    VALIDATION.bearer_challenge(challenge, "test/project")
+
+    def test_noncanonical_challenge_is_rejected_before_credentials_are_read(self) -> None:
+        blob = b"fixture"
+        digest = "sha256:" + hashlib.sha256(blob).hexdigest()
+        headers = Message()
+        headers["WWW-Authenticate"] = (
+            'Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+            'scope="repository:test/other:pull"'
+        )
+        unauthorized = urllib.error.HTTPError(
+            "https://ghcr.io/v2/test/project/blobs/fixture",
+            401,
+            "Unauthorized",
+            headers,
+            None,
+        )
+        with mock.patch.object(
+            VALIDATION, "request_ghcr_blob", side_effect=unauthorized
+        ):
+            with mock.patch.object(VALIDATION, "docker_credentials") as credentials:
+                with mock.patch.object(
+                    VALIDATION.urllib.request,
+                    "build_opener",
+                    return_value=mock.sentinel.opener,
+                ) as build_opener:
+                    with self.assertRaisesRegex(
+                        VALIDATION.ValidationError, "exact repository pull scope"
+                    ):
+                        VALIDATION.fetch_registry_blob(
+                            "ghcr.io/test/project",
+                            digest,
+                            len(blob),
+                            None,
+                        )
+        credentials.assert_not_called()
+        self.assertEqual(build_opener.call_count, 1)
+
+    def test_approved_cross_origin_blob_redirect_drops_authorization(self) -> None:
         request = urllib.request.Request(
             "https://ghcr.io/v2/test/project/blobs/sha256:deadbeef",
             headers={"Authorization": "Bearer secret"},
         )
-        redirected = VALIDATION.SafeRedirectHandler().redirect_request(
+        redirected = VALIDATION.GhcrBlobRedirectHandler().redirect_request(
             request,
             None,
             307,
             "Temporary Redirect",
             Message(),
-            "https://objects.example.test/blob?signed=true",
+            "https://pkg-containers.githubusercontent.com/ghcr1/blobs/"
+            "fixture?signed=true",
         )
         self.assertIsNotNone(redirected)
         self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_same_origin_blob_redirect_preserves_authorization(self) -> None:
+        request = urllib.request.Request(
+            "https://ghcr.io/v2/test/project/blobs/sha256:deadbeef",
+            headers={"Authorization": "Bearer secret"},
+        )
+        redirected = VALIDATION.GhcrBlobRedirectHandler().redirect_request(
+            request,
+            None,
+            307,
+            "Temporary Redirect",
+            Message(),
+            "https://ghcr.io/v2/test/project/blobs/sha256:cafebabe",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertEqual(redirected.get_header("Authorization"), "Bearer secret")
+
+    def test_blob_redirect_rejects_every_unapproved_origin_shape(self) -> None:
+        request = urllib.request.Request(
+            "https://ghcr.io/v2/test/project/blobs/sha256:deadbeef",
+            headers={"Authorization": "Bearer secret"},
+        )
+        invalid_redirects = (
+            "http://pkg-containers.githubusercontent.com/ghcr1/blobs/fixture",
+            "https://evil.example/fixture",
+            "https://ghcr.io:443/fixture",
+            "https://user@ghcr.io/fixture",
+            "https://GHCR.IO/fixture",
+            "https://ghcr.io/fixture#fragment",
+            "https://ghcr.io/fixture\r\nX-Injected: true",
+            "https://[invalid/fixture",
+        )
+        for new_url in invalid_redirects:
+            with self.subTest(new_url=new_url):
+                with self.assertRaises(VALIDATION.ValidationError):
+                    VALIDATION.GhcrBlobRedirectHandler().redirect_request(
+                        request,
+                        None,
+                        307,
+                        "Temporary Redirect",
+                        Message(),
+                        new_url,
+                    )
+
+    def test_registry_token_redirects_are_always_rejected(self) -> None:
+        request = urllib.request.Request(
+            "https://ghcr.io/token?service=ghcr.io&scope=fixture",
+            headers={"Authorization": "Basic secret"},
+        )
+        for new_url in (
+            "https://ghcr.io/token?service=ghcr.io&scope=other",
+            "https://pkg-containers.githubusercontent.com/token",
+        ):
+            with self.subTest(new_url=new_url):
+                with self.assertRaisesRegex(
+                    VALIDATION.ValidationError, "token endpoint attempted a redirect"
+                ):
+                    VALIDATION.RejectTokenRedirectHandler().redirect_request(
+                        request,
+                        None,
+                        307,
+                        "Temporary Redirect",
+                        Message(),
+                        new_url,
+                    )
+
+    def test_response_rejects_noncanonical_content_lengths(self) -> None:
+        request = urllib.request.Request("https://ghcr.io/token")
+        for content_length in ("²", "+1", " 1", "9" * 5_000):
+            with self.subTest(content_length=content_length):
+                response = FakeResponse(b"x")
+                response.headers.replace_header("Content-Length", content_length)
+                opener = mock.Mock()
+                opener.open.return_value = response
+                with self.assertRaisesRegex(
+                    VALIDATION.ValidationError, "invalid Content-Length"
+                ):
+                    VALIDATION.read_request_bytes(
+                        opener,
+                        request,
+                        "registry token",
+                        VALIDATION.MAX_TOKEN_RESPONSE_SIZE,
+                    )
+
+    def test_token_response_rejects_declared_and_streamed_oversize(self) -> None:
+        declared_oversize = FakeResponse(b"{}")
+        declared_oversize.headers.replace_header(
+            "Content-Length", str(VALIDATION.MAX_TOKEN_RESPONSE_SIZE + 1)
+        )
+        streamed_oversize = FakeResponse(
+            b"x" * (VALIDATION.MAX_TOKEN_RESPONSE_SIZE + 1)
+        )
+        del streamed_oversize.headers["Content-Length"]
+
+        for response in (declared_oversize, streamed_oversize):
+            with self.subTest(has_content_length="Content-Length" in response.headers):
+                opener = mock.Mock()
+                opener.open.return_value = response
+                with self.assertRaisesRegex(
+                    VALIDATION.ValidationError, "exceeds its size bound"
+                ):
+                    VALIDATION.request_ghcr_token(
+                        opener,
+                        "test/project",
+                        None,
+                    )
 
     def test_duplicate_json_keys_are_rejected(self) -> None:
         with self.assertRaises(VALIDATION.ValidationError):
