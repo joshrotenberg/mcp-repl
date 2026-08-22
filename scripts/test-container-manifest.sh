@@ -28,6 +28,11 @@ export TEST_NEXT_RUNNABLE_A=7777777777777777777777777777777777777777777777777777
 export TEST_NEXT_RUNNABLE_B=8888888888888888888888888888888888888888888888888888888888888888
 export TEST_TAG_OBJECT_SHA=9999999999999999999999999999999999999999
 export TEST_NEXT_TAG_OBJECT_SHA=9898989898989898989898989898989898989898
+export GITHUB_REF=refs/heads/main
+export GITHUB_SHA=$TEST_SOURCE_SHA
+export GITHUB_REPOSITORY=test/project
+export RELEASE_TAG=$TEST_TAG
+export SOURCE_DATE_EPOCH=$TEST_SOURCE_EPOCH
 TEST_RELEASE_BODY=$("$root/scripts/extract-release-notes.sh" "${TEST_TAG#v}")
 export TEST_RELEASE_BODY
 
@@ -823,11 +828,22 @@ case "${1:-}" in
         [ "${16}" = --source-ref ] && source_ref=${17}
         [ "${18}" = --deny-self-hosted-runners ]
         [ -f "$trusted_root" ] && [ -s "$trusted_root" ]
-        tag=${source_ref#refs/tags/}
-        [ "$source_ref" = "refs/tags/$tag" ]
-        record="$state/mcp-repl-$tag-release.json"
-        [ -f "$record" ]
-        manifest=$(jq -er '.container.manifest_digest' "$record")
+        [ "$source_ref" = refs/heads/main ]
+        tag=
+        record=
+        manifest=
+        for candidate_tag in "$TEST_TAG" "$TEST_NEXT_TAG"; do
+          candidate_record="$state/mcp-repl-$candidate_tag-release.json"
+          [ -f "$candidate_record" ] || continue
+          candidate_manifest=$(jq -er '.container.manifest_digest' "$candidate_record")
+          if [ "$subject" = "oci://$TEST_IMAGE@$candidate_manifest" ]; then
+            [ -z "$tag" ]
+            tag=$candidate_tag
+            record=$candidate_record
+            manifest=$candidate_manifest
+          fi
+        done
+        [ -n "$tag" ] && [ -n "$record" ] && [ -n "$manifest" ]
         [ "$subject" = "oci://$TEST_IMAGE@$manifest" ]
         [ "$source_sha" = "$(jq -er '.source_sha' "$record")" ]
         case "$predicate" in
@@ -1564,16 +1580,15 @@ export DOCKER_MODE
 expect_failure "bad stage create metadata" run_stage
 test ! -e "$TEST_OUTPUT/image-manifest.json"
 
-# Version publication verifies the exact staged record and trusted annotated
-# tag/draft on both sides of the write, and never mutates latest.
+# Version publication verifies the exact staged record and trusted main event
+# on both sides of the write, and never mutates GitHub or latest.
 prepare_version_case version_fresh
 "$publish" version "$TEST_OUTPUT/image-manifest.json"
 grep -Fq -- "-t $TEST_IMAGE:${TEST_TAG#v}" "$TEST_STATE/docker.log"
 test "$(sha256_path "$TEST_STATE/version.raw")" = \
   "$(jq -r '.manifest_digest' "$TEST_OUTPUT/image-manifest.json")"
 assert_no_target "$TEST_IMAGE:latest"
-grep -Fq "git/ref/tags/$TEST_TAG" "$TEST_STATE/gh.log"
-grep -Fq "releases/tags/$TEST_TAG" "$TEST_STATE/gh.log"
+test ! -s "$TEST_STATE/gh.log"
 
 prepare_version_case version_existing
 cp "$TEST_STATE/staging.raw" "$TEST_STATE/version.raw"
@@ -1618,22 +1633,40 @@ expect_failure "symlinked release record" \
   "$publish" version "$TEST_STATE/linked-record.json"
 assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
 
-for gh_mode in tag_moved draft_public draft_foreign draft_wrong_name \
-  draft_wrong_body draft_malformed; do
-  prepare_version_case "version_$gh_mode"
-  GH_MODE=$gh_mode
-  export GH_MODE
-  expect_failure "$gh_mode trusted draft" \
-    "$publish" version "$TEST_OUTPUT/image-manifest.json"
-  assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
-done
-
-prepare_version_case version_replaced_draft
-GH_MODE=draft_replaced
-export GH_MODE
-expect_failure "draft replaced around version write" \
+prepare_version_case version_wrong_event_ref
+GITHUB_REF=refs/heads/other
+expect_failure "version image from non-main event" \
   "$publish" version "$TEST_OUTPUT/image-manifest.json"
-assert_no_target "$TEST_IMAGE:latest"
+GITHUB_REF=refs/heads/main
+assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
+
+prepare_version_case version_wrong_event_sha
+GITHUB_SHA=$TEST_OTHER_SOURCE_SHA
+expect_failure "version image from wrong event SHA" \
+  "$publish" version "$TEST_OUTPUT/image-manifest.json"
+GITHUB_SHA=$TEST_SOURCE_SHA
+assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
+
+prepare_version_case version_wrong_event_repository
+GITHUB_REPOSITORY=other/project
+expect_failure "version image from wrong event repository" \
+  "$publish" version "$TEST_OUTPUT/image-manifest.json"
+GITHUB_REPOSITORY=test/project
+assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
+
+prepare_version_case version_wrong_event_tag
+RELEASE_TAG=$TEST_NEXT_TAG
+expect_failure "version image with wrong release tag" \
+  "$publish" version "$TEST_OUTPUT/image-manifest.json"
+RELEASE_TAG=$TEST_TAG
+assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
+
+prepare_version_case version_wrong_event_epoch
+SOURCE_DATE_EPOCH=$((TEST_SOURCE_EPOCH + 1))
+expect_failure "version image with wrong source epoch" \
+  "$publish" version "$TEST_OUTPUT/image-manifest.json"
+SOURCE_DATE_EPOCH=$TEST_SOURCE_EPOCH
+assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
 
 prepare_version_case bad_new_version
 DOCKER_MODE=create_version_bad
@@ -1666,7 +1699,7 @@ assert_no_target "$TEST_IMAGE:${TEST_TAG#v}"
 test "$(grep -Fc 'attestation verify oci://ghcr.io/test/project@' \
   "$TEST_STATE/gh.log")" -eq 2
 grep -Fq -- \
-  "--signer-workflow test/project/.github/workflows/release-binaries.yml --source-digest $TEST_SOURCE_SHA --source-ref refs/tags/$TEST_TAG --deny-self-hosted-runners" \
+  "--signer-workflow test/project/.github/workflows/release-binaries.yml --source-digest $TEST_SOURCE_SHA --source-ref refs/heads/main --deny-self-hosted-runners" \
   "$TEST_STATE/gh.log"
 if [[ $(grep -Fc "git/ref/tags/$TEST_TAG" "$TEST_STATE/gh.log") -lt 2 ]]; then
   echo "Latest publication did not re-authenticate its live annotated tag" >&2

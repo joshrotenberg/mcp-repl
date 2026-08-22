@@ -1,27 +1,17 @@
 name: Release binaries
 
-# Source-release reconciliation creates or verifies a draft GitHub release
-# before dispatching this workflow.
-# Every native target must build and package successfully before this workflow
-# uploads any public asset. The release is published only after the complete
-# manifest-derived archive and checksum set is present and verifies, so a
-# failed target cannot expose a partial binary release.
+# Source-release reconciliation verifies the exact published crate before this
+# reusable workflow runs at the frozen release-merge commit. Every native and
+# container target must complete before any version tag or GitHub release is
+# created. One final contents-write job creates or verifies the annotated tag,
+# stages the exact durable asset set, and immediately finalizes it.
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing draft release tag to build and publish
-        required: true
-        type: string
-      source_sha:
-        description: Release-merge commit captured before dispatch
-        required: true
-        type: string
+  workflow_call:
 
 permissions: {}
 
 concurrency:
-  group: release-binaries-${{ inputs.tag }}
+  group: release-binaries-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -29,10 +19,14 @@ jobs:
     name: Verify immutable release source
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
+      pull-requests: read
+      statuses: read
     outputs:
       container_matrix: ${{ steps.source.outputs.container_matrix }}
       native_matrix: ${{ steps.source.outputs.native_matrix }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
       release_toolchain: ${{ steps.source.outputs.release_toolchain }}
       source_date_epoch: ${{ steps.source.outputs.source_date_epoch }}
       syft_version: ${{ steps.source.outputs.syft_version }}
@@ -43,40 +37,42 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Match the workflow ref, tag, and package version
+      - name: Match the workflow ref and package version
         id: source
         shell: bash
         env:
-          TAG: ${{ inputs.tag }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid release tag: $TAG" >&2
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "Release binaries must inherit one trusted main event" >&2
             exit 1
           fi
-          if [[ "$GITHUB_REF" != "refs/tags/$TAG" ]]; then
-            echo "Workflow ref $GITHUB_REF does not match immutable tag $TAG" >&2
-            exit 1
-          fi
-          if [[ "$GITHUB_SHA" != "$SOURCE_SHA" ]]; then
-            echo "Dispatch resolved $GITHUB_SHA instead of expected source $SOURCE_SHA" >&2
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Workflow resolved an invalid source SHA: $SOURCE_SHA" >&2
             exit 1
           fi
           checked_out_sha=$(git rev-parse HEAD)
           if [[ "$checked_out_sha" != "$SOURCE_SHA" ]]; then
-            echo "Checkout $checked_out_sha does not match dispatch source $SOURCE_SHA" >&2
+            echo "Checkout $checked_out_sha does not match release source $SOURCE_SHA" >&2
             exit 1
           fi
-          ./scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA"
           version=$(cargo metadata --locked --no-deps --format-version 1 |
             jq -er '.packages[] | select(.name == "mcp-repl") | .version')
-          if [[ "v$version" != "$TAG" ]]; then
-            echo "Cargo version $version does not match release tag $TAG" >&2
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release package version: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          release_merge_output="$RUNNER_TEMP/release-merge-output"
+          : > "$release_merge_output"
+          ./scripts/discover-release-merge.sh "$release_merge_output"
+          if [[ $(<"$release_merge_output") != is_release_merge=true ]]; then
+            echo "Release source is not exactly one trusted release merge" >&2
             exit 1
           fi
           ./scripts/release-targets.sh validate
@@ -107,6 +103,7 @@ jobs:
             ' <<<"$container_matrix")
             echo "container_matrix=$container_matrix"
             echo "native_matrix=$(./scripts/release-targets.sh release-matrix)"
+            echo "release_tag=$tag"
             echo "release_toolchain=$(jq -er '.rust.release' release-targets.json)"
             echo "source_date_epoch=$source_date_epoch"
             echo "syft_version=$(jq -er '.container_build.syft_version' release-targets.json)"
@@ -123,8 +120,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/release-build.yml
     with:
-      ref: ${{ inputs.source_sha }}
-      version: ${{ inputs.tag }}
+      version: ${{ needs.verify.outputs.release_tag }}
       upload: true
       toolchain: ${{ needs.verify.outputs.release_toolchain }}
 
@@ -145,7 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download this attempt's exact native package
@@ -198,10 +194,10 @@ jobs:
         id: identity
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_EXTENSION: ${{ matrix.archive }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_SHA: ${{ github.sha }}
           SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
         run: |
           set -euo pipefail
@@ -280,8 +276,8 @@ jobs:
         shell: bash
         env:
           ARCHIVE_PATH: ${{ steps.identity.outputs.archive_path }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           trusted_root="$RUNNER_TEMP/trusted-root.jsonl"
@@ -291,7 +287,7 @@ jobs:
             --custom-trusted-root "$trusted_root"
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml"
             --source-digest "$SOURCE_SHA"
-            --source-ref "refs/tags/$RELEASE_TAG"
+            --source-ref "refs/heads/main"
             --deny-self-hosted-runners
           )
           gh attestation verify "$ARCHIVE_PATH" \
@@ -325,8 +321,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/container-build.yml
     with:
-      ref: ${{ inputs.source_sha }}
-      version: ${{ inputs.tag }}
+      version: ${{ needs.verify.outputs.release_tag }}
       source_date_epoch: ${{ needs.verify.outputs.source_date_epoch }}
       push: true
 
@@ -349,7 +344,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download this attempt's exact platform metadata
@@ -421,8 +416,8 @@ jobs:
         id: identity
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
           SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
           GH_REPO: ${{ github.repository }}
         run: |
@@ -458,7 +453,7 @@ jobs:
         shell: bash
         env:
           ATTEST_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: >-
           install -m 0644 "$ATTEST_BUNDLE"
           "container-supply/mcp-repl-$RELEASE_TAG-container.provenance.sigstore.json"
@@ -469,7 +464,7 @@ jobs:
         with:
           subject-name: ${{ steps.identity.outputs.image }}
           subject-digest: ${{ steps.identity.outputs.manifest_digest }}
-          sbom-path: container-supply/mcp-repl-${{ inputs.tag }}-container.spdx.json
+          sbom-path: container-supply/mcp-repl-${{ needs.verify.outputs.release_tag }}-container.spdx.json
           push-to-registry: true
           create-storage-record: false
 
@@ -477,7 +472,7 @@ jobs:
         shell: bash
         env:
           ATTEST_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
         run: >-
           install -m 0644 "$ATTEST_BUNDLE"
           "container-supply/mcp-repl-$RELEASE_TAG-container.sbom.sigstore.json"
@@ -488,8 +483,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ${{ steps.identity.outputs.image }}
           MANIFEST_DIGEST: ${{ steps.identity.outputs.manifest_digest }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           subject="oci://$IMAGE@$MANIFEST_DIGEST"
@@ -502,7 +497,7 @@ jobs:
             --custom-trusted-root "$trusted_root"
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml"
             --source-digest "$SOURCE_SHA"
-            --source-ref "refs/tags/$RELEASE_TAG"
+            --source-ref "refs/heads/main"
             --deny-self-hosted-runners
           )
           gh attestation verify "$subject" \
@@ -542,7 +537,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download the exact container identity
@@ -563,7 +558,7 @@ jobs:
       - name: Pull and smoke the staging digest without registry credentials
         shell: bash
         env:
-          PACKAGE_VERSION: ${{ inputs.tag }}
+          PACKAGE_VERSION: ${{ needs.verify.outputs.release_tag }}
         run: |
           set -euo pipefail
           manifest=container-supply/image-manifest.json
@@ -603,7 +598,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download this attempt's native supply-chain sets
@@ -641,8 +636,8 @@ jobs:
       - name: Build and assemble the exact release inventory
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
           SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
         run: |
           set -euo pipefail
@@ -684,72 +679,17 @@ jobs:
           name: release-supply-${{ github.run_attempt }}
           path: release
           if-no-files-found: error
-          retention-days: 7
-
-  stage_release:
-    name: Stage the complete GitHub release
-    needs:
-      - staging_smoke
-      - assemble
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: write
-    outputs:
-      already_published: ${{ steps.boundary.outputs.already_published }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ inputs.source_sha }}
-          persist-credentials: false
-
-      - name: Download the exact canonical release set
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: release-supply-*
-          path: artifact-downloads
-
-      - name: Select the newest complete release set
-        run: |
-          mkdir release
-          ./scripts/select-run-artifacts.sh \
-            "$GITHUB_RUN_ATTEMPT" \
-            artifact-downloads \
-            release \
-            release-supply
-
-      - name: Stage a draft or verify an immutable recovery retry
-        id: boundary
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          state=$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" \
-            --json isDraft --jq '.isDraft')
-          case "$state" in
-            true)
-              ./scripts/publish-release.sh stage "$RELEASE_TAG" release
-              echo "already_published=false" >> "$GITHUB_OUTPUT"
-              ;;
-            false)
-              ./scripts/publish-release.sh verify "$RELEASE_TAG" release
-              echo "already_published=true" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "Release $RELEASE_TAG returned invalid draft state: $state" >&2
-              exit 1
-              ;;
-          esac
+          # Preserve the one-off signed bundles for exact partial-draft
+          # recovery throughout GitHub's supported workflow rerun window.
+          retention-days: 90
 
   version_image:
     name: Publish the immutable container version
     needs:
       - verify
       - container_manifest
-      - stage_release
+      - staging_smoke
+      - assemble
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -758,7 +698,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download the exact container identity
@@ -820,34 +760,18 @@ jobs:
       - name: Publish or verify the exact version image
         shell: bash
         env:
-          ALREADY_PUBLISHED: ${{ needs.stage_release.outputs.already_published }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
         run: |
           set -euo pipefail
-          manifest=container-supply/image-manifest.json
-          if [[ "$ALREADY_PUBLISHED" == false ]]; then
-            ./scripts/publish-container-manifest.sh version "$manifest"
-          elif [[ "$ALREADY_PUBLISHED" == true ]]; then
-            image=$(jq -er '.image' "$manifest")
-            tag=$(jq -er '.tag' "$manifest")
-            expected=$(jq -er '.manifest_digest' "$manifest")
-            raw="$RUNNER_TEMP/version-index.json"
-            docker buildx imagetools inspect --raw "$image:${tag#v}" > "$raw"
-            actual="sha256:$(sha256sum "$raw" | awk '{print $1}')"
-            if [[ "$actual" != "$expected" ]]; then
-              echo "Published version image moved from $expected to $actual" >&2
-              exit 1
-            fi
-          else
-            echo "Invalid already-published boundary: $ALREADY_PUBLISHED" >&2
-            exit 1
-          fi
+          ./scripts/publish-container-manifest.sh \
+            version container-supply/image-manifest.json
 
-  finalize_release:
-    name: Publish the immutable GitHub release
+  publish_release:
+    name: Publish the complete immutable GitHub release
     needs:
-      - stage_release
+      - verify
       - version_image
       - assemble
     runs-on: ubuntu-latest
@@ -857,7 +781,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download the exact canonical release set
@@ -875,21 +799,22 @@ jobs:
             release \
             release-supply
 
-      - name: Finalize once or verify the immutable retry boundary
+      - name: Create the tag, stage the exact set, and finalize once
         shell: bash
         env:
-          ALREADY_PUBLISHED: ${{ needs.stage_release.outputs.already_published }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$ALREADY_PUBLISHED" == false ]]; then
+          ./scripts/publish-release-tag.sh "$RELEASE_TAG" "$SOURCE_SHA"
+          if ./scripts/publish-release.sh stage "$RELEASE_TAG" release; then
             ./scripts/publish-release.sh finalize "$RELEASE_TAG" release
-          elif [[ "$ALREADY_PUBLISHED" == true ]]; then
-            ./scripts/publish-release.sh verify "$RELEASE_TAG" release
+          elif ./scripts/publish-release.sh verify "$RELEASE_TAG" release; then
+            echo "Accepted already-published exact immutable release $RELEASE_TAG"
           else
-            echo "Invalid already-published boundary: $ALREADY_PUBLISHED" >&2
+            echo "Release $RELEASE_TAG is neither a resumable draft nor an exact immutable release" >&2
             exit 1
           fi
 
@@ -897,7 +822,7 @@ jobs:
     name: Reconcile the mutable latest container alias
     needs:
       - verify
-      - finalize_release
+      - publish_release
     runs-on: ubuntu-latest
     permissions:
       attestations: read
@@ -906,7 +831,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Install checksum-pinned Buildx
@@ -970,7 +895,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download the exact container identity

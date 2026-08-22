@@ -4,7 +4,6 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 release_targets="$root/scripts/release-targets.sh"
-verify_release="$root/scripts/verify-release.sh"
 verify_release_tag="$root/scripts/verify-release-tag.sh"
 validate_oci_attestation="$root/scripts/validate-oci-attestation.py"
 container_runnable_mapping="$root/scripts/container-runnable-mapping.jq"
@@ -55,7 +54,7 @@ for required_command in awk cmp docker find jq ln mktemp python3 rm sed sort tr 
   command -v "$required_command" > /dev/null 2>&1 ||
     die "$required_command is required"
 done
-if [[ "$mode" != stage ]]; then
+if [[ "$mode" == latest ]]; then
   command -v gh > /dev/null 2>&1 || die "gh is required"
 fi
 if command -v sha256sum > /dev/null 2>&1; then
@@ -713,28 +712,23 @@ validate_release_record() {
   RECORD_JSON=$normalized
 }
 
-trusted_draft_boundary() {
+trusted_main_source_boundary() {
   local tag=$1
   local source_sha=$2
-  local expected_release_id=${3:-}
-  local release_id
-
-  "$verify_release_tag" "$tag" "$source_sha" > /dev/null ||
-    die "release tag $tag does not match source $source_sha"
-  if [[ -n "$expected_release_id" ]]; then
-    release_id=$("$verify_release" "$tag" draft "$expected_release_id") ||
-      die "GitHub release $tag left its trusted draft boundary"
-  else
-    release_id=$("$verify_release" "$tag" draft) ||
-      die "GitHub release $tag is not the trusted draft"
+  local source_epoch=$3
+  if [[ "${GITHUB_REF:-}" != refs/heads/main ||
+        "${GITHUB_SHA:-}" != "$source_sha" ||
+        "${GITHUB_REPOSITORY:-}" != "$repository" ||
+        "${RELEASE_TAG:-}" != "$tag" ||
+        "${SOURCE_DATE_EPOCH:-}" != "$source_epoch" ]]; then
+    die "version image is not bound to the trusted main release event"
   fi
-  printf '%s\n' "$release_id"
 }
 
 version_manifest() {
   local record_path=$1
   local tag source_sha source_epoch staging_ref manifest_digest rows version_ref
-  local release_id version_status
+  local version_status
 
   validate_release_record "$record_path"
   tag=$(jq -r '.tag' <<<"$RECORD_JSON")
@@ -746,6 +740,7 @@ version_manifest() {
   validate_tag "$tag"
   EXPECTED_PACKAGE_VERSION=${tag#v}
   validate_source_identity "$source_sha" "$source_epoch"
+  trusted_main_source_boundary "$tag" "$source_sha" "$source_epoch"
 
   validate_platform_builds "$rows"
   inspect_reference "$staging_ref" "staging image $staging_ref" false
@@ -754,7 +749,6 @@ version_manifest() {
     die "staging image $staging_ref moved from $manifest_digest to $INSPECT_DIGEST"
   fi
 
-  release_id=$(trusted_draft_boundary "$tag" "$source_sha")
   version_ref="$image:${tag#v}"
   if inspect_reference "$version_ref" "version image $version_ref" true; then
     validate_index_mapping "$INSPECT_RAW_FILE" "$rows" "version image $version_ref"
@@ -775,7 +769,7 @@ version_manifest() {
     validate_create_metadata "$CREATE_METADATA_FILE" "$manifest_digest" \
       "$INSPECT_RAW_FILE" "version image $version_ref"
   fi
-  trusted_draft_boundary "$tag" "$source_sha" "$release_id" > /dev/null
+  trusted_main_source_boundary "$tag" "$source_sha" "$source_epoch"
   echo "Published exact version image $version_ref@$manifest_digest"
 }
 
@@ -886,7 +880,7 @@ verify_release_record_attestations() {
     --custom-trusted-root "$trusted_root"
     --signer-workflow "$repository/.github/workflows/release-binaries.yml"
     --source-digest "$source_sha"
-    --source-ref "refs/tags/$tag"
+    --source-ref "refs/heads/main"
     --deny-self-hosted-runners
   )
   if ! gh attestation verify "$subject" \

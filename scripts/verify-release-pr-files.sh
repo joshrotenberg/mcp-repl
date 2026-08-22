@@ -15,18 +15,32 @@ if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
   exit 2
 fi
 
-if ! changed_files=$(gh api --paginate \
-  "repos/${repository}/pulls/${pr_number}/files?per_page=100" \
-  --jq '.[].filename'); then
+if ! file_pages=$(gh api --paginate --slurp \
+  "repos/${repository}/pulls/${pr_number}/files?per_page=100"); then
   echo "Could not list files for release PR #$pr_number" >&2
   exit 1
 fi
-
-actual_files=$(printf '%s\n' "$changed_files" | sed '/^$/d' | LC_ALL=C sort -u)
-expected_files=$'CHANGELOG.md\nCargo.lock\nCargo.toml'
-if [[ "$actual_files" != "$expected_files" ]]; then
+if ! changed_files=$(jq -ce '
+  if type != "array" or any(.[]; type != "array")
+  then error("file pages are malformed")
+  else [.[][]]
+  end
+' <<<"$file_pages"); then
+  echo "GitHub returned malformed release-PR file data" >&2
+  exit 1
+fi
+if ! jq -e '
+  length == 3 and
+  all(.[];
+    type == "object" and
+    (.filename | type == "string") and
+    .status == "modified" and
+    (has("previous_filename") | not)) and
+  ([.[].filename] | sort) == ["CHANGELOG.md", "Cargo.lock", "Cargo.toml"]
+' <<<"$changed_files" > /dev/null; then
   echo "Release PR #$pr_number changes an unexpected file set:" >&2
-  printf '%s\n' "$actual_files" >&2
+  jq -c '[.[] | {filename, status, previous_filename}]' \
+    <<<"$changed_files" >&2 || true
   exit 1
 fi
 

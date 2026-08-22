@@ -121,7 +121,7 @@ fi
 # Recheck both conditions that authorized the merge. Publication must remain
 # safe even if repository rules drift or a same-named check run is introduced.
 "$root/scripts/verify-release-pr-files.sh" "$repository" "$pr_number"
-"$root/scripts/verify-release-gate.sh" "$head_sha" "$base_sha"
+"$root/scripts/verify-release-gate.sh" "$pr_number" "$head_sha" "$base_sha"
 
 echo "is_release_merge=true" >> "$output_file"
 echo "This commit merged exactly one trusted release-plz PR"

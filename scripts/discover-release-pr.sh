@@ -10,8 +10,14 @@ fi
 output_file=$1
 root=$(cd "$(dirname "$0")/.." && pwd)
 repository=${GITHUB_REPOSITORY:-}
+expected_head_sha=${EXPECTED_RELEASE_HEAD_SHA:-}
 if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "GITHUB_REPOSITORY must be an owner/repository name" >&2
+  exit 2
+fi
+if [[ -n "$expected_head_sha" &&
+      ! "$expected_head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "EXPECTED_RELEASE_HEAD_SHA must be an exact lowercase commit" >&2
   exit 2
 fi
 
@@ -38,6 +44,10 @@ fi
 
 candidate_count=$(jq -r 'length' <<<"$candidates")
 if [[ "$candidate_count" == 0 ]]; then
+  if [[ -n "$expected_head_sha" ]]; then
+    echo "The generated release commit has no trusted pull request" >&2
+    exit 1
+  fi
   # A normal main push need not create a release PR. Explicit empty outputs
   # make every downstream job's skip condition deterministic.
   {
@@ -61,6 +71,10 @@ head_sha=$(jq -r '.head.sha // ""' <<<"$pull")
 if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ||
       ! "$head_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "Trusted release PR candidate has an invalid identity" >&2
+  exit 1
+fi
+if [[ -n "$expected_head_sha" && "$head_sha" != "$expected_head_sha" ]]; then
+  echo "Release PR head $head_sha differs from generated commit $expected_head_sha" >&2
   exit 1
 fi
 

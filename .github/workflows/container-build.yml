@@ -3,10 +3,6 @@ name: Container release build
 on:
   workflow_call:
     inputs:
-      ref:
-        description: Exact source commit to build
-        required: true
-        type: string
       version:
         description: Version label used for smoke verification
         required: true
@@ -19,6 +15,11 @@ on:
         description: Push content-addressed platform images and metadata
         required: true
         type: boolean
+      source_sha:
+        description: Authenticated candidate SHA; empty uses the caller event SHA
+        required: false
+        default: ""
+        type: string
 
 # The caller owns the maximum token scope for this reusable workflow. The CI
 # rehearsal passes only contents: read; release publication additionally passes
@@ -41,14 +42,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated candidate source
+        if: inputs.source_sha != '' && inputs.source_sha != github.sha
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Bind source, epoch, version, and immutable tools
         id: config
         shell: bash
         env:
-          EXPECTED_REF: ${{ inputs.ref }}
+          EXPECTED_REF: ${{ inputs.source_sha || github.sha }}
           EXPECTED_EPOCH: ${{ inputs.source_date_epoch }}
           ARCHIVE_VERSION: ${{ inputs.version }}
         run: |
@@ -99,8 +111,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated candidate source
+        if: inputs.source_sha != '' && inputs.source_sha != github.sha
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Install checksum-pinned Buildx
         shell: bash
@@ -206,7 +229,7 @@ jobs:
           PLATFORM_SLUG: ${{ matrix.platform_slug }}
           PACKAGE_VERSION: ${{ needs.manifest.outputs.package_version }}
           RELEASE_TAG: ${{ inputs.version }}
-          SOURCE_SHA: ${{ inputs.ref }}
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
           SOURCE_DATE_EPOCH: ${{ inputs.source_date_epoch }}
         run: |
           set -euo pipefail

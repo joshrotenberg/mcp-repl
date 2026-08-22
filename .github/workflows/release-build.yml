@@ -3,10 +3,6 @@ name: Native release build
 on:
   workflow_call:
     inputs:
-      ref:
-        description: Exact lowercase 40-character source commit to build
-        required: true
-        type: string
       version:
         description: Version label used in archive names
         required: true
@@ -18,6 +14,11 @@ on:
       toolchain:
         description: Manifest-approved rehearsal or release Rust toolchain
         required: true
+        type: string
+      source_sha:
+        description: Authenticated candidate SHA; empty uses the caller event SHA
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -41,14 +42,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated candidate source
+        if: inputs.source_sha != '' && inputs.source_sha != github.sha
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Validate and export the authoritative matrix
         id: targets
         shell: bash
         env:
-          EXPECTED_SOURCE: ${{ inputs.ref }}
+          EXPECTED_SOURCE: ${{ inputs.source_sha || github.sha }}
           REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}
         run: |
           set -euo pipefail
@@ -107,13 +119,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.manifest.outputs.source_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated candidate source
+        if: inputs.source_sha != '' && inputs.source_sha != github.sha
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Recheck the exact source commit
         shell: bash
         env:
-          EXPECTED_SOURCE: ${{ needs.manifest.outputs.source_sha }}
+          EXPECTED_SOURCE: ${{ inputs.source_sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE"
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -125,10 +148,6 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ needs.manifest.outputs.archive_python }}
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Install native musl toolchain
         if: matrix.libc == 'musl'

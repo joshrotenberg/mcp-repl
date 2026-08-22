@@ -12,55 +12,96 @@ binaries.
    artifact. A fresh write-scoped job first proves `main` is still at that
    exact SHA, then verifies and commits only that artifact to a same-repository,
    bot-owned branch whose name starts with `release-plz-`, creating the release
-   PR when needed.
+   PR when needed. It captures and validates the generated commit's full SHA
+   immediately after the commit and before pushing it.
 2. The trusted `main` workflow discovers at most one open release PR. It
    requires the GitHub Actions bot, the same repository, base `main`, a full
-   commit SHA, and exactly `CHANGELOG.md`, `Cargo.toml`, and `Cargo.lock`.
+   commit SHA, and exactly `CHANGELOG.md`, `Cargo.toml`, and `Cargo.lock`. The
+   discovered live head must equal the generated SHA captured before the push.
+   It preserves a 90-day identity artifact that binds the repository, parent
+   run ID and attempt, base SHA, PR number, release branch, and generated head
+   SHA for later publication preflight.
 3. That workflow posts the required classic `Release gate` status as pending,
-   then calls `ci.yml` as a reusable workflow with the exact candidate SHA and
-   a read-only token. This avoids GitHub's suppression of recursively created
-   workflow events without introducing a PAT or long-lived App credential.
-4. The final reporting job posts success only if the aggregate gate succeeds,
-   reports that same SHA, and the pull request is still open at that exact
-   head. A moved or untrusted head is refused rather than receiving a stale
-   status.
+   with the exact trusted Release-plz run-attempt URL as its owning claim. A
+   normal runner job sends a typed `repository_dispatch` request. GitHub always
+   resolves that event's `ci.yml`, local reusable workflows, `GITHUB_REF`, and
+   `GITHUB_SHA` from the default branch; no API caller can select workflow code
+   from the release branch. The payload binds the parent run and attempt, base
+   SHA, PR number, release branch, generated head, and unique claim. Before any
+   candidate code runs, the read-only child validates that payload against the
+   exact parent attempt, current PR and branch, three-file diff, and durable
+   identity artifact. It then fetches the authenticated candidate by its full
+   SHA with raw Git commands, verifies detached `HEAD`, and runs the ordinary
+   multi-platform CI graph on GitHub-hosted ephemeral runners. Candidate jobs
+   receive no secrets or write, OIDC, or cache authority; every shared Rust
+   cache read and write is disabled. The parent accepts exactly one bot-owned,
+   first-attempt `repository_dispatch` child whose recorded source is the same
+   trusted `main` base and whose claim names the candidate head. This avoids
+   recursive-event suppression without a PAT or long-lived App credential.
+4. The final reporting job posts success only if that exact child run completes
+   successfully with one successful aggregate `Release gate`, reports the same
+   authenticated candidate SHA, and the pull request is still open at that
+   exact head. The
+   parent Release-plz attempt remains the status owner's claim while the
+   successful status targets the verified child CI attempt URL. The reporter
+   requires that its attempt is the same attempt that produced and uploaded the
+   identity artifact, revalidates that it is still the current parent attempt
+   before each write, and refuses a same-attempt downgrade or replacement. A
+   moved or
+   untrusted head, stale parent attempt, or mismatched child is refused rather
+   than receiving a stale status.
 5. The gate includes the ordinary quality, package, dependency, Windows-path,
    and workflow-lint jobs. Exact Rust 1.90.0 checks run natively on the
    manifest's representative Linux, macOS, and Windows targets. Every
    same-repository PR and exact release validation also builds, executes,
    ABI-checks, and packages all manifest targets with stable Rust; untrusted
-   fork PRs cannot run that broader native matrix.
+   fork PRs cannot run that broader native matrix. The native release builder
+   deliberately does not use a shared Actions cache, so its final artifacts do
+   not inherit mutable cache state from another run.
 6. Merge the release PR only after `Release gate` succeeds. The first-party
    merge preflight below makes every ordinary `main` commit ineligible for
    publication, and release-plz itself has publishing disabled.
 7. The uncoalesced `release-publish.yml` workflow first proves that its exact
    `main` SHA merged one trusted release-plz PR through a one-parent squash or
    equivalent single-commit rebase. It independently rechecks the
-   exact three-file diff and binds the successful classic status to the
-   trusted Release-plz run on that PR's base and head. Only then does a
-   credential-free runner package and compile the source. A fresh
-   least-privilege runner then receives only the crates.io token for a fixed-
-   toolchain `cargo publish --locked --no-verify`; no package code executes on
-   that runner. A separate first-party job receives `contents: write` but no
-   registry credential; it rebuilds the exact locked `.crate` without executing
-   package code, compares its checksum with crates.io, then creates or verifies
-   the canonical annotated immutable tag and **draft** GitHub release. This
-   split closes the partial state where crates.io accepted a version before
-   GitHub objects existed, without ever colocating both high-value credentials
-   or their runners. A separate job dispatches `release-binaries.yml`.
-8. Dispatch carries both the tag and the release-merge SHA. The binary workflow
-   checks out that SHA everywhere, rechecks the immutable annotated tag, and
-   verifies Cargo's version. An active repository ruleset allows new `v*` tags
-   but forbids updating or deleting them. Native jobs use the manifest's exact
-   Rust, Python, cargo-auditable, and checksum-pinned musl inputs. They build all
-   seven targets, enforce Linux ABI policy, execute each binary, and create
-   archives whose paths, modes, timestamps, order, ZIP storage, and raw stored
-   gzip stream are independent of host archiver or zlib behavior.
+   exact three-file diff and binds the successful classic status to the exact
+   bot-owned, default-branch-controlled child CI attempt for that PR head,
+   including its one
+   successful `Release gate` job. It also verifies the exact successful parent
+   Release-plz attempt and reporting job, confirms no newer attempt superseded
+   it, and downloads the uniquely named identity artifact whose base, PR,
+   branch, and head fields must all match the merge. Only then does a
+   credential-free runner packages and compiles the source. A fresh
+   least-privilege runner then receives only the crates.io token for a
+   fixed-toolchain `cargo publish --locked --no-verify`; no package code
+   executes on that runner. A separate read-only first-party job receives no
+   registry credential, rebuilds the exact locked `.crate` without executing
+   package code, and compares its checksum with crates.io. It deliberately
+   creates no GitHub tag or release: those mutations remain deferred until the
+   complete release set is ready. This split recovers the partial state where
+   crates.io accepted a version before later stages completed, without ever
+   colocating registry and GitHub publication authority. After reconciliation,
+   `release-publish.yml` calls
+   `release-binaries.yml` as a local reusable workflow. The call is resolved
+   from the same frozen, trusted `main` `github.sha`; no workflow code is loaded
+   from a tag or candidate branch.
+8. The binary workflow accepts no workflow inputs. It inherits the caller's
+   event-bound `github.sha` and `refs/heads/main`, checks out that SHA
+   everywhere, derives the semver tag from the locked Cargo metadata, and
+   proves that the source is one trusted release merge and that Cargo names one
+   canonical version. No tag or draft is required before the build. Native jobs
+   use the manifest's exact Rust,
+   Python, cargo-auditable, and checksum-pinned musl inputs. They build all
+   seven targets, enforce Linux ABI policy, execute each binary, and
+   create archives whose paths, modes, timestamps, order, ZIP storage, and raw
+   stored gzip stream are independent of host archiver or zlib behavior.
 9. A separate read-only attestation matrix verifies each archive checksum,
    creates a deterministic normalized SPDX 2.3 inventory, and signs both SLSA
    v1 provenance and the SPDX predicate. The bundles are verified against the
-   exact repository workflow, source digest, tag ref, and public trusted root
-   before they become workflow artifacts.
+   exact repository workflow, source digest, trusted `refs/heads/main` source
+   ref, and public trusted root before they become workflow artifacts. The
+   final annotated tag and canonical release record bind that trusted source
+   digest to the release version.
 10. Container jobs use digest-pinned base, BuildKit, and SBOM-generator images
     plus a checksum-pinned Buildx binary. Each architecture builds natively,
     rewrites layer timestamps to the source commit epoch, pushes by digest, and
@@ -83,14 +124,17 @@ binaries.
     release-target manifest, native file identities, final container digest and
     runnable platform digests. It decodes every DSSE statement and rejects a
     subject or predicate that belongs to anything else.
-13. Publication stages the exact 39-file set on the bot-owned draft without
-    replacement. A retry may fill a byte-identical partial subset, but an extra,
-    duplicate, or mismatched asset fails closed. While the release is still a
-    trusted draft, the workflow creates or verifies the immutable version image.
-    It then publishes the draft with GitHub's legacy latest-selection behavior;
-    repository release immutability locks its tag and assets. Lost responses and
-    failed-job reruns re-read live state and succeed only for the same immutable,
-    complete, byte-identical release.
+13. Only after staging smoke and all 39 durable files are complete does a
+    package-write job create or verify the immutable version image. It binds
+    the record to the same trusted `main` event, source SHA, version, and source
+    epoch without depending on a prematurely created GitHub object. One final
+    contents-write job then creates or verifies the canonical annotated tag,
+    creates or resumes the bot-owned draft, stages the exact 39-file set without
+    replacement, verifies it byte for byte, and immediately publishes it with
+    GitHub's legacy latest-selection behavior. An extra, duplicate, or
+    mismatched asset fails closed; repository release immutability locks the tag
+    and assets. Lost responses and failed-job reruns re-read live state and
+    succeed only for the same immutable, complete, byte-identical release.
 14. After publication, `latest` is reconciled to GitHub's current bot-owned
     immutable latest release. The workflow re-reads that release around the
     mutable-tag write so overlapping versions and older retries converge instead
@@ -103,13 +147,22 @@ binaries.
 The status reporter is intentionally narrow and the whole update/validation
 graph is serialized. It runs from the trusted default branch, grants only its
 reporting jobs `pull-requests: read` and `statuses: write`, and re-reads the
-release PR plus the latest status claim before every write. A stale main run,
-moved head, older run ID, or untrusted PR is refused. Candidate application and
-build code plus release-plz execute only in credential-free or `contents: read`
-jobs; the write-scoped release-PR job is limited to first-party boundary
-checks, fixed-artifact verification, and the branch/PR update.
-Ordinary and fork pull-request CI keep their read-only token, and the pipeline
-needs no personal access token or long-lived GitHub App credential.
+release PR plus the latest parent status claim before every write. Pending and
+successful statuses use exact `/actions/runs/<id>/attempts/<attempt>` URLs, not
+bare run URLs. A pending status points to the claiming Release-plz attempt;
+only its verified child CI attempt may become the target of success. The
+identity artifact gives publication a durable, independently checked binding
+to the same parent attempt and generated candidate. A stale main run, moved
+head, newer parent attempt, older claim, or untrusted PR is refused. Candidate
+application and build code plus release-plz execute only in credential-free or
+`contents: read` jobs; the write-scoped release-PR job is limited to
+first-party boundary checks, fixed-artifact verification, and the branch/PR
+update.
+Ordinary and fork pull-request CI keep their read-only token. Although any
+`contents: write` token can request a repository dispatch, an unrelated request
+can at most create a duplicate or failing read-only validation run: it cannot
+select executable workflow code or acquire an authoritative status claim. The
+pipeline needs no personal access token or long-lived GitHub App credential.
 
 Every external Action is pinned to a reviewed full commit SHA and checked by
 `scripts/check-actions-pinned.sh`; the trailing version comments let Dependabot
@@ -119,14 +172,31 @@ explicit Rust 1.90.0 MSRV.
 Repository settings must keep **Enable release immutability** on. GitHub applies
 that policy only to releases created after it is enabled, and the published-
 release verifier requires the API's `immutable: true` state before a retry is
-accepted. The separate `v*` tag ruleset remains defense in depth before a draft
-is published.
+accepted. Active `v*` tag rulesets must continue to forbid every update or
+deletion. Creation-only enforcement remains a pending hardening item until the
+repository has a dedicated, narrowly scoped release principal or GitHub App.
+Do not grant the generic repository-wide GitHub Actions App a tag-creation
+bypass: that identity is shared by unrelated workflows and is too broad to be
+a release boundary. Once a dedicated principal exists, only it should receive
+the creation bypass.
+
+GitHub Release and GHCR publication also require dedicated protected publisher
+identities or an isolated distribution repository before their write scopes
+can be treated as an exclusive authority boundary. The generic source-repository
+GitHub Actions identity must receive no publication bypass. Until that
+provisioning is complete, keep the local workflow source-bound, minimize the
+tag/draft lifetime as above, and retain every live-state verification. This is
+tracked in issue #210; dedicated tag creation is tracked in #209.
 
 `release-targets.json` is the authoritative native/container platform, ABI, and
 release-tool input contract. `scripts/release-targets.sh` validates its exact
 schema and its mirrors in Cargo, Docker, and the installer; workflow runner
 labels are accepted only from a fixed allowlist. The same reusable native and
-container workflows serve PR rehearsal and publication.
+container workflows serve PR rehearsal and publication. Publication binds every
+checkout to the calling event's `github.sha`; release rehearsal may accept only
+the candidate SHA already authenticated by the default-branch CI control job,
+fetches it without a dynamic `actions/checkout` ref, and rechecks detached
+`HEAD` before any build.
 
 Packaging lives in `scripts/package-release.sh`, Linux ABI enforcement in
 `scripts/verify-release-binary.sh`, container evidence in
@@ -152,7 +222,7 @@ source_sha=$(jq -r '.source_sha' "$record")
 common=(
   --repo joshrotenberg/mcp-repl
   --signer-workflow joshrotenberg/mcp-repl/.github/workflows/release-binaries.yml
-  --source-ref "refs/tags/$tag"
+  --source-ref refs/heads/main
   --source-digest "$source_sha"
   --deny-self-hosted-runners
 )
@@ -178,7 +248,7 @@ subject="oci://ghcr.io/joshrotenberg/mcp-repl@$digest"
 common=(
   --repo joshrotenberg/mcp-repl
   --signer-workflow joshrotenberg/mcp-repl/.github/workflows/release-binaries.yml
-  --source-ref "refs/tags/$tag"
+  --source-ref refs/heads/main
   --source-digest "$source_sha"
   --deny-self-hosted-runners
 )
@@ -200,31 +270,48 @@ compact release record.
 
 - A failed release-PR check blocks the merge and therefore blocks crates.io,
   the tag, and the GitHub release.
-- To retry transient release-PR CI, use **Re-run failed jobs** on its existing
-  Release-plz run; the same run may replace its owned failure after the gate
-  passes. If `main` or the release head has advanced, dispatch Release-plz on
-  current `main` instead. The workflow refuses to mutate the generated PR from
-  a stale main SHA.
+- To retry transient release-PR CI, use **Re-run all jobs** on its existing
+  Release-plz run. Each attempt must recreate the identity artifact, pending
+  claim, default-branch-controlled child CI run, and final report as one
+  attempt-scoped chain. **Re-run failed jobs** is intentionally unsupported
+  here and fails closed because its retained successful jobs belong to an older
+  attempt. If `main` or the release head has advanced, let a new `main` push start a fresh
+  Release-plz run instead. The workflow refuses to mutate the generated PR from
+  a stale main SHA. If a green release PR is ever held near the 90-day artifact
+  limit, use **Re-run all jobs** before merging so publication receives fresh
+  identity evidence.
 - If **Release publish** fails during merge preflight, credential-free package
-  verification, registry publication, source reconciliation, or dispatch, use
+  verification, registry publication, or source reconciliation, use
   **Re-run all jobs** on that existing run. This retries a registry attempt
   that failed before upload while remaining safe if crates.io already accepted
   it. The event stays bound to the release-merge SHA; a fresh dispatch from a
   later `main` commit is intentionally ineligible. Reconciliation resumes a
   crate-only partial publication only after proving the exact archive's VCS and
-  registry checksums; a yanked or mismatched crate, noncanonical or moved tag,
-  conflicting draft, or mismatched canonical notes fails closed.
+  registry checksums; a yanked or mismatched crate fails closed before any tag
+  or release exists. Once the final publication boundary begins, a
+  noncanonical or moved tag, conflicting draft, or mismatched canonical notes
+  also fails closed.
 - A failed native target, container build, attestation, assembly, or staging
-  smoke after the crate is published leaves the GitHub release in draft form.
-  No incomplete binary/container release is public. Content-addressed platform
-  objects or a private partial draft may remain, but every retry verifies them
-  before reuse.
-- For transient failures in **Release binaries**, **Re-run failed jobs** is
-  supported. The workflow downloads all same-run artifact attempts and selects
-  the newest complete attempt per logical target, so successful prior jobs need
-  not rebuild. **Re-run all jobs** remains safe when a complete rebuild is
-  desired. Duplicate candidates within one attempt, missing targets, stale
-  newer attempts, or differing published bytes fail closed.
+  smoke after the crate is published leaves no GitHub tag or release. No
+  incomplete binary/container release is public. Content-addressed platform
+  objects may remain and every retry verifies them before reuse. Once the exact
+  version image has passed, a later tag or GitHub publication failure may leave
+  that complete but orphaned public version image; recovery accepts it only at
+  the recorded digest. Only an interruption inside the final contents-write job
+  can leave a private partial draft, which the retry resumes only with
+  byte-identical assets.
+- After the release-validation claim has cleared and the local reusable binary
+  workflow is running, **Re-run failed jobs** remains supported for transient
+  binary-stage failures. The workflow downloads all same-run artifact attempts
+  and selects the newest complete attempt per logical target, so successful
+  prior jobs need not rebuild. This is distinct from the attempt-atomic
+  Release-plz validation chain above. **Re-run all jobs** remains fail-closed,
+  but regenerated Sigstore bundles are not guaranteed to be byte-identical; it
+  may therefore be unable to resume an existing partial draft. Prefer
+  **Re-run failed jobs** after final staging has begun. The exact assembled
+  release artifact is retained for 90 days to cover GitHub's supported rerun
+  window. Duplicate candidates within one attempt, missing targets, stale newer
+  attempts, or differing published bytes fail closed.
 - A retry after draft publication re-reads live state. It accepts only the same
   bot-owned immutable release with the exact 39 byte-identical assets; it never
   trusts a stale prerequisite output or replaces an asset. An older tag retry

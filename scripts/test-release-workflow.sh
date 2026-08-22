@@ -6,9 +6,10 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 discover="$root/scripts/discover-release-pr.sh"
 discover_merge="$root/scripts/discover-release-merge.sh"
 report="$root/scripts/report-release-status.sh"
-dispatch="$root/scripts/dispatch-release-binaries.sh"
+dispatch_validation="$root/scripts/dispatch-release-validation.sh"
 verify_tag="$root/scripts/verify-release-tag.sh"
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+release_base=cccccccccccccccccccccccccccccccccccccccc
 metadata=$(cargo metadata --locked --no-deps --format-version 1)
 version=$(jq -er '.packages[] | select(.name == "mcp-repl") | .version' <<<"$metadata")
 tag="v$version"
@@ -36,18 +37,111 @@ release_build="$root/.github/workflows/release-build.yml"
 container_build="$root/.github/workflows/container-build.yml"
 ci_workflow="$root/.github/workflows/ci.yml"
 release_workflow="$root/.github/workflows/release-binaries.yml"
+release_plz="$root/.github/workflows/release-plz.yml"
+release_publish="$root/.github/workflows/release-publish.yml"
 if grep -Fq 'github.event.pull_request.head.sha' "$ci_workflow"; then
   echo "CI must use one exact merge-or-release source for every release rehearsal" >&2
   exit 1
 fi
-# The release-target job validates and exports the source once; both reusable
-# builders and the aggregate gate must consume that exact output.
-# These single-quoted patterns intentionally match literal shell syntax.
+# No API caller may select the workflow code that validates a release. A
+# repository dispatch always runs CI and its local reusable workflows from the
+# default-branch commit; the candidate SHA crosses only as authenticated data
+# and is fetched without flowing into actions/checkout's ref input.
+if grep -Fq 'release_ref' "$ci_workflow" ||
+  grep -Fq 'workflow_call:' "$ci_workflow" ||
+  grep -Fq 'workflow_dispatch:' "$ci_workflow" ||
+  grep -Fq 'workflow_dispatch:' "$release_plz" ||
+  grep -Eq 'ref:.*(client_payload|inputs\.source_sha)' \
+    "$ci_workflow" "$release_build" "$container_build"; then
+  echo "release validation workflow code must remain default-branch controlled" >&2
+  exit 1
+fi
+if grep -Fq 'workflow_dispatch:' "$release_workflow" ||
+  grep -Fq 'workflow_dispatch:' "$release_publish" ||
+  [[ $(grep -Fc 'workflow_call:' "$release_workflow") -ne 1 ||
+     $(grep -Fc 'uses: ./.github/workflows/release-binaries.yml' \
+       "$release_publish") -ne 1 ]]; then
+  echo "binary publication must be called at the frozen trusted main event" >&2
+  exit 1
+fi
+reconcile_job=$(sed -n '/^  reconcile:/,/^  binaries:/p' "$release_publish")
+if grep -Fq '      contents: write' <<<"$reconcile_job"; then
+  echo "registry reconciliation must not receive GitHub publication authority" >&2
+  exit 1
+fi
+version_job_line=$(grep -n '^  version_image:' "$release_workflow" | cut -d: -f1)
+publish_job_line=$(grep -n '^  publish_release:' "$release_workflow" | cut -d: -f1)
+tag_publish_line=$(grep -Fn 'publish-release-tag.sh' "$release_workflow" | cut -d: -f1)
+version_job=$(sed -n '/^  version_image:/,/^  publish_release:/p' "$release_workflow")
+publish_job=$(sed -n '/^  publish_release:/,/^  latest_image:/p' "$release_workflow")
+if [[ ! "$version_job_line" =~ ^[0-9]+$ ||
+      ! "$publish_job_line" =~ ^[0-9]+$ ||
+      ! "$tag_publish_line" =~ ^[0-9]+$ ||
+      "$version_job_line" -ge "$publish_job_line" ||
+      "$publish_job_line" -ge "$tag_publish_line" ||
+      $(grep -Fc 'retention-days: 90' "$release_workflow") -ne 1 ||
+      $(grep -Fc '      - staging_smoke' <<<"$version_job") -ne 1 ||
+      $(grep -Fc '      - assemble' <<<"$version_job") -ne 1 ||
+      $(grep -Fc '      packages: write' <<<"$version_job") -ne 1 ||
+      $(grep -Fc '      - version_image' <<<"$publish_job") -ne 1 ||
+      $(grep -Fc '      contents: write' <<<"$publish_job") -ne 1 ||
+      $(grep -Fc 'publish-release.sh stage' <<<"$publish_job") -ne 1 ||
+      $(grep -Fc 'publish-release.sh finalize' <<<"$publish_job") -ne 1 ]]; then
+  echo "tag and release publication must stay behind the complete versioned release set" >&2
+  exit 1
+fi
+# These patterns intentionally match literal workflow and shell syntax.
 # shellcheck disable=SC2016
-[[ $(grep -Fc 'needs.release-targets.outputs.source_sha' "$ci_workflow") -eq 3 &&
-    $(grep -Fc 'source_sha=$(git rev-parse HEAD)' "$ci_workflow") -eq 1 &&
-    $(grep -Fc 'source_date_epoch=$(git show -s --format=%ct HEAD)' "$ci_workflow") -eq 1 ]] || {
-  echo "CI release source and epoch must come from one validated checkout" >&2
+[[ $(grep -Fc "ref: \${{ github.sha }}" "$ci_workflow") -eq 8 &&
+    $(grep -Fc "ref: \${{ github.sha }}" "$release_build") -eq 2 &&
+    $(grep -Fc "ref: \${{ github.sha }}" "$container_build") -eq 2 &&
+    $(grep -Fc "ref: \${{ github.sha }}" "$release_workflow") -eq 9 &&
+    $(grep -Fc 'repository_dispatch:' "$ci_workflow") -eq 1 &&
+    $(grep -Fc 'types: [release_validation]' "$ci_workflow") -eq 1 &&
+    $(grep -Fc 'git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"' \
+      "$ci_workflow") -eq 7 &&
+    $(grep -Fc 'inputs.source_sha || github.sha' "$release_build") -eq 2 &&
+    $(grep -Fc 'inputs.source_sha || github.sha' "$container_build") -eq 2 &&
+    $(grep -Fc 'needs.release-targets.outputs.source_sha' "$ci_workflow") -eq 1 &&
+    $(grep -Fc "source_sha=\$(git rev-parse HEAD)" "$ci_workflow") -eq 1 &&
+    $(grep -Fc "source_date_epoch=\$(git show -s --format=%ct HEAD)" "$ci_workflow") -eq 1 ]] || {
+  echo "release source and epoch must come from frozen event checkouts" >&2
+  exit 1
+}
+if grep -Fq 'Swatinem/rust-cache' "$release_build"; then
+  echo "final native release builds must not consume shared Actions caches" >&2
+  exit 1
+fi
+if [[ $(grep -Fc 'Swatinem/rust-cache' "$ci_workflow") -ne 5 ||
+      $(grep -Fc "if: needs.source.outputs.release_validation != 'true'" \
+        "$ci_workflow") -ne 4 ]]; then
+  echo "release validation must skip every shared CI cache" >&2
+  exit 1
+fi
+[[ $(grep -Fc 'RELEASE_VALIDATION_COMPLETION_ATTEMPTS:-720' \
+      "$dispatch_validation") -eq 1 &&
+    $(grep -Fc 'completion_attempts" -gt 720' \
+      "$dispatch_validation") -eq 1 &&
+    $(grep -Fc 'RELEASE_VALIDATION_RETRY_DELAY_SECONDS:-10' \
+      "$dispatch_validation") -eq 1 ]] || {
+  echo "cache-free release validation must allow the reviewed two-hour window" >&2
+  exit 1
+}
+# shellcheck disable=SC2016
+[[ $(grep -Fc 'client_payload[validation_claim]' "$dispatch_validation") -eq 1 &&
+    $(grep -Fc 'event_type=release_validation' "$dispatch_validation") -eq 1 &&
+    $(grep -Fc 'event=repository_dispatch&branch=main' \
+      "$dispatch_validation") -eq 1 &&
+    $(grep -Fc 'dispatch-release-validation.sh' "$release_plz") -eq 1 &&
+    $(grep -Fc 'producer_attempt: ${{ steps.identity.outputs.producer_attempt }}' \
+      "$release_plz") -eq 1 &&
+    $(grep -Fc 'RELEASE_PRODUCER_ATTEMPT: ${{ needs.release-pr.outputs.producer_attempt }}' \
+      "$release_plz") -eq 2 &&
+    $(grep -Fc 'retention-days: 90' "$release_plz") -eq 1 &&
+    $(grep -Fc '"${VALIDATION_CLAIM##*-}" != "$EXPECTED_SOURCE"' \
+      "$ci_workflow") -eq 1 &&
+    -x "$dispatch_validation" ]] || {
+  echo "release-plz must dispatch and bind default-branch-controlled CI" >&2
   exit 1
 }
 
@@ -339,15 +433,20 @@ pull_json() {
   author='github-actions[bot]'
   author_type=Bot
   head_sha=$sha
+  head_branch=release-plz-v9
+  base_sha=$release_base
   case "$mode" in
-    closed) state=closed ;;
-    cross_repo) repository=other/project ;;
-    wrong_author) author=octocat; author_type=User ;;
-    moved_head) head_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    closed | validation_closed) state=closed ;;
+    cross_repo | validation_cross_repo) repository=other/project ;;
+    wrong_author | validation_wrong_author) author=octocat; author_type=User ;;
+    moved_head | validation_moved_pull) head_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    validation_wrong_branch) head_branch=release-plz-other ;;
+    report_wrong_base) base_sha=dddddddddddddddddddddddddddddddddddddddd ;;
     bad_sha) head_sha=short ;;
   esac
-  printf '{"number":42,"state":"%s","base":{"ref":"main"},"head":{"ref":"release-plz-v9","sha":"%s","repo":{"full_name":"%s"}},"user":{"login":"%s","type":"%s"}}' \
-    "$state" "$head_sha" "$repository" "$author" "$author_type"
+  printf '{"number":42,"state":"%s","base":{"ref":"main","sha":"%s"},"head":{"ref":"release-plz-v9","sha":"%s","repo":{"full_name":"%s"}},"user":{"login":"%s","type":"%s"}}' \
+    "$state" "$base_sha" "$head_sha" "$repository" "$author" "$author_type" |
+    sed "s/\"ref\":\"release-plz-v9\"/\"ref\":\"$head_branch\"/"
 }
 
 merge_json() {
@@ -360,6 +459,78 @@ merge_json() {
   esac
   printf '{"number":42,"state":"closed","merged_at":"2026-08-21T00:00:00Z","merge_commit_sha":"%s","base":{"ref":"main","sha":"%s"},"head":{"ref":"release-plz-v9","sha":"%s","repo":{"full_name":"%s"}},"user":{"login":"%s","type":"%s"}}' \
     "$sha" "$release_base" "$release_head" "$repository" "$author" "$author_type"
+}
+
+validation_run_json() {
+  run_id=199
+  run_attempt=1
+  title=${TEST_VALIDATION_CLAIM:?}
+  event=repository_dispatch
+  path=.github/workflows/ci.yml
+  branch=main
+  head_sha=$release_base
+  repository=test/project
+  head_repository=test/project
+  actor='github-actions[bot]'
+  actor_type=Bot
+  status=completed
+  conclusion=success
+  case "$mode" in
+    validation_wrong_title) title='release-validation-other' ;;
+    validation_wrong_event) event=workflow_dispatch ;;
+    validation_wrong_path) path=.github/workflows/release-plz.yml ;;
+    validation_wrong_run_branch) branch=release-plz-v9 ;;
+    validation_wrong_run_sha | validation_mutated_run) head_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    validation_wrong_repo) repository=other/project ;;
+    validation_wrong_head_repo) head_repository=other/project ;;
+    validation_wrong_run_actor) actor=octocat; actor_type=User ;;
+    validation_wrong_attempt) run_attempt=2 ;;
+    validation_pending) status=in_progress; conclusion='' ;;
+    validation_failed) conclusion=failure ;;
+  esac
+  printf '{"id":%s,"run_attempt":%s,"display_title":"%s","event":"%s","path":"%s","head_branch":"%s","head_sha":"%s","html_url":"https://github.com/test/project/actions/runs/%s","repository":{"full_name":"%s"},"head_repository":{"full_name":"%s"},"actor":{"login":"%s","type":"%s"},"status":"%s","conclusion":%s}\n' \
+    "$run_id" "$run_attempt" "$title" "$event" "$path" "$branch" "$head_sha" "$run_id" \
+    "$repository" "$head_repository" "$actor" "$actor_type" "$status" \
+    "$(if [ -n "$conclusion" ]; then printf '"%s"' "$conclusion"; else printf null; fi)"
+}
+
+parent_run_json() {
+  parent_id=${1:-98}
+  parent_attempt=${2:-1}
+  parent_path=.github/workflows/release-plz.yml
+  parent_head=$release_base
+  parent_branch=main
+  parent_status=completed
+  parent_conclusion=success
+  parent_event=push
+  parent_repository=test/project
+  parent_head_repository=test/project
+  case "$mode" in
+    merge_wrong_parent_path|report_wrong_parent_path) parent_path=.github/workflows/ci.yml ;;
+    merge_wrong_parent_head|report_wrong_parent_head) parent_head=dddddddddddddddddddddddddddddddddddddddd ;;
+    merge_wrong_parent_branch|report_wrong_parent_branch) parent_branch=release-plz-v9 ;;
+    merge_wrong_parent_event|report_wrong_parent_event) parent_event=pull_request ;;
+    merge_wrong_parent_attempt) parent_attempt=2 ;;
+    merge_wrong_parent_repo|report_wrong_parent_repo) parent_repository=other/project ;;
+    merge_wrong_parent_head_repo|report_wrong_parent_head_repo) parent_head_repository=other/project ;;
+    merge_failed_parent_run) parent_conclusion=failure ;;
+    merge_pending_parent_run)
+      parent_status=in_progress
+      parent_conclusion=''
+      ;;
+    merge_retrying_parent_run)
+      if [ ! -f "${GH_RUN_STATE:?}" ]; then
+        touch "$GH_RUN_STATE"
+        parent_status=in_progress
+        parent_conclusion=''
+      fi
+      ;;
+  esac
+  printf '{"id":%s,"run_attempt":%s,"event":"%s","status":"%s","conclusion":%s,"head_branch":"%s","head_sha":"%s","path":"%s","html_url":"https://github.com/test/project/actions/runs/%s","repository":{"full_name":"%s"},"head_repository":{"full_name":"%s"}}\n' \
+    "$parent_id" "$parent_attempt" "$parent_event" "$parent_status" \
+    "$(if [ -n "$parent_conclusion" ]; then printf '"%s"' "$parent_conclusion"; else printf null; fi)" \
+    "$parent_branch" "$parent_head" "$parent_path" "$parent_id" \
+    "$parent_repository" "$parent_head_repository"
 }
 
 if [ "${1:-}" = api ]; then
@@ -417,22 +588,34 @@ if [ "${1:-}" = api ]; then
             *) printf '[[%s]]\n' "$(merge_json)" ;;
           esac
           ;;
-        --paginate\ repos/test/project/pulls/42/files?*)
+        "--paginate --slurp repos/test/project/pulls/42/files?per_page=100")
           if [ "$mode" = files_api_failure ] || [ "$mode" = merge_files_api_failure ]; then
             echo "files API unavailable" >&2
             exit 1
           fi
-          if [ "$mode" = bad_files ] || [ "$mode" = merge_bad_files ]; then
-            printf '%s\n' CHANGELOG.md Cargo.toml README.md
-          else
-            printf '%s\n' Cargo.toml CHANGELOG.md Cargo.lock
-          fi
+          case "$mode" in
+            malformed_files) printf '{}\n' ;;
+            malformed_file_page) printf '[{}]\n' ;;
+            renamed_files)
+              printf '%s\n' '[[{"filename":"CHANGELOG.md","status":"modified"},{"filename":"Cargo.lock","status":"modified"},{"filename":"Cargo.toml","status":"renamed","previous_filename":".github/workflows/ci.yml"}]]'
+              ;;
+            copied_files)
+              printf '%s\n' '[[{"filename":"CHANGELOG.md","status":"modified"},{"filename":"Cargo.lock","status":"modified"},{"filename":"Cargo.toml","status":"copied","previous_filename":".github/workflows/ci.yml"}]]'
+              ;;
+            bad_files|merge_bad_files|validation_bad_files)
+              printf '%s\n' '[[{"filename":"CHANGELOG.md","status":"modified"},{"filename":"Cargo.toml","status":"modified"},{"filename":"README.md","status":"modified"}]]'
+              ;;
+            *)
+              printf '%s\n' '[[{"filename":"Cargo.toml","status":"modified"},{"filename":"CHANGELOG.md","status":"modified"},{"filename":"Cargo.lock","status":"modified"}]]'
+              ;;
+          esac
           ;;
         *) echo "unexpected paginated API call: $*" >&2; exit 1 ;;
       esac
       ;;
     --method)
-      if [ "$mode" = post_failure ]; then
+      if [ "$mode" = post_failure ] ||
+        [ "$mode" = validation_dispatch_failure ]; then
         echo "status API unavailable" >&2
         exit 1
       fi
@@ -445,6 +628,17 @@ if [ "${1:-}" = api ]; then
       fi
       pull_json
       ;;
+    repos/test/project/git/ref/heads/release-plz-v9)
+      if [ "$mode" = validation_branch_api_failure ]; then
+        echo "branch lookup unavailable" >&2
+        exit 1
+      fi
+      branch_sha=$sha
+      [ "$mode" = validation_moved_branch ] && \
+        branch_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      printf '{"ref":"refs/heads/release-plz-v9","object":{"type":"commit","sha":"%s"}}\n' \
+        "$branch_sha"
+      ;;
     repos/test/project/commits/*/statuses?*)
       if [ "$mode" = status_query_failure ]; then
         echo "status query unavailable" >&2
@@ -455,19 +649,25 @@ if [ "${1:-}" = api ]; then
           merge_malformed_status) printf '{}\n' ;;
           merge_no_status) printf '[]\n' ;;
           merge_failed_status)
-            printf '[{"context":"Release gate","state":"failure","description":"Release validation failed","target_url":"https://github.com/test/project/actions/runs/99","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            printf '[{"context":"Release gate","state":"failure","description":"Release validation failed","target_url":"https://github.com/test/project/actions/runs/99/attempts/1","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
             ;;
           merge_foreign_status)
-            printf '[{"context":"Release gate","state":"success","description":"Release validation passed","target_url":"https://github.com/test/project/actions/runs/99","creator":{"login":"octocat","type":"User"}}]\n'
+            printf '[{"context":"Release gate","state":"success","description":"Release validation passed","target_url":"https://github.com/test/project/actions/runs/99/attempts/1","creator":{"login":"octocat","type":"User"}}]\n'
             ;;
           merge_foreign_url)
-            printf '[{"context":"Release gate","state":"success","description":"Release validation passed","target_url":"https://example.com/actions/runs/99","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            printf '[{"context":"Release gate","state":"success","description":"Release validation passed","target_url":"https://example.com/actions/runs/99/attempts/1","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
             ;;
           merge_missing_url)
             printf '[{"context":"Release gate","state":"success","description":"Release validation passed","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
             ;;
-          *)
+          merge_bare_run_url)
             printf '[{"context":"Release gate","state":"success","description":"Release validation passed","target_url":"https://github.com/test/project/actions/runs/99","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            ;;
+          merge_child_attempt_two)
+            printf '[{"context":"Release gate","state":"success","description":"Release validation passed","target_url":"https://github.com/test/project/actions/runs/99/attempts/2","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            ;;
+          *)
+            printf '[{"context":"Release gate","state":"success","description":"Release validation passed","target_url":"https://github.com/test/project/actions/runs/99/attempts/1","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
             ;;
         esac
       else
@@ -475,13 +675,25 @@ if [ "${1:-}" = api ]; then
           none) printf '[]\n' ;;
           malformed) printf '{}\n' ;;
           current)
-            printf '[{"context":"Release gate","state":"pending","target_url":"https://github.com/test/project/actions/runs/99"}]\n'
+            printf '[{"context":"Release gate","state":"pending","description":"Release CI pending","target_url":"https://github.com/test/project/actions/runs/98/attempts/1","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            ;;
+          current_attempt_two)
+            printf '[{"context":"Release gate","state":"pending","description":"Release CI pending","target_url":"https://github.com/test/project/actions/runs/98/attempts/2","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
             ;;
           owned_failure)
-            printf '[{"context":"Release gate","state":"failure","target_url":"https://github.com/test/project/actions/runs/99"}]\n'
+            printf '[{"context":"Release gate","state":"failure","description":"Release CI failure","target_url":"https://github.com/test/project/actions/runs/98/attempts/1","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
             ;;
           newer)
-            printf '[{"context":"Release gate","state":"pending","target_url":"https://github.com/test/project/actions/runs/100"}]\n'
+            printf '[{"context":"Release gate","state":"pending","description":"Release CI pending","target_url":"https://github.com/test/project/actions/runs/100/attempts/1","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            ;;
+          newer_attempt)
+            printf '[{"context":"Release gate","state":"pending","description":"Release CI pending","target_url":"https://github.com/test/project/actions/runs/98/attempts/2","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            ;;
+          current_success)
+            printf '[{"context":"Release gate","state":"success","description":"Release CI success","target_url":"https://github.com/test/project/actions/runs/199/attempts/1","creator":{"login":"github-actions[bot]","type":"Bot"}}]\n'
+            ;;
+          foreign_claim)
+            printf '[{"context":"Release gate","state":"pending","description":"Release CI pending","target_url":"https://github.com/test/project/actions/runs/98/attempts/1","creator":{"login":"octocat","type":"User"}}]\n'
             ;;
           *) echo "unknown claim mode" >&2; exit 1 ;;
         esac
@@ -580,7 +792,62 @@ if [ "${1:-}" = api ]; then
         *) printf '{"sha":"%s","tree":{"sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}\n' "$release_head" ;;
       esac
       ;;
-    repos/test/project/actions/runs/99)
+    repos/test/project/actions/runs/98/attempts/1)
+      if [ "$mode" = merge_parent_run_api_failure ]; then
+        echo "parent workflow run unavailable" >&2
+        exit 1
+      fi
+      if [ "$mode" = merge_malformed_parent_run ]; then
+        printf '{}\n'
+        exit 0
+      fi
+      parent_run_json 98 1
+      ;;
+    repos/test/project/actions/runs/98/attempts/2)
+      parent_run_json 98 2
+      ;;
+    repos/test/project/actions/runs/100/attempts/1)
+      parent_run_json 100 1
+      ;;
+    repos/test/project/actions/runs/98)
+      if [ "$mode" = report_parent_recheck_failure ] ||
+        [ "$mode" = merge_parent_recheck_failure ]; then
+        echo "current parent workflow run unavailable" >&2
+        exit 1
+      fi
+      case "$mode" in
+        report_newer_attempt|merge_newer_parent_attempt)
+          parent_run_json 98 2
+          ;;
+        *) parent_run_json 98 1 ;;
+      esac
+      ;;
+    repos/test/project/actions/runs/98/attempts/1/jobs?per_page=100)
+      case "$mode" in
+        merge_parent_jobs_api_failure)
+          echo "parent workflow jobs unavailable" >&2
+          exit 1
+          ;;
+        merge_malformed_parent_jobs) printf '{}\n' ;;
+        merge_incomplete_parent_jobs)
+          printf '{"total_count":2,"jobs":[{"name":"Report release validation","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        merge_missing_report_job) printf '{"total_count":0,"jobs":[]}\n' ;;
+        merge_failed_report_job)
+          printf '{"total_count":1,"jobs":[{"name":"Report release validation","run_attempt":1,"status":"completed","conclusion":"failure"}]}\n'
+          ;;
+        merge_duplicate_report_job)
+          printf '{"total_count":2,"jobs":[{"name":"Report release validation","run_attempt":1,"status":"completed","conclusion":"success"},{"name":"Report release validation","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        merge_wrong_report_job_attempt)
+          printf '{"total_count":1,"jobs":[{"name":"Report release validation","run_attempt":2,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        *)
+          printf '{"total_count":1,"jobs":[{"name":"Report release validation","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+      esac
+      ;;
+    repos/test/project/actions/runs/99/attempts/1)
       if [ "$mode" = merge_run_api_failure ]; then
         echo "workflow run unavailable" >&2
         exit 1
@@ -589,13 +856,24 @@ if [ "${1:-}" = api ]; then
         printf '{}\n'
         exit 0
       fi
-      run_path=.github/workflows/release-plz.yml
+      run_path=.github/workflows/ci.yml
       run_head=$release_base
+      run_branch=main
       run_status=completed
       run_conclusion='"success"'
+      run_event=repository_dispatch
+      run_attempt=1
+      run_actor='github-actions[bot]'
+      run_actor_type=Bot
+      run_title="release-validation-98-1-$release_head"
       case "$mode" in
-        merge_wrong_run) run_path=.github/workflows/ci.yml ;;
+        merge_wrong_run) run_path=.github/workflows/release-plz.yml ;;
         merge_wrong_base) run_head=dddddddddddddddddddddddddddddddddddddddd ;;
+        merge_wrong_branch) run_branch=release-plz-v9 ;;
+        merge_wrong_event) run_event=workflow_dispatch ;;
+        merge_wrong_actor) run_actor=octocat; run_actor_type=User ;;
+        merge_wrong_title) run_title='CI main' ;;
+        merge_wrong_child_attempt) run_attempt=2 ;;
         merge_failed_run) run_conclusion='"failure"' ;;
         merge_pending_run) run_status=in_progress; run_conclusion=null ;;
         merge_retrying_run)
@@ -606,20 +884,94 @@ if [ "${1:-}" = api ]; then
           fi
           ;;
       esac
-      printf '{"id":99,"event":"push","status":"%s","conclusion":%s,"head_branch":"main","head_sha":"%s","path":"%s","html_url":"https://github.com/test/project/actions/runs/99","repository":{"full_name":"test/project"},"head_repository":{"full_name":"test/project"}}\n' \
-        "$run_status" "$run_conclusion" "$run_head" "$run_path"
+      printf '{"id":99,"run_attempt":%s,"display_title":"%s","event":"%s","status":"%s","conclusion":%s,"head_branch":"%s","head_sha":"%s","path":"%s","html_url":"https://github.com/test/project/actions/runs/99","repository":{"full_name":"test/project"},"head_repository":{"full_name":"test/project"},"actor":{"login":"%s","type":"%s"}}\n' \
+        "$run_attempt" "$run_title" "$run_event" "$run_status" "$run_conclusion" \
+        "$run_branch" "$run_head" "$run_path" "$run_actor" "$run_actor_type"
       ;;
-    repos/test/project/actions/workflows/release-binaries.yml/runs?*)
-      expected_runs_query="repos/test/project/actions/workflows/release-binaries.yml/runs?event=workflow_dispatch&head_sha=${sha}&per_page=100"
-      if [ "$1" != "$expected_runs_query" ]; then
-        echo "unexpected workflow-run filter: $1" >&2
+    repos/test/project/actions/runs/99/attempts/1/jobs?per_page=100)
+      case "$mode" in
+        merge_jobs_api_failure) echo "workflow jobs unavailable" >&2; exit 1 ;;
+        merge_malformed_jobs) printf '{}\n' ;;
+        merge_incomplete_jobs)
+          printf '{"total_count":2,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        merge_missing_gate) printf '{"total_count":0,"jobs":[]}\n' ;;
+        merge_failed_gate)
+          printf '{"total_count":1,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"failure"}]}\n'
+          ;;
+        merge_duplicate_gate)
+          printf '{"total_count":2,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"},{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        merge_wrong_gate_attempt)
+          printf '{"total_count":1,"jobs":[{"name":"Release gate","run_attempt":2,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        *)
+          printf '{"total_count":1,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+      esac
+      ;;
+    repos/test/project/actions/workflows/ci.yml/runs?*)
+      expected_validation_query="repos/test/project/actions/workflows/ci.yml/runs?event=repository_dispatch&branch=main&head_sha=${release_base}&per_page=100"
+      if [ "$1" != "$expected_validation_query" ]; then
+        echo "unexpected release-validation filter: $1" >&2
         exit 1
       fi
       case "$mode" in
-        run_query_failure) echo "workflow runs unavailable" >&2; exit 1 ;;
-        active_dispatch) printf '1\n' ;;
-        invalid_run_count) printf 'many\n' ;;
-        *) printf '0\n' ;;
+        validation_runs_api_failure)
+          echo "validation runs unavailable" >&2
+          exit 1
+          ;;
+        validation_malformed_runs) printf '{}\n' ;;
+        validation_no_run|validation_wrong_title|validation_wrong_event|\
+          validation_wrong_path|validation_wrong_run_branch|\
+          validation_wrong_run_sha|validation_wrong_repo|\
+          validation_wrong_head_repo|validation_wrong_run_actor|\
+          validation_wrong_attempt)
+          printf '{"workflow_runs":[]}\n'
+          ;;
+        validation_duplicate_run)
+          run=$(validation_run_json)
+          printf '{"workflow_runs":[%s,%s]}\n' "$run" "$run"
+          ;;
+        validation_mutated_run)
+          saved_mode=$mode
+          mode=valid
+          run=$(validation_run_json)
+          mode=$saved_mode
+          printf '{"workflow_runs":[%s]}\n' "$run"
+          ;;
+        *) printf '{"workflow_runs":[%s]}\n' "$(validation_run_json)" ;;
+      esac
+      ;;
+    repos/test/project/actions/runs/199/attempts/1)
+      if [ "$mode" = validation_run_api_failure ]; then
+        echo "validation run unavailable" >&2
+        exit 1
+      fi
+      if [ "$mode" = validation_malformed_run ]; then
+        printf '{}\n'
+      else
+        validation_run_json
+      fi
+      ;;
+    repos/test/project/actions/runs/199/attempts/1/jobs?per_page=100)
+      case "$mode" in
+        validation_jobs_api_failure) echo "validation jobs unavailable" >&2; exit 1 ;;
+        validation_malformed_jobs) printf '{}\n' ;;
+        validation_incomplete_jobs)
+          printf '{"total_count":2,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        validation_missing_gate) printf '{"total_count":0,"jobs":[]}\n' ;;
+        validation_failed_gate)
+          printf '{"total_count":1,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"failure"}]}\n'
+          ;;
+        validation_duplicate_gate)
+          printf '{"total_count":2,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"},{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        validation_wrong_gate_attempt)
+          printf '{"total_count":1,"jobs":[{"name":"Release gate","run_attempt":2,"status":"completed","conclusion":"success"}]}\n'
+          ;;
+        *) printf '{"total_count":1,"jobs":[{"name":"Release gate","run_attempt":1,"status":"completed","conclusion":"success"}]}\n' ;;
       esac
       ;;
     repos/test/project/pulls?*)
@@ -646,6 +998,73 @@ if [ "${1:-}" = api ]; then
   exit 0
 fi
 
+if [ "${1:-} ${2:-}" = "run download" ]; then
+  if [ "$mode" = merge_identity_download_failure ]; then
+    echo "identity artifact unavailable" >&2
+    exit 1
+  fi
+  run_id=${3:-}
+  shift 3
+  artifact_name=
+  artifact_dir=
+  artifact_repo=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name)
+        artifact_name=${2:-}
+        shift 2
+        ;;
+      --dir)
+        artifact_dir=${2:-}
+        shift 2
+        ;;
+      --repo)
+        artifact_repo=${2:-}
+        shift 2
+        ;;
+      *)
+        echo "unexpected run download argument: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+  expected_identity_head=$release_head
+  case "$mode" in
+    validation_source*) expected_identity_head=$sha ;;
+  esac
+  expected_name="release-identity-98-1-$expected_identity_head"
+  if [ "$run_id" != 98 ] || [ "$artifact_repo" != test/project ] ||
+    [ "$artifact_name" != "$expected_name" ] || [ -z "$artifact_dir" ]; then
+    echo "unexpected identity artifact request" >&2
+    exit 1
+  fi
+  mkdir -p "$artifact_dir"
+  if [ "$mode" = merge_symlink_identity ]; then
+    ln -s /dev/null "$artifact_dir/release-identity.json"
+    exit 0
+  fi
+  identity_head=$expected_identity_head
+  identity_base=$release_base
+  identity_attempt=1
+  case "$mode" in
+    validation_source_bad_identity) identity_head=dddddddddddddddddddddddddddddddddddddddd ;;
+    merge_bad_identity) identity_head=dddddddddddddddddddddddddddddddddddddddd ;;
+    merge_bad_identity_base) identity_base=dddddddddddddddddddddddddddddddddddddddd ;;
+    merge_bad_identity_attempt) identity_attempt=2 ;;
+    merge_malformed_identity)
+      printf '%s\n' '{not-json' > "$artifact_dir/release-identity.json"
+      exit 0
+      ;;
+  esac
+  printf '{"schema_version":1,"repository":"test/project","parent_run_id":98,"parent_run_attempt":%s,"base_sha":"%s","pr_number":42,"head_branch":"release-plz-v9","head_sha":"%s"}\n' \
+    "$identity_attempt" "$identity_base" "$identity_head" \
+    > "$artifact_dir/release-identity.json"
+  if [ "$mode" = merge_extra_identity ]; then
+    printf '%s\n' unexpected > "$artifact_dir/extra.txt"
+  fi
+  exit 0
+fi
+
 if [ "${1:-} ${2:-}" = "release view" ]; then
   case "$mode" in
     unreachable) echo "release API unavailable" >&2; exit 1 ;;
@@ -656,19 +1075,18 @@ if [ "${1:-} ${2:-}" = "release view" ]; then
   exit 0
 fi
 
-if [ "${1:-} ${2:-}" = "workflow run" ]; then
-  if [ "$mode" = dispatch_failure ]; then
-    echo "workflow API unavailable" >&2
-    exit 1
-  fi
-  printf '%s\n' "$*" >> "${GH_LOG:?}"
-  exit 0
-fi
-
 echo "unexpected gh call: $*" >&2
 exit 1
 STUB
 chmod +x "$work/bin/gh"
+
+source_resolver="$work/source-resolver.sh"
+sed -n \
+  '/^      - name: Authenticate the requested release candidate$/,/^  quality:$/p' \
+  "$ci_workflow" |
+  sed '1,/^        run: |$/d; /^  quality:$/d; s/^          //' \
+    > "$source_resolver"
+chmod +x "$source_resolver"
 
 failures=0
 assert_result() {
@@ -686,13 +1104,66 @@ assert_result() {
   printf 'ok   %s\n' "$name"
 }
 
+check_source_request() {
+  local name=$1 mode=$2 want_status=$3 want_text=$4 event_name=${5:-repository_dispatch}
+  local event_file="$work/source-event.json" output_file="$work/source-output"
+  local runner_temp="$work/source-runner" output status expected
+  rm -rf "$runner_temp"
+  mkdir "$runner_temp"
+  : > "$output_file"
+  jq -n \
+    --arg claim "release-validation-98-1-$sha" \
+    --arg base "$release_base" \
+    --arg head "$sha" '
+      {
+        client_payload: {
+          schema_version: 1,
+          validation_claim: $claim,
+          parent_run_id: 98,
+          parent_run_attempt: 1,
+          base_sha: $base,
+          pr_number: 42,
+          head_branch: "release-plz-v9",
+          head_sha: $head
+        }
+      }
+    ' > "$event_file"
+  set +e
+  output=$(PATH="$work/bin:$PATH" GH_MODE="$mode" GH_LOG="$log" \
+    TEST_TAG="$tag" TEST_VERSION="$version" TEST_EXPECTED_NOTES="$expected_notes" \
+    GITHUB_EVENT_NAME="$event_name" GITHUB_EVENT_PATH="$event_file" \
+    GITHUB_REF=refs/heads/main GITHUB_SHA="$release_base" \
+    GITHUB_REPOSITORY=test/project GITHUB_SERVER_URL=https://github.com \
+    GITHUB_OUTPUT="$output_file" RUNNER_TEMP="$runner_temp" \
+    "$source_resolver" 2>&1)
+  status=$?
+  set -e
+  if ! assert_result "$name" "$status" "$want_status" "$output" "$want_text"; then
+    return 0
+  fi
+  if [[ "$want_status" == 0 && "$event_name" == repository_dispatch ]]; then
+    expected=$'release_validation=true\nsource_sha='"$sha"$'\nbase_sha='"$release_base"$'\nvalidation_claim=release-validation-98-1-'"$sha"
+    if [[ $(<"$output_file") != "$expected" ]]; then
+      printf 'FAIL %s: source resolver outputs were not exact\n' "$name" >&2
+      failures=$((failures + 1))
+    fi
+  elif [[ "$want_status" == 0 ]]; then
+    expected=$'release_validation=false\nsource_sha='"$release_base"$'\nbase_sha='"$release_base"$'\nvalidation_claim='
+    if [[ $(<"$output_file") != "$expected" ]]; then
+      printf 'FAIL %s: ordinary CI source outputs were not exact\n' "$name" >&2
+      failures=$((failures + 1))
+    fi
+  fi
+}
+
 check_discovery() {
-  local name=$1 mode=$2 want_status=$3 want_text=$4 want_file_text=${5:-}
+  local name=$1 mode=$2 want_status=$3 want_text=$4 want_file_text=${5:-} expected_head=${6:-}
   local output status output_file="$work/github-output"
   : > "$output_file"
   set +e
   output=$(PATH="$work/bin:$PATH" GH_MODE="$mode" GH_LOG="$log" \
-    GITHUB_REPOSITORY=test/project "$discover" "$output_file" 2>&1)
+    GITHUB_REPOSITORY=test/project EXPECTED_RELEASE_HEAD_SHA="$expected_head" \
+    "$discover" "$output_file" 2>&1)
   status=$?
   set -e
   if ! assert_result "$name" "$status" "$want_status" "$output" "$want_text"; then
@@ -729,12 +1200,27 @@ check_merge() {
 
 check_report() {
   local name=$1 mode=$2 want_status=$3 want_text=$4 should_post=$5 state=${6:-pending} claim=${7:-none}
-  local output status
+  local claim_override=${8:-} target_override=${9:-}
+  local current_attempt=${10:-1}
+  local producer_attempt=${11:-$current_attempt}
+  local output status claim_url target_url
   : > "$log"
+  claim_url="https://github.com/test/project/actions/runs/98/attempts/$current_attempt"
+  target_url=$claim_url
+  if [[ "$state" == success ]]; then
+    target_url=https://github.com/test/project/actions/runs/199/attempts/1
+  fi
+  [[ -z "$claim_override" ]] || claim_url=$claim_override
+  [[ -z "$target_override" ]] || target_url=$target_override
   set +e
   output=$(PATH="$work/bin:$PATH" GH_MODE="$mode" GH_CLAIM="$claim" GH_LOG="$log" \
-    GITHUB_REPOSITORY=test/project "$report" 42 "$sha" "$state" \
-    https://github.com/test/project/actions/runs/99 "Release CI $state" 2>&1)
+    GITHUB_REPOSITORY=test/project GITHUB_SERVER_URL=https://github.com \
+    GITHUB_RUN_ID=98 GITHUB_RUN_ATTEMPT="$current_attempt" \
+    GITHUB_SHA=cccccccccccccccccccccccccccccccccccccccc \
+    RELEASE_PRODUCER_ATTEMPT="$producer_attempt" \
+    TEST_VALIDATION_CLAIM="release-validation-98-$current_attempt-$sha" \
+    "$report" 42 "$sha" "$state" "$claim_url" "$target_url" \
+    "Release CI $state" 2>&1)
   status=$?
   set -e
   if ! assert_result "$name" "$status" "$want_status" "$output" "$want_text"; then
@@ -751,29 +1237,48 @@ check_report() {
   fi
 }
 
-check_dispatch() {
+check_validation() {
   local name=$1 mode=$2 want_status=$3 want_text=$4 should_dispatch=$5
-  local output status
+  local output status expected_output output_file="$work/validation-output"
+  local branch=release-plz-v9
+  local claim="release-validation-98-1-$sha"
   : > "$log"
+  : > "$output_file"
   set +e
   output=$(PATH="$work/bin:$PATH" GH_MODE="$mode" GH_LOG="$log" \
     TEST_TAG="$tag" TEST_VERSION="$version" TEST_EXPECTED_NOTES="$expected_notes" \
-    GH_REPO=test/project "$dispatch" "$tag" "$sha" 2>&1)
+    TEST_VALIDATION_CLAIM="$claim" GITHUB_REPOSITORY=test/project \
+    GITHUB_SERVER_URL=https://github.com GITHUB_RUN_ID=98 GITHUB_RUN_ATTEMPT=1 \
+    GITHUB_SHA=cccccccccccccccccccccccccccccccccccccccc \
+    RELEASE_VALIDATION_DISCOVERY_ATTEMPTS=1 \
+    RELEASE_VALIDATION_COMPLETION_ATTEMPTS=1 \
+    RELEASE_VALIDATION_RETRY_DELAY_SECONDS=0 \
+    "$dispatch_validation" 42 "$branch" "$sha" "$claim" "$output_file" 2>&1)
   status=$?
   set -e
   if ! assert_result "$name" "$status" "$want_status" "$output" "$want_text"; then
     return 0
   fi
   if [[ "$should_dispatch" == true ]]; then
-    if ! grep -Fq 'workflow run release-binaries.yml' "$log" ||
-       ! grep -Fq -- "--ref $tag" "$log" ||
-       ! grep -Fq -- "source_sha=$sha" "$log"; then
-      printf 'FAIL %s: expected immutable-tag dispatch was not recorded\n' "$name" >&2
+    if ! grep -Fq -- '--method POST repos/test/project/dispatches' "$log" ||
+       ! grep -Fq -- 'event_type=release_validation' "$log" ||
+       ! grep -Fq -- "client_payload[validation_claim]=$claim" "$log" ||
+       ! grep -Fq -- 'client_payload[base_sha]=cccccccccccccccccccccccccccccccccccccccc' "$log" ||
+       ! grep -Fq -- "client_payload[head_sha]=$sha" "$log" ||
+       grep -Fq -- 'workflow run' "$log"; then
+      printf 'FAIL %s: default-branch repository dispatch was not recorded\n' "$name" >&2
       failures=$((failures + 1))
     fi
   elif [[ -s "$log" ]]; then
-    printf 'FAIL %s: an unexpected dispatch was recorded\n' "$name" >&2
+    printf 'FAIL %s: release CI was dispatched across a failed boundary\n' "$name" >&2
     failures=$((failures + 1))
+  fi
+  if [[ "$want_status" == 0 ]]; then
+    expected_output=$'gate_result=success\nvalidated_ref='"$sha"$'\nrun_id=199\nrun_url=https://github.com/test/project/actions/runs/199/attempts/1'
+    if [[ $(<"$output_file") != "$expected_output" ]]; then
+      printf 'FAIL %s: validation outputs were not exact\n' "$name" >&2
+      failures=$((failures + 1))
+    fi
   fi
 }
 
@@ -791,6 +1296,19 @@ check_tag() {
   fi
 }
 
+check_source_request "a repository dispatch authenticates the exact candidate" \
+  validation_source 0 ""
+check_source_request "ordinary CI remains bound to its event source" \
+  validation_source 0 "" pull_request
+check_source_request "a dispatch with an untrusted parent is refused" \
+  merge_wrong_parent_path 1 "no trusted parent"
+check_source_request "a dispatch for a moved candidate is refused" \
+  validation_moved_pull 1 "changed across its trusted identity"
+check_source_request "a superseded parent attempt cannot authorize a dispatch" \
+  report_newer_attempt 1 "superseded this dispatch"
+check_source_request "a mismatched identity artifact cannot authorize source" \
+  validation_source_bad_identity 1 "does not bind this dispatch"
+
 check_discovery "trusted release PR is discovered" valid 0 "Discovered trusted" "head_sha=$sha"
 check_discovery "no release PR is a clean no-op" none 0 "No open" "pr_number="
 check_discovery "multiple release PRs are refused" multiple 1 "found 2"
@@ -802,6 +1320,17 @@ check_discovery "wrong-author release lookalike is ignored" wrong_author 0 "No o
 check_discovery "a trusted PR wins over a fork lookalike" trusted_and_cross_repo 0 "Discovered trusted" "head_sha=$sha"
 check_discovery "a trusted PR wins over a wrong-author lookalike" trusted_and_wrong_author 0 "Discovered trusted" "head_sha=$sha"
 check_discovery "unexpected release files are refused" bad_files 1 "unexpected file set"
+check_discovery "a renamed workflow cannot masquerade as a release file" renamed_files 1 "unexpected file set"
+check_discovery "a copied workflow cannot masquerade as a release file" copied_files 1 "unexpected file set"
+check_discovery "malformed release file data is refused" malformed_files 1 "malformed release-PR file data"
+check_discovery "a malformed release file page is refused" malformed_file_page 1 "malformed release-PR file data"
+check_discovery "a release file API failure is preserved" files_api_failure 1 "Could not list files"
+check_discovery "the generated release head is bound exactly" valid 0 \
+  "Discovered trusted" "head_sha=$sha" "$sha"
+check_discovery "a raced generated release head is refused" moved_head 1 \
+  "differs from generated" "" "$sha"
+check_discovery "a missing generated release PR is refused" none 1 \
+  "has no trusted pull request" "" "$sha"
 
 check_merge "a trusted release merge is discovered" valid 0 "exactly one trusted" "is_release_merge=true"
 check_merge "an ordinary merge is a clean no-op" merge_none 0 "did not merge" "is_release_merge=false"
@@ -827,17 +1356,70 @@ check_merge "a failed classic release status is refused" merge_failed_status 1 "
 check_merge "a foreign classic release status is refused" merge_foreign_status 1 "not a trusted success"
 check_merge "a foreign release status URL is refused" merge_foreign_url 1 "untrusted target URL"
 check_merge "a missing release status URL is refused" merge_missing_url 1 "malformed target URL"
+check_merge "a bare child run URL is refused" merge_bare_run_url 1 "does not name one workflow run attempt"
+check_merge "a rerun child attempt cannot replace dispatched evidence" merge_child_attempt_two 1 "not the dispatched child run's first attempt"
 check_merge "a status from the wrong workflow is refused" merge_wrong_run 1 "does not belong"
-check_merge "a status from the wrong main base is refused" merge_wrong_base 1 "does not belong"
-check_merge "a failed Release-plz run is refused" merge_failed_run 1 "does not belong"
-check_merge "an unfinished Release-plz run is not trusted yet" merge_pending_run 1 "did not finish"
+check_merge "a child run for the wrong release head is refused" merge_wrong_base 1 "does not belong"
+check_merge "a child run on the wrong branch is refused" merge_wrong_branch 1 "does not belong"
+check_merge "a child run from the wrong event is refused" merge_wrong_event 1 "does not belong"
+check_merge "a child run from the wrong actor is refused" merge_wrong_actor 1 "does not belong"
+check_merge "a child run with the wrong claim is refused" merge_wrong_title 1 "does not belong"
+check_merge "a child endpoint reporting another attempt is refused" merge_wrong_child_attempt 1 "does not belong"
+check_merge "a failed release-validation run is refused" merge_failed_run 1 "did not succeed"
+check_merge "an unfinished release-validation run is not trusted yet" merge_pending_run 1 "did not finish"
 check_merge "the status-to-completed race is retried" merge_retrying_run 0 "exactly one trusted" "is_release_merge=true" 2
-check_merge "malformed Release-plz run data is refused" merge_malformed_run 1 "malformed state"
-check_merge "a Release-plz run API failure is preserved" merge_run_api_failure 1 "Could not read Release-plz"
+check_merge "malformed release-validation run data is refused" merge_malformed_run 1 "malformed state"
+check_merge "a release-validation run API failure is preserved" merge_run_api_failure 1 "Could not read release-validation"
+check_merge "a child claim from the wrong parent workflow is refused" merge_wrong_parent_path 1 "trusted Release-plz parent"
+check_merge "a child claim from the wrong parent source is refused" merge_wrong_parent_head 1 "trusted Release-plz parent"
+check_merge "a child claim from the wrong parent branch is refused" merge_wrong_parent_branch 1 "trusted Release-plz parent"
+check_merge "a child claim from the wrong parent event is refused" merge_wrong_parent_event 1 "trusted Release-plz parent"
+check_merge "a child claim from the wrong parent attempt is refused" merge_wrong_parent_attempt 1 "trusted Release-plz parent"
+check_merge "a child claim from another parent repository is refused" merge_wrong_parent_repo 1 "trusted Release-plz parent"
+check_merge "a child claim with another parent head repository is refused" merge_wrong_parent_head_repo 1 "trusted Release-plz parent"
+check_merge "a failed claiming parent run is refused" merge_failed_parent_run 1 "did not succeed"
+check_merge "an unfinished claiming parent run is refused" merge_pending_parent_run 1 "did not finish"
+check_merge "the parent status-to-completed race is retried" merge_retrying_parent_run 0 "exactly one trusted" "is_release_merge=true" 2
+check_merge "a claiming parent run API failure is preserved" merge_parent_run_api_failure 1 "Could not read claiming"
+check_merge "malformed claiming parent data is refused" merge_malformed_parent_run 1 "trusted Release-plz parent"
+check_merge "a missing parent reporting job is refused" merge_missing_report_job 1 "lacks one exact successful reporting"
+check_merge "a failed parent reporting job is refused" merge_failed_report_job 1 "lacks one exact successful reporting"
+check_merge "duplicate parent reporting jobs are refused" merge_duplicate_report_job 1 "lacks one exact successful reporting"
+check_merge "a reporting job from another parent attempt is refused" merge_wrong_report_job_attempt 1 "lacks one exact successful reporting"
+check_merge "incomplete parent job data is refused" merge_incomplete_parent_jobs 1 "malformed claiming Release-plz job data"
+check_merge "malformed parent job data is refused" merge_malformed_parent_jobs 1 "malformed claiming Release-plz job data"
+check_merge "a parent jobs API failure is preserved" merge_parent_jobs_api_failure 1 "Could not read jobs for claiming"
+check_merge "a newer parent rerun supersedes old evidence" merge_newer_parent_attempt 1 "newer Release-plz attempt"
+check_merge "a parent recheck failure is preserved" merge_parent_recheck_failure 1 "Could not confirm the current"
+check_merge "a missing release identity artifact is refused" merge_identity_download_failure 1 "Could not download"
+check_merge "a release identity with the wrong head is refused" merge_bad_identity 1 "does not bind this release"
+check_merge "a release identity with the wrong base is refused" merge_bad_identity_base 1 "does not bind this release"
+check_merge "a release identity with the wrong attempt is refused" merge_bad_identity_attempt 1 "does not bind this release"
+check_merge "malformed release identity data is refused" merge_malformed_identity 1 "does not bind this release"
+check_merge "extra release identity files are refused" merge_extra_identity 1 "unexpected file set"
+check_merge "a linked release identity file is refused" merge_symlink_identity 1 "unexpected file set"
+check_merge "a missing release gate job is refused" merge_missing_gate 1 "lacks one exact successful"
+check_merge "a failed release gate job is refused" merge_failed_gate 1 "lacks one exact successful"
+check_merge "duplicate release gate jobs are refused" merge_duplicate_gate 1 "lacks one exact successful"
+check_merge "a gate job from another child attempt is refused" merge_wrong_gate_attempt 1 "lacks one exact successful"
+check_merge "incomplete release-validation job data is refused" merge_incomplete_jobs 1 "malformed release-validation job data"
+check_merge "malformed release-validation job data is refused" merge_malformed_jobs 1 "malformed release-validation job data"
+check_merge "a release-validation jobs API failure is preserved" merge_jobs_api_failure 1 "Could not read jobs"
 
 check_report "pending status is posted to the exact head" valid 0 "Release gate: pending" true
 check_report "success status is posted to the exact head" valid 0 "Release gate: success" true success current
-check_report "a failed run can finalize successfully on retry" valid 0 "Release gate: success" true success owned_failure
+check_report "failure status is posted from the exact pending claim" valid 0 "Release gate: failure" true failure current
+check_report "an exact pending retry is idempotent" valid 0 "already records pending" false pending current
+check_report "an exact success retry is idempotent" valid 0 "already records success" false success current_success
+check_report "an exact failure retry is idempotent" valid 0 "already records failure" false failure owned_failure
+check_report "a completed failure cannot be upgraded within its attempt" valid 1 "no longer owns" false success owned_failure
+check_report "a failed-job-only reporter rerun cannot reuse the old claim" valid 1 "no longer owns" false success owned_failure "" "" 2
+check_report "a failed-job-only pending rerun cannot mint a new claim" report_newer_attempt 2 "producer attempt" false pending none "" "" 2 1
+check_report "a fresh all-jobs attempt can post its pending claim" report_newer_attempt 0 "Release gate: pending" true pending none "" "" 2
+check_report "a fresh all-jobs attempt can finalize its own claim" report_newer_attempt 0 "Release gate: success" true success current_attempt_two "" "" 2
+check_report "a success cannot be downgraded to pending" valid 1 "cannot replace" false pending current_success
+check_report "a success cannot be downgraded to failure" valid 1 "no longer owns" false failure current_success
+check_report "a foreign bot claim is refused" valid 1 "untrusted creator" false pending foreign_claim
 check_report "a moved PR head is refused" moved_head 1 "no longer matches" false
 check_report "a closed release PR is refused" closed 1 "no longer matches" false
 check_report "a pull API failure is preserved" api_failure 1 "Could not read" false
@@ -845,19 +1427,48 @@ check_report "a status API failure is preserved" post_failure 1 "Could not post"
 check_report "a status query failure is preserved" status_query_failure 1 "Could not read existing" false
 check_report "malformed status data is refused" valid 1 "malformed commit-status" false pending malformed
 check_report "an older pending run cannot steal the claim" valid 1 "newer release validation" false pending newer
-check_report "an older final run cannot overwrite the claim" valid 1 "no longer owns" false success newer
+check_report "an older final run cannot overwrite the claim" valid 1 "newer release validation" false success newer
+check_report "a newer attempt cannot be overwritten" valid 1 "newer release validation" false pending newer_attempt
+check_report "a stale reporter is rejected at the final parent recheck" report_newer_attempt 1 "newer Release-plz attempt" false
+check_report "a release PR on another main base is refused" report_wrong_base 1 "invalid parent source" false
+check_report "a reporter from the wrong workflow is refused" report_wrong_parent_path 1 "does not belong" false
+check_report "a parent recheck API failure is preserved" report_parent_recheck_failure 1 "newer Release-plz attempt" false
+check_report "a bare claim URL is refused" valid 2 "Invalid release-status run URL" false pending none \
+  https://github.com/test/project/actions/runs/98
+check_report "a bare success target URL is refused" valid 2 "Invalid release-status run URL" false success none "" \
+  https://github.com/test/project/actions/runs/199
+check_report "a cross-repository claim URL is refused" valid 2 "do not belong" false pending none \
+  https://github.com/other/project/actions/runs/98/attempts/1
+check_report "a pending status cannot target a child" valid 2 "must target its claiming" false pending none "" \
+  https://github.com/test/project/actions/runs/199/attempts/1
+check_report "a success cannot target its parent claim" valid 2 "must target its validated child" false success none "" \
+  https://github.com/test/project/actions/runs/98/attempts/1
 
-check_dispatch "an unreachable release API is preserved" unreachable 1 "Could not read release" false
-check_dispatch "a published release is an idempotent no-op" published 0 "already published" false
-check_dispatch "bad published release metadata is refused" bad_public_release 1 "unexpected title or notes" false
-check_dispatch "an invalid draft state is refused" nonsense 1 "unexpected draft state" false
-check_dispatch "a run query failure is preserved" run_query_failure 1 "Could not check existing" false
-check_dispatch "an invalid active-run count is refused" invalid_run_count 1 "invalid native publication" false
-check_dispatch "an active publication is not duplicated" active_dispatch 0 "already active" false
-check_dispatch "a draft with wrong notes is refused" bad_release_draft 1 "unexpected title or notes" false
-check_dispatch "a foreign draft is refused" foreign_release_draft 1 "trusted draft boundary" false
-check_dispatch "a dispatch API failure is preserved" dispatch_failure 1 "Could not dispatch" false
-check_dispatch "a draft dispatches at its immutable tag" valid 0 "Dispatched native" true
+check_validation "default-branch-controlled release validation is accepted" valid 0 "passed for" true
+check_validation "a raced release PR head is refused before dispatch" validation_moved_pull 1 "no longer matches" false
+check_validation "a raced release branch is refused before dispatch" validation_moved_branch 1 "no longer resolves" false
+check_validation "unexpected release files are refused before dispatch" validation_bad_files 1 "unexpected file set" false
+check_validation "a release branch lookup failure is preserved" validation_branch_api_failure 1 "Could not read release branch" false
+check_validation "a release CI dispatch failure is preserved" validation_dispatch_failure 1 "Could not dispatch" false
+check_validation "a release CI discovery failure is preserved" validation_runs_api_failure 1 "Could not discover" true
+check_validation "malformed release CI run data is refused" validation_malformed_runs 1 "malformed release-validation run data" true
+check_validation "a missing claimed child run times out" validation_no_run 1 "did not appear" true
+check_validation "duplicate claimed child runs are refused" validation_duplicate_run 1 "matched 2" true
+check_validation "a wrong child workflow is not claimed" validation_wrong_path 1 "did not appear" true
+check_validation "a wrong child source is not claimed" validation_wrong_run_sha 1 "did not appear" true
+check_validation "a wrong child actor is not claimed" validation_wrong_run_actor 1 "did not appear" true
+check_validation "a rerun child attempt is not claimed" validation_wrong_attempt 1 "did not appear" true
+check_validation "a mutated claimed child run is refused" validation_mutated_run 1 "crossed its trusted identity" true
+check_validation "a child run API failure is preserved" validation_run_api_failure 1 "Could not read release-validation run" true
+check_validation "an unfinished child run times out" validation_pending 1 "did not finish" true
+check_validation "a failed child run is refused" validation_failed 1 "did not succeed" true
+check_validation "a missing child release gate is refused" validation_missing_gate 1 "lacks one exact successful" true
+check_validation "a failed child release gate is refused" validation_failed_gate 1 "lacks one exact successful" true
+check_validation "duplicate child release gates are refused" validation_duplicate_gate 1 "lacks one exact successful" true
+check_validation "a gate from another child attempt is refused" validation_wrong_gate_attempt 1 "lacks one exact successful" true
+check_validation "incomplete child job data is refused" validation_incomplete_jobs 1 "malformed release-validation job data" true
+check_validation "malformed child job data is refused" validation_malformed_jobs 1 "malformed release-validation job data" true
+check_validation "a child jobs API failure is preserved" validation_jobs_api_failure 1 "Could not read jobs" true
 
 check_tag "an unchanged release tag is accepted" valid 0 "still resolves"
 check_tag "a missing release tag is refused" tag_missing 1 "Could not read release tag"

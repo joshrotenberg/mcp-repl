@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Finish or verify the registry -> tag -> draft sequence after cargo publish.
+# Verify the exact registry state after cargo publish.
 #
-# Registry upload is intentionally isolated from GitHub write credentials. If
-# an external service fails after accepting the crate, this separately
-# credentialed step makes the partial state recoverable without ever
-# republishing or moving a tag.
+# If an external service fails after accepting the crate, this credential-free
+# step makes the partial state recoverable without republishing. GitHub tag and
+# release mutation stays deferred until the complete release set is ready.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -14,13 +13,8 @@ fi
 
 source_sha=$1
 release_outcome=$2
-repository=${GITHUB_REPOSITORY:-}
-github_token=${GH_TOKEN:-}
-unset GH_TOKEN
 
-if [[ ! "$source_sha" =~ ^[0-9a-fA-F]{40}$ ||
-      ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
-      -z "$github_token" ]]; then
+if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Invalid source-release reconciliation environment" >&2
   exit 2
 fi
@@ -57,24 +51,13 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || -z "$target_dir" ]]; then
   echo "Cargo returned invalid release metadata" >&2
   exit 1
 fi
-tag="v$version"
-tag_message="chore: Release package mcp-repl version $version"
-tagger_name="github-actions[bot]"
-tagger_email="41898282+github-actions[bot]@users.noreply.github.com"
-
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
-notes_file="$work/release-notes.md"
 registry_response="$work/registry.json"
 
-if ! "$root/scripts/extract-release-notes.sh" "$version" > "$notes_file"; then
-  echo "Could not derive canonical release notes for $version" >&2
-  exit 1
-fi
-
-# Build the exact upload artifact without executing package code on the runner
-# that later receives a GitHub write token. Compilation already passed on a
-# separate credential-free runner; this archive is the resumed-upload identity.
+# Build the exact upload artifact without executing package code. Compilation
+# already passed on a separate credential-free runner; this archive is the
+# resumed-upload identity.
 cargo package --locked --no-verify
 crate_file="$target_dir/package/mcp-repl-$version.crate"
 if [[ ! -f "$crate_file" ]]; then
@@ -153,164 +136,8 @@ if [[ "$registry_checksum" != "$local_checksum" ]]; then
   exit 1
 fi
 
-if ! tag_refs=$(GH_TOKEN="$github_token" gh api \
-  "repos/${repository}/git/matching-refs/tags/${tag}"); then
-  echo "Could not list GitHub refs matching $tag" >&2
-  exit 1
-fi
-if ! exact_tag_refs=$(jq -ce \
-  --arg ref "refs/tags/$tag" '
-    if type != "array" then error("tag refs are not an array")
-    else [.[] | select(.ref == $ref)]
-    end
-  ' <<<"$tag_refs"); then
-  echo "GitHub returned malformed tag-ref data" >&2
-  exit 1
-fi
-tag_count=$(jq -r 'length' <<<"$exact_tag_refs")
-case "$tag_count" in
-  0)
-    if ! tag_object=$(GH_TOKEN="$github_token" gh api \
-      --method POST \
-      "repos/${repository}/git/tags" \
-      -f tag="$tag" \
-      -f message="$tag_message" \
-      -f object="$source_sha" \
-      -f type=commit \
-      -f "tagger[name]=$tagger_name" \
-      -f "tagger[email]=$tagger_email"); then
-      echo "Could not create annotated tag object for $tag" >&2
-      exit 1
-    fi
-    if ! tag_object_sha=$(jq -er \
-      --arg tag "$tag" \
-      --arg message "$tag_message" \
-      --arg source_sha "$source_sha" \
-      --arg tagger_name "$tagger_name" \
-      --arg tagger_email "$tagger_email" '
-        select(.tag == $tag) |
-        select(.message == $message) |
-        select(.object.type == "commit") |
-        select(.object.sha == $source_sha) |
-        select(.tagger.name == $tagger_name) |
-        select(.tagger.email == $tagger_email) |
-        .sha |
-        select(type == "string" and test("^[0-9a-fA-F]{40}$"))
-      ' \
-      <<<"$tag_object"); then
-      echo "GitHub returned a noncanonical annotated tag object for $tag" >&2
-      exit 1
-    fi
-    if ! GH_TOKEN="$github_token" gh api \
-      --method POST \
-      "repos/${repository}/git/refs" \
-      -f ref="refs/tags/$tag" \
-      -f sha="$tag_object_sha" \
-      > /dev/null; then
-      echo "Could not create release tag $tag at $source_sha" >&2
-      exit 1
-    fi
-    echo "Created release tag $tag at $source_sha"
-    ;;
-  1) ;;
-  *)
-    echo "GitHub returned multiple exact refs for $tag" >&2
-    exit 1
-    ;;
-esac
-
-GH_TOKEN="$github_token" GH_REPO="$repository" \
-  "$root/scripts/verify-release-tag.sh" "$tag" "$source_sha"
-
-read_releases() {
-  if ! release_pages=$(GH_TOKEN="$github_token" gh api --paginate --slurp \
-    "repos/${repository}/releases?per_page=100"); then
-    echo "Could not list GitHub releases" >&2
-    return 1
-  fi
-  if ! matching_releases=$(jq -ce \
-    --arg tag "$tag" '
-      if type != "array" or any(.[]; type != "array")
-      then error("release pages are malformed")
-      else [.[][] | select(.tag_name == $tag)]
-      end
-    ' <<<"$release_pages"); then
-    echo "GitHub returned malformed release data" >&2
-    return 1
-  fi
-}
-
-read_releases
-release_count=$(jq -r 'length' <<<"$matching_releases")
-case "$release_count" in
-  0)
-    if ! GH_TOKEN="$github_token" gh release create "$tag" \
-      --repo "$repository" \
-      --title "$tag" \
-      --notes-file "$notes_file" \
-      --draft \
-      --verify-tag; then
-      echo "Could not create draft GitHub release $tag" >&2
-      exit 1
-    fi
-    echo "Created draft GitHub release $tag"
-    read_releases
-    release_count=$(jq -r 'length' <<<"$matching_releases")
-    ;;
-  1) ;;
-  *)
-    echo "GitHub returned multiple releases for $tag" >&2
-    exit 1
-    ;;
-esac
-
-if [[ "$release_count" != 1 ]]; then
-  echo "GitHub did not retain exactly one release for $tag" >&2
-  exit 1
-fi
-
-if ! release_is_draft=$(jq -er '
-  .[0] |
-  if type != "object" then error("release is not an object")
-  elif (.draft | type) != "boolean" then error("draft state is not boolean")
-  else (.draft | tostring)
-  end
-' <<<"$matching_releases"); then
-  echo "GitHub release $tag returned an invalid draft state" >&2
-  exit 1
-fi
-
-case "$release_is_draft" in
-  true)
-    GH_TOKEN="$github_token" GH_REPO="$repository" \
-      "$root/scripts/verify-release.sh" "$tag" draft > /dev/null
-    echo "Draft GitHub release $tag is ready for native assets"
-    ;;
-  false)
-    # A retry can arrive after native publication completed. Accept that state
-    # only if the immutable release and its complete downloadable asset set
-    # pass the same content-bound recovery verification used by the binary
-    # publisher. This lets downstream jobs proceed without trusting a merely
-    # public, incomplete, or manually replaced release.
-    published_assets="$work/published-assets"
-    mkdir "$published_assets"
-    if ! GH_TOKEN="$github_token" gh release download "$tag" \
-      --repo "$repository" \
-      --dir "$published_assets"; then
-      echo "Could not download published release assets for $tag" >&2
-      exit 1
-    fi
-    GH_TOKEN="$github_token" GH_REPO="$repository" \
-      "$root/scripts/publish-release.sh" verify "$tag" \
-      "$published_assets" > /dev/null
-    echo "Published immutable GitHub release $tag is complete and ready for downstream recovery"
-    ;;
-  *)
-    echo "GitHub release $tag returned an invalid draft state: $release_is_draft" >&2
-    exit 1
-    ;;
-esac
+echo "Verified crates.io mcp-repl $version matches release source $source_sha"
 
 if [[ "$release_outcome" == failure ]]; then
-  echo "Recovered the safe external state after cargo publish reported failure"
+  echo "Recovered the exact registry state after cargo publish reported failure"
 fi
