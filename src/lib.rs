@@ -349,10 +349,10 @@ struct Args {
     trace: bool,
 
     /// Give up on a request that has produced no response after this many
-    /// seconds, and report a transport error. Applies to tool calls, `read`,
-    /// `prompt`, `bench` calls, and surface fetches, over both transports.
-    /// `0` waits indefinitely. `wait <id>` is exempt, since outliving the
-    /// call is what a task is for; give it its own `--timeout`.
+    /// seconds, and report a transport error. Applies to the initial handshake,
+    /// tool calls, `read`, `prompt`, `bench` calls, and surface fetches, over
+    /// both transports. `0` waits indefinitely. `wait <id>` is exempt, since
+    /// outliving the call is what a task is for; give it its own `--timeout`.
     /// Defaults to `[repl] request_timeout` in the config file, or 120.
     #[arg(long, value_name = "SECONDS", hide_short_help = true)]
     timeout: Option<u64>,
@@ -1427,7 +1427,7 @@ async fn establish_connection_retrying(
     client: &McpClient,
     protocol: ProtocolMode,
 ) -> tower_mcp::Result<ConnectionInfo> {
-    let first = match establish_connection(client, protocol).await {
+    let first = match with_deadline(establish_connection(client, protocol)).await {
         Ok(info) => return Ok(info),
         Err(e) => e,
     };
@@ -1436,7 +1436,7 @@ async fn establish_connection_retrying(
     }
     // The first error is the one worth reporting if this also fails: it says
     // what originally went wrong, where the second is usually a consequence.
-    establish_connection(client, protocol)
+    with_deadline(establish_connection(client, protocol))
         .await
         .map_err(|_| first)
 }

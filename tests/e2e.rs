@@ -2093,6 +2093,43 @@ async fn exercise_connection_failure_output() {
     );
 }
 
+/// The request deadline includes startup: a child that reads `initialize`
+/// but never answers cannot hang a script before its first command (#220).
+async fn exercise_initialization_timeout(fixture: &Path, temp: &TempDir) {
+    let exit_file = temp.path().join("ignored-initialize.exit");
+    let mut command = repl_command();
+    command
+        .args([
+            "--timeout",
+            "1",
+            "--no-history",
+            "--color",
+            "never",
+            "--exec",
+            "tools",
+        ])
+        .arg(fixture)
+        .args(["--tools-only", "--ignore-initialize"])
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let output = run(command, "ignored initialization", CASE_TIMEOUT).await;
+    assert_status(&output, 4, "ignored initialization");
+    assert!(
+        output.stdout.is_empty(),
+        "a failed handshake has no command output: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no response after 1s (--timeout)"),
+        "the configured deadline is reported: {stderr}"
+    );
+    assert_eq!(
+        wait_for_file(&exit_file, "ignored-initialize fixture shutdown").await,
+        "clean",
+        "timing out the handshake did not orderly close the stdio child"
+    );
+}
+
 /// Run the demo server, answering elicitation prompts from `stdin`.
 async fn run_demo_answering(answers: &str, case: &str, repl_args: &[&str]) -> Output {
     let mut command = repl_command();
@@ -2880,6 +2917,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let fixture = build_fixture().await;
         exercise_generators().await;
         exercise_connection_failure_output().await;
+        exercise_initialization_timeout(&fixture, &temp).await;
         exercise_elicitation_field_order().await;
         exercise_respond_needs_the_final_lifecycle().await;
         #[cfg(unix)]
