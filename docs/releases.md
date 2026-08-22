@@ -25,8 +25,11 @@ binaries.
    head. A moved or untrusted head is refused rather than receiving a stale
    status.
 5. The gate includes the ordinary quality, package, dependency, Windows-path,
-   workflow-lint, and exact Rust 1.90 MSRV jobs. On a `release-plz-` branch it
-   additionally builds and packages all five native release targets.
+   and workflow-lint jobs. Exact Rust 1.90.0 checks run natively on the
+   manifest's representative Linux, macOS, and Windows targets. Every
+   same-repository PR and exact release validation also builds, executes,
+   ABI-checks, and packages all manifest targets with stable Rust; untrusted
+   fork PRs cannot run that broader native matrix.
 6. Merge the release PR only after `Release gate` succeeds. The first-party
    merge preflight below makes every ordinary `main` commit ineligible for
    publication, and release-plz itself has publishing disabled.
@@ -49,13 +52,14 @@ binaries.
    must resolve to that SHA, checks it out by hash everywhere, rechecks the live
    tag before publication, and verifies the Cargo version. An active repository
    ruleset allows new `v*` tags but forbids updating or deleting them. The
-   workflow rebuilds the five-target matrix through the same reusable workflow
-   and `scripts/package-release.sh`; each job stores its archive and checksum as
-   a private workflow artifact.
-9. Only after all five jobs succeed does the final binary-asset job download
-   and verify the complete ten-file set, upload it to the same bot-owned draft,
-   re-read GitHub's complete paginated asset set, bind every stored digest and
-   size to the local file, and publish the GitHub release. Repository release
+   workflow rebuilds the manifest-derived target matrix through the same
+   reusable workflow and `scripts/package-release.sh`; each job stores its
+   archive and checksum as a private workflow artifact.
+9. Only after every manifest target succeeds does the final binary-asset job
+   download and verify the complete archive/checksum set, upload it to the
+   same bot-owned draft, re-read GitHub's complete paginated asset set, bind
+   every stored digest and size to the local file, and publish the GitHub
+   release. Repository release
    immutability then locks the release, tag, and assets and requires GitHub's
    generated release attestation. Container jobs build both architectures by
    digest. Every version's manifest job is allowed to run: a shared GitHub
@@ -87,8 +91,8 @@ needs no personal access token or long-lived GitHub App credential.
 
 Every external Action is pinned to a reviewed full commit SHA and checked by
 `scripts/check-actions-pinned.sh`; the trailing version comments let Dependabot
-continue proposing implementation updates without changing the explicit Rust
-1.90 MSRV input.
+continue proposing implementation updates without changing the manifest's
+explicit Rust 1.90.0 MSRV.
 
 Repository settings must keep **Enable release immutability** on. GitHub applies
 that policy only to releases created after it is enabled, and the published-
@@ -96,12 +100,15 @@ release verifier requires the API's `immutable: true` state before a retry is
 accepted. The separate `v*` tag ruleset remains defense in depth before a draft
 is published.
 
-The native build matrix lives in `.github/workflows/release-build.yml`; both the
-PR rehearsal and publication call it. Packaging logic likewise lives in
-`scripts/package-release.sh`, and verification/publication in
-`scripts/publish-release.sh`. The publication exact-set mirror is
-behavior-tested; the authoritative platform manifest tracked in #198 will
-replace it and the still-unverified installer mirror.
+`release-targets.json` is the authoritative native/container platform and Rust
+support contract. `scripts/release-targets.sh` validates its exact schema and
+exports the release, MSRV, publication, installer-check, and container views;
+workflow runner labels are accepted only from a fixed validator allowlist.
+Both the PR rehearsal and publication call the same reusable build workflow.
+Packaging logic lives in `scripts/package-release.sh`, Linux ABI enforcement in
+`scripts/verify-release-binary.sh`, and verification/publication in
+`scripts/publish-release.sh`. Behavior tests prove the generated views remain
+complete and that no production target table drifts away from the manifest.
 
 Those guards decide whether a release becomes public and otherwise run only
 while one is being cut, so `scripts/test-release-guards.sh` drives them
@@ -168,6 +175,9 @@ for script in scripts/*.sh; do bash -n "$script"; done
 ./scripts/test-release-workflow.sh
 ./scripts/test-source-release.sh
 ./scripts/test-container-manifest.sh
+./scripts/test-release-targets.sh
+./scripts/test-installer.sh
+./scripts/test-package-release.sh
 ./scripts/test-source-package.sh
 ```
 

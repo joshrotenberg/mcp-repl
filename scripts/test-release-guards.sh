@@ -18,6 +18,11 @@ publish="$root/scripts/publish-release.sh"
 metadata=$(cargo metadata --locked --no-deps --format-version 1)
 version=$(jq -er '.packages[] | select(.name == "mcp-repl") | .version' <<<"$metadata")
 tag="v$version"
+"$root/scripts/release-targets.sh" validate
+target_rows=()
+while IFS= read -r row; do
+  target_rows+=("$row")
+done < <("$root/scripts/release-targets.sh" rows)
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
@@ -177,16 +182,14 @@ sha256() {
   fi
 }
 
-# A complete set, as five successful build jobs would leave behind.
+# A complete set, as all manifest-derived build jobs would leave behind.
 seed_dist() {
   local dist=$1
   rm -rf "$dist"
   mkdir -p "$dist"
-  local target extension
-  for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
-                x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
-    extension=tar.gz
-    [[ "$target" == x86_64-pc-windows-msvc ]] && extension=zip
+  local row target extension _binary
+  for row in "${target_rows[@]}"; do
+    IFS=$'\t' read -r target extension _binary <<<"$row"
     echo "archive for $target" > "$dist/mcp-repl-${tag}-${target}.${extension}"
     (
       cd "$dist"

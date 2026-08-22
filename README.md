@@ -25,10 +25,15 @@ On macOS or Linux, install the prebuilt x86_64 or arm64 binary with:
 curl -fsSL https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/install.sh | sh
 ```
 
-It verifies the release's published checksum before unpacking, and installs
-to `~/.local/bin` unless `MCP_REPL_INSTALL_DIR` says otherwise. Reading a
-script before piping it to a shell is the better habit, and this one is
-short. On Windows, download the `mcp-repl-vX.Y.Z-x86_64-pc-windows-msvc.zip` from the
+It detects glibc 2.34+, musl, older glibc, and unknown Linux libc safely,
+verifies the release's self-naming checksum, and executes the staged binary
+before atomically replacing `~/.local/bin/mcp-repl` (or
+`MCP_REPL_INSTALL_DIR/mcp-repl`). A failed download, verification, or startup
+leaves an existing install untouched and prints the locked source-install
+fallback; this also covers a compatible prebuilt asset not yet being available
+in the selected release. Reading a script before piping it to a shell is the
+better habit. On Windows, download the
+`mcp-repl-vX.Y.Z-x86_64-pc-windows-msvc.zip` from the
 [latest release](https://github.com/joshrotenberg/mcp-repl/releases/latest),
 extract `mcp-repl.exe`, and place it on `PATH`.
 
@@ -38,7 +43,7 @@ Or install from source on any supported platform:
 cargo install --locked mcp-repl
 ```
 
-Source installs require Rust 1.90 or newer.
+Source installs require Rust 1.90.0 or newer.
 
 Or run it without installing anything:
 
