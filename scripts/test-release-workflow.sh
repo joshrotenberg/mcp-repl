@@ -108,6 +108,26 @@ fi
   echo "release source and epoch must come from frozen event checkouts" >&2
   exit 1
 }
+# shellcheck disable=SC2016
+attach_main_line=$(grep -Fn 'git checkout -B main "$GITHUB_SHA"' "$release_plz" |
+  cut -d: -f1)
+# shellcheck disable=SC2016
+release_plz_update_line=$(grep -Fn '"$RUNNER_TEMP/release-plz" update' "$release_plz" |
+  cut -d: -f1)
+# release-plz requires an attached branch and upstream to resolve repository
+# metadata. The attachment must preserve the frozen event SHA and happen before
+# candidate generation.
+# shellcheck disable=SC2016
+if [[ ! "$attach_main_line" =~ ^[0-9]+$ ||
+      ! "$release_plz_update_line" =~ ^[0-9]+$ ||
+      "$attach_main_line" -ge "$release_plz_update_line" ||
+      $(grep -Fc 'git branch --set-upstream-to=origin/main main' "$release_plz") -ne 1 ||
+      $(grep -Fc '"$(git symbolic-ref --short HEAD)" != main' "$release_plz") -ne 1 ||
+      $(grep -Fc '"$(git rev-parse HEAD)" != "$GITHUB_SHA"' "$release_plz") -ne 2 ||
+      $(grep -Fc "ref: \${{ github.sha }}" "$release_plz") -ne 2 ]]; then
+  echo "release-plz must attach the frozen event commit to origin/main" >&2
+  exit 1
+fi
 if grep -Fq 'Swatinem/rust-cache' "$release_build"; then
   echo "final native release builds must not consume shared Actions caches" >&2
   exit 1

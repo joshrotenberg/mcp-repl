@@ -34,6 +34,28 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Attach the frozen event commit to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ||
+                "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo 'Checkout does not match the frozen main event commit' >&2
+            exit 1
+          fi
+
+          # release-plz resolves repository metadata through the current
+          # branch's upstream. Keep the exact event commit, but give it the
+          # attached branch shape release-plz requires.
+          git checkout -B main "$GITHUB_SHA"
+          git branch --set-upstream-to=origin/main main
+          if [[ "$(git symbolic-ref --short HEAD)" != main ||
+                "$(git rev-parse HEAD)" != "$GITHUB_SHA" ||
+                "$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" !=
+                  origin/main ]]; then
+            echo 'Failed to attach the frozen event commit to origin/main' >&2
+            exit 1
+          fi
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
