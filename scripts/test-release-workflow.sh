@@ -40,6 +40,25 @@ ci_workflow="$root/.github/workflows/ci.yml"
 release_workflow="$root/.github/workflows/release-binaries.yml"
 release_plz="$root/.github/workflows/release-plz.yml"
 release_publish="$root/.github/workflows/release-publish.yml"
+download_artifact='actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c'
+download_count=$(grep -Fc "uses: $download_artifact" "$release_workflow")
+selector_count=$(grep -Fc './scripts/select-run-artifacts.sh' "$release_workflow")
+nonmerging_count=$(grep -Fc '          merge-multiple: false' "$release_workflow")
+if [[ "$download_count" -ne 8 ||
+      "$selector_count" -ne "$download_count" ||
+      "$nonmerging_count" -ne "$download_count" ]] ||
+  grep -Fq 'merge-multiple: true' "$release_workflow"; then
+  echo "release artifact downloads must preserve every matched artifact boundary" >&2
+  exit 1
+fi
+while IFS=: read -r action_line _; do
+  action_block=$(sed -n "${action_line},$((action_line + 6))p" "$release_workflow")
+  if [[ $(grep -Fc '          pattern:' <<<"$action_block") -ne 1 ||
+        $(grep -Fc '          merge-multiple: false' <<<"$action_block") -ne 1 ]]; then
+    echo "each release artifact download must use one non-merging pattern" >&2
+    exit 1
+  fi
+done < <(grep -nF "uses: $download_artifact" "$release_workflow")
 if grep -Fq 'github.event.pull_request.head.sha' "$ci_workflow"; then
   echo "CI must use one exact merge-or-release source for every release rehearsal" >&2
   exit 1

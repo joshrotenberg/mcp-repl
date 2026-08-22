@@ -127,9 +127,13 @@ binaries.
     An anonymous job pulls and executes the content-addressed staging index
     before any public release transition.
 12. The assembly job selects the newest complete artifact for each logical
-    target across all attempts in the same workflow run. It accepts exactly 39
-    durable assets: archive, checksum, SPDX, provenance bundle, and SBOM bundle
-    for each of seven native targets; three equivalent container evidence
+    target from the artifacts visible to the current workflow attempt. The
+    pinned downloader preserves named directories when a pattern matches
+    multiple artifacts, but flattens a sole match into the requested path. The
+    selector accepts that flat shape only for one requested logical artifact and
+    otherwise requires the attempt-named directory boundary. It accepts exactly
+    39 durable assets: archive, checksum, SPDX, provenance bundle, and SBOM
+    bundle for each of seven native targets; three equivalent container evidence
     files; and one canonical release record. That record binds the exact source,
     release-target manifest, native file identities, final container digest and
     runnable platform digests. It decodes every DSSE statement and rejects a
@@ -331,16 +335,22 @@ compact release record.
   byte-identical assets.
 - After the release-validation claim has cleared and the local reusable binary
   workflow is running, **Re-run failed jobs** remains supported for transient
-  binary-stage failures. The workflow downloads all same-run artifact attempts
-  and selects the newest complete attempt per logical target, so successful
-  prior jobs need not rebuild. This is distinct from the attempt-atomic
-  Release-plz validation chain above. **Re-run all jobs** remains fail-closed,
-  but regenerated Sigstore bundles are not guaranteed to be byte-identical; it
-  may therefore be unable to resume an existing partial draft. Prefer
-  **Re-run failed jobs** after final staging has begun. The exact assembled
-  release artifact is retained for 90 days to cover GitHub's supported rerun
-  window. Duplicate candidates within one attempt, missing targets, stale newer
-  attempts, or differing published bytes fail closed.
+  binary-stage failures. A partial rerun retains successful producer artifacts
+  from earlier attempts; the workflow selects the newest complete artifact per
+  logical target, so successful prior jobs need not rebuild. GitHub deletes the
+  earlier artifacts for a full rerun, which recreates the complete current
+  attempt instead. In either case, `actions/download-artifact` v5 and later
+  extract a sole pattern match directly into the requested path while placing
+  multiple matches in artifact-named directories. The selector supports both
+  shapes without treating one flattened artifact as multiple logical inputs.
+  This is distinct from the attempt-atomic Release-plz validation chain above.
+  **Re-run all jobs** remains fail-closed, but regenerated Sigstore bundles are
+  not guaranteed to be byte-identical; it may therefore be unable to resume an
+  existing partial draft. Prefer **Re-run failed jobs** after final staging has
+  begun. The exact assembled release artifact is retained for 90 days to cover
+  GitHub's supported rerun window. Duplicate candidates within one attempt,
+  missing targets, stale newer attempts, or differing published bytes fail
+  closed.
 - A retry after draft publication re-reads live state. It accepts only the same
   bot-owned immutable release with the exact 39 byte-identical assets; it never
   trusts a stale prerequisite output or replaces an asset. An older tag retry

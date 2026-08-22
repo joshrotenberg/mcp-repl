@@ -67,6 +67,8 @@ case "$*" in
     else
       printf '%s\0' \
         '.github/workflows/release-publish.yml' \
+        'scripts/select-run-artifacts.sh' \
+        'scripts/test-select-run-artifacts.sh' \
         'scripts/verify-release-recovery.sh' \
         'scripts/test-release-recovery.sh'
     fi

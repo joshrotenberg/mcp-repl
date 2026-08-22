@@ -168,8 +168,11 @@ jobs:
       - name: Download this attempt's exact native package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
+          # v5+ flattens a sole pattern match. Keeping merging disabled lets the
+          # selector distinguish that one safe shape from named multiple matches.
           pattern: release-${{ matrix.target }}-*
           path: artifact-downloads
+          merge-multiple: false
 
       - name: Select the newest producer attempt for this target
         shell: bash
@@ -373,6 +376,7 @@ jobs:
         with:
           pattern: container-linux-*
           path: artifact-downloads
+          merge-multiple: false
 
       - name: Select the newest producer attempt for every platform
         shell: bash
@@ -566,6 +570,7 @@ jobs:
         with:
           pattern: container-supply-*
           path: artifact-downloads
+          merge-multiple: false
 
       - name: Select the newest complete container identity
         run: |
@@ -627,12 +632,14 @@ jobs:
         with:
           pattern: native-supply-*
           path: artifact-downloads/native
+          merge-multiple: false
 
       - name: Download this attempt's container supply-chain set
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: container-supply-*
           path: artifact-downloads/container
+          merge-multiple: false
 
       - name: Select the newest complete producer artifacts
         shell: bash
@@ -727,6 +734,7 @@ jobs:
         with:
           pattern: container-supply-*
           path: artifact-downloads
+          merge-multiple: false
 
       - name: Select the newest complete container identity
         run: |
@@ -810,6 +818,7 @@ jobs:
         with:
           pattern: release-supply-*
           path: artifact-downloads
+          merge-multiple: false
 
       - name: Select the newest complete release set
         run: |
@@ -924,6 +933,7 @@ jobs:
         with:
           pattern: container-supply-*
           path: artifact-downloads
+          merge-multiple: false
 
       - name: Select the newest complete container identity
         run: |
