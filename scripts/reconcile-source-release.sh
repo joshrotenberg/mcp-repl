@@ -72,7 +72,14 @@ if ! tar -xOf "$crate_file" \
 fi
 if ! jq -e \
   --arg source_sha "$source_sha" '
-    .git.sha1 == $source_sha and .git.dirty == false
+    select(type == "object") |
+    select(.path_in_vcs == "") |
+    select((.git | type) == "object") |
+    select(.git.sha1 == $source_sha) |
+    select(
+      ((.git | has("dirty")) | not) or
+      ((.git.dirty | type) == "boolean" and .git.dirty == false)
+    )
   ' "$vcs_info" > /dev/null; then
   echo "source package VCS metadata does not identify clean commit $source_sha" >&2
   exit 1

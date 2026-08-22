@@ -2,15 +2,15 @@
 # Decide whether this exact main commit merged one trusted release-plz PR.
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 <github-output-file>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: $0 <github-output-file> [release-merge-sha]" >&2
   exit 2
 fi
 
 output_file=$1
 root=$(cd "$(dirname "$0")/.." && pwd)
 repository=${GITHUB_REPOSITORY:-}
-source_sha=${GITHUB_SHA:-}
+source_sha=${2:-${GITHUB_SHA:-}}
 if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
       ! "$source_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "Invalid release-merge environment" >&2

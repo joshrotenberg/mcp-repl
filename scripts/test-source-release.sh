@@ -305,11 +305,34 @@ case "${1:-}" in
     package_dir="$staging/mcp-repl-${TEST_VERSION:?}"
     mkdir -p "$package_dir"
     vcs_sha=${TEST_SOURCE_SHA:?}
-    dirty=false
     [ "${GH_MODE:-valid}" = wrong_vcs_sha ] && vcs_sha=dddddddddddddddddddddddddddddddddddddddd
-    [ "${GH_MODE:-valid}" = dirty_vcs ] && dirty=true
-    printf '{"git":{"sha1":"%s","dirty":%s}}\n' "$vcs_sha" "$dirty" \
-      > "$package_dir/.cargo_vcs_info.json"
+    case "${GH_MODE:-valid}" in
+      explicit_clean_vcs)
+        printf '{"git":{"sha1":"%s","dirty":false},"path_in_vcs":""}\n' "$vcs_sha"
+        ;;
+      dirty_vcs)
+        printf '{"git":{"sha1":"%s","dirty":true},"path_in_vcs":""}\n' "$vcs_sha"
+        ;;
+      null_dirty_vcs)
+        printf '{"git":{"sha1":"%s","dirty":null},"path_in_vcs":""}\n' "$vcs_sha"
+        ;;
+      string_dirty_vcs)
+        printf '{"git":{"sha1":"%s","dirty":"false"},"path_in_vcs":""}\n' "$vcs_sha"
+        ;;
+      number_dirty_vcs)
+        printf '{"git":{"sha1":"%s","dirty":0},"path_in_vcs":""}\n' "$vcs_sha"
+        ;;
+      malformed_git_vcs)
+        printf '{"git":[],"path_in_vcs":""}\n'
+        ;;
+      wrong_path_vcs)
+        printf '{"git":{"sha1":"%s"},"path_in_vcs":"nested"}\n' "$vcs_sha"
+        ;;
+      *)
+        # Cargo 1.97.1 omits `dirty` for a clean tree.
+        printf '{"git":{"sha1":"%s"},"path_in_vcs":""}\n' "$vcs_sha"
+        ;;
+    esac > "$package_dir/.cargo_vcs_info.json"
     tar -czf "$package_root/mcp-repl-${TEST_VERSION}.crate" \
       -C "$staging" "mcp-repl-${TEST_VERSION}"
     ;;
@@ -741,12 +764,18 @@ check_tag() {
 }
 
 check_reconcile "crate publication verifies without GitHub mutation" valid success 0 "Verified crates.io"
+check_reconcile "an explicit clean VCS marker is accepted" explicit_clean_vcs success 0 "Verified crates.io"
 check_reconcile "a crate-only action failure is recovered" valid failure 0 "Recovered the exact registry state"
 check_reconcile "an absent registry version is refused" registry_missing failure 1 "is not on crates.io"
 check_reconcile "a registry outage is preserved" registry_api_error failure 1 "Could not verify"
 check_reconcile "a registry network failure is preserved" registry_network_error failure 1 "Could not verify"
 check_reconcile "a package from the wrong commit is refused" wrong_vcs_sha success 1 "VCS metadata"
 check_reconcile "a dirty source package is refused" dirty_vcs success 1 "VCS metadata"
+check_reconcile "a null dirty marker is refused" null_dirty_vcs success 1 "VCS metadata"
+check_reconcile "a string dirty marker is refused" string_dirty_vcs success 1 "VCS metadata"
+check_reconcile "a numeric dirty marker is refused" number_dirty_vcs success 1 "VCS metadata"
+check_reconcile "malformed VCS git metadata is refused" malformed_git_vcs success 1 "VCS metadata"
+check_reconcile "a nested package path is refused" wrong_path_vcs success 1 "VCS metadata"
 check_reconcile "malformed registry metadata is refused" registry_bad_metadata success 1 "invalid or yanked"
 check_reconcile "a yanked registry version is refused" registry_yanked success 1 "invalid or yanked"
 check_reconcile "a mismatched registry package is refused" registry_bad_checksum success 1 "does not match"
