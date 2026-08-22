@@ -217,7 +217,10 @@ case "${1:-}" in
   -hW)
     machine='Advanced Micro Devices X86-64'
     [[ "$mode" == wrong_machine ]] && machine=AArch64
-    printf 'ELF Header:\n  Machine:                           %s\n' "$machine"
+    elf_type='EXEC (Executable file)'
+    [[ "$mode" == dyn ]] && elf_type='DYN (Position-Independent Executable file)'
+    printf 'ELF Header:\n  Type:                              %s\n  Machine:                           %s\n' \
+      "$elf_type" "$machine"
     ;;
   -lW)
     echo 'Program Headers:'
@@ -254,7 +257,9 @@ case "${1:-}" in
 esac
 STUB
 chmod 755 "$work/bin/readelf"
-printf '#!/bin/sh\nexit 0\n' > "$work/release-binary"
+# The generated script expands this at runtime.
+# shellcheck disable=SC2016
+printf '#!/bin/sh\n[ "${READELF_MODE:-}" != runtime_fail ]\n' > "$work/release-binary"
 chmod 755 "$work/release-binary"
 
 PATH="$work/bin:$PATH" READELF_MODE=static \
@@ -264,6 +269,12 @@ expect_fail "musl interpreter" "ELF INTERP is present" \
   "$verifier" x86_64-unknown-linux-musl "$work/release-binary"
 expect_fail "musl dependency" "ELF NEEDED is present" \
   env PATH="$work/bin:$PATH" READELF_MODE=needed \
+  "$verifier" x86_64-unknown-linux-musl "$work/release-binary"
+expect_fail "musl PIE" "not a non-PIE ELF executable" \
+  env PATH="$work/bin:$PATH" READELF_MODE=dyn \
+  "$verifier" x86_64-unknown-linux-musl "$work/release-binary"
+expect_fail "musl runtime smoke" "cannot execute its --version smoke test" \
+  env PATH="$work/bin:$PATH" READELF_MODE=runtime_fail \
   "$verifier" x86_64-unknown-linux-musl "$work/release-binary"
 PATH="$work/bin:$PATH" READELF_MODE=gnu_ok \
   "$verifier" x86_64-unknown-linux-gnu "$work/release-binary" > /dev/null

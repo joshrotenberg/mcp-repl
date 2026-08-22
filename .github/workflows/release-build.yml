@@ -97,10 +97,10 @@ jobs:
           cc_key=${RELEASE_TARGET//-/_}
           cargo_key=${cc_key^^}
           {
-            echo "CC=musl-gcc"
             echo "CC_${cc_key}=musl-gcc"
             echo "CARGO_TARGET_${cargo_key}_LINKER=musl-gcc"
-            echo "RUSTFLAGS=-C target-feature=+crt-static -C link-arg=-static"
+            # rust-lang/rust#95926: force non-PIE codegen for Jammy's musl-gcc.
+            echo "CARGO_TARGET_${cargo_key}_RUSTFLAGS=-C target-feature=+crt-static -C relocation-model=static"
           } >> "$GITHUB_ENV"
 
       - name: Build native binary

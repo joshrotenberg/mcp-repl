@@ -70,6 +70,10 @@ case "$arch" in
 esac
 
 if [[ "$libc" == musl ]]; then
+  if ! grep -Eq 'Type:[[:space:]]+EXEC([[:space:]]|$)' <<<"$header"; then
+    fail "musl artifact is not a non-PIE ELF executable (Type: EXEC)"
+  fi
+
   if ! program_headers=$(LC_ALL=C "$readelf_command" -lW "$binary" 2>&1); then
     fail "could not inspect ELF program headers: $program_headers"
   fi
@@ -83,6 +87,10 @@ if [[ "$libc" == musl ]]; then
   fi
   if grep -Eq '\(NEEDED\)' <<<"$dynamic_section"; then
     fail "musl artifact is dynamically linked: ELF NEEDED is present"
+  fi
+
+  if ! "$binary" --version > /dev/null 2>&1; then
+    fail "musl artifact cannot execute its --version smoke test"
   fi
 
   echo "Verified static musl ABI for $target"
