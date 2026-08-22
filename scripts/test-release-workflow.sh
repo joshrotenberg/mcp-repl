@@ -21,6 +21,240 @@ expected_notes="$work/expected-notes.md"
 "$root/scripts/extract-release-notes.sh" "$version" > "$expected_notes"
 export TEST_TAG="$tag" TEST_VERSION="$version" TEST_EXPECTED_NOTES="$expected_notes"
 
+sbom_predicate='--predicate-type https://spdx.dev/Document/v2.3'
+[[ $(grep -Fc -- "$sbom_predicate" \
+      "$root/.github/workflows/release-binaries.yml") -eq 3 ]] || {
+  echo "release workflow must verify all three SBOM paths with the exact SPDX 2.3 predicate" >&2
+  exit 1
+}
+[[ $(grep -Fc -- "$sbom_predicate" "$root/docs/releases.md") -eq 2 ]] || {
+  echo "release documentation must use the exact SPDX 2.3 predicate" >&2
+  exit 1
+}
+
+release_build="$root/.github/workflows/release-build.yml"
+ci_workflow="$root/.github/workflows/ci.yml"
+if grep -Fq 'github.event.pull_request.head.sha' "$ci_workflow"; then
+  echo "CI must use one exact merge-or-release source for every release rehearsal" >&2
+  exit 1
+fi
+# The release-target job validates and exports the source once; both reusable
+# builders and the aggregate gate must consume that exact output.
+# These single-quoted patterns intentionally match literal shell syntax.
+# shellcheck disable=SC2016
+[[ $(grep -Fc 'needs.release-targets.outputs.source_sha' "$ci_workflow") -eq 3 &&
+    $(grep -Fc 'source_sha=$(git rev-parse HEAD)' "$ci_workflow") -eq 1 &&
+    $(grep -Fc 'source_date_epoch=$(git show -s --format=%ct HEAD)' "$ci_workflow") -eq 1 ]] || {
+  echo "CI release source and epoch must come from one validated checkout" >&2
+  exit 1
+}
+
+touch_line=$(grep -Fn 'touch src/main.rs src/lib.rs' "$release_build" | cut -d: -f1)
+# These single-quoted patterns intentionally match literal workflow variables.
+# shellcheck disable=SC2016
+auditable_build_line=$(grep -Fn \
+  'cargo auditable build --release --locked --target "$RELEASE_TARGET"' \
+  "$release_build" | cut -d: -f1)
+# shellcheck disable=SC2016
+auditable_verify_line=$(grep -Fn \
+  '"$RELEASE_PYTHON" scripts/verify-auditable-binary.py' \
+  "$release_build" | cut -d: -f1)
+package_line=$(grep -Fn -- '- name: Rehearse release package' "$release_build" | cut -d: -f1)
+if [[ ! "$touch_line" =~ ^[0-9]+$ ||
+      ! "$auditable_build_line" =~ ^[0-9]+$ ||
+      ! "$auditable_verify_line" =~ ^[0-9]+$ ||
+      ! "$package_line" =~ ^[0-9]+$ ||
+      "$touch_line" -ge "$auditable_build_line" ||
+      "$auditable_build_line" -ge "$auditable_verify_line" ||
+      "$auditable_verify_line" -ge "$package_line" ]]; then
+  echo "native release must force an auditable relink and verify it before packaging" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+[[ $(grep -Fc '"target/$RELEASE_TARGET/release/$RELEASE_BINARY"' \
+      "$release_build") -eq 2 &&
+    $(grep -Fc '"$PACKAGE_VERSION"' "$release_build") -eq 1 ]] || {
+  echo "native audit verification must bind the matrix binary to the package version" >&2
+  exit 1
+}
+
+for candidate in python3 python; do
+  if command -v "$candidate" > /dev/null 2>&1 &&
+    "$candidate" -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' \
+      > /dev/null 2>&1; then
+    test_python=$candidate
+    break
+  fi
+done
+[[ -n "${test_python:-}" ]] || {
+  echo "Python 3.8 or newer is required for native audit verification tests" >&2
+  exit 1
+}
+
+audit_fixtures="$work/auditable"
+mkdir -p "$audit_fixtures"
+"$test_python" - "$audit_fixtures" "$version" <<'PY'
+import json
+import struct
+import sys
+import zlib
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+version = sys.argv[2]
+
+
+def payload(root_version, include_unreachable=False):
+    packages = [
+        {
+            "name": "mcp-repl",
+            "version": root_version,
+            "source": "local",
+            "kind": "runtime",
+            "dependencies": [1],
+            "root": True,
+        },
+        {
+            "name": "dependency",
+            "version": "1.0.0",
+            "source": "crates.io",
+        },
+    ]
+    if include_unreachable:
+        packages.append(
+            {
+                "name": "unreachable",
+                "version": "1.0.0",
+                "source": "crates.io",
+            }
+        )
+    inventory = {
+        "format": 1,
+        "packages": packages,
+    }
+    return zlib.compress(json.dumps(inventory, separators=(",", ":")).encode())
+
+
+def elf(audit_data):
+    names = b"\0.dep-v0\0.shstrtab\0"
+    audit_offset = 64
+    names_offset = audit_offset + len(audit_data)
+    section_offset = (names_offset + len(names) + 7) & ~7
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        b"\x7fELF\x02\x01\x01" + bytes(9),
+        2,
+        62,
+        1,
+        0,
+        0,
+        section_offset,
+        0,
+        64,
+        0,
+        0,
+        64,
+        3,
+        2,
+    )
+    section = struct.Struct("<IIQQQQIIQQ")
+    sections = (
+        bytes(section.size)
+        + section.pack(1, 1, 0, 0, audit_offset, len(audit_data), 0, 0, 1, 0)
+        + section.pack(9, 3, 0, 0, names_offset, len(names), 0, 0, 1, 0)
+    )
+    return header + audit_data + names + bytes(section_offset - names_offset - len(names)) + sections
+
+
+def macho(audit_data):
+    command_size = 72 + 80
+    audit_offset = 32 + command_size
+    header = struct.pack("<IiiIIIII", 0xFEEDFACF, 0x01000007, 3, 2, 1, command_size, 0, 0)
+    segment = struct.pack(
+        "<II16sQQQQiiII",
+        0x19,
+        command_size,
+        b"__DATA",
+        0,
+        len(audit_data),
+        audit_offset,
+        len(audit_data),
+        3,
+        3,
+        1,
+        0,
+    )
+    section = struct.pack(
+        "<16s16sQQIIIIIIII",
+        b".dep-v0",
+        b"__DATA",
+        0,
+        len(audit_data),
+        audit_offset,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    return header + segment + section + audit_data
+
+
+def pe(audit_data):
+    pe_offset = 64
+    optional_size = 240
+    section_table = pe_offset + 24 + optional_size
+    audit_offset = 512
+    raw_size = (len(audit_data) + 511) & ~511
+    dos = bytearray(pe_offset)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 60, pe_offset)
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, optional_size, 0x22)
+    optional = bytearray(optional_size)
+    struct.pack_into("<H", optional, 0, 0x20B)
+    section = struct.pack(
+        "<8sIIIIIIHHI",
+        b".dep-v0",
+        len(audit_data),
+        0,
+        raw_size,
+        audit_offset,
+        0,
+        0,
+        0,
+        0,
+        0x40000040,
+    )
+    prefix = bytes(dos) + b"PE\0\0" + coff + bytes(optional) + section
+    return prefix + bytes(audit_offset - len(prefix)) + audit_data + bytes(raw_size - len(audit_data))
+
+
+valid = payload(version)
+(destination / "valid.elf").write_bytes(elf(valid))
+(destination / "valid.macho").write_bytes(macho(valid))
+(destination / "valid.exe").write_bytes(pe(valid))
+(destination / "wrong-root.elf").write_bytes(elf(payload("9.9.9")))
+(destination / "unreachable.elf").write_bytes(
+    elf(payload(version, include_unreachable=True))
+)
+(destination / "missing.elf").write_bytes(elf(valid).replace(b".dep-v0", b".no-v00", 1))
+PY
+
+auditable_verifier="$root/scripts/verify-auditable-binary.py"
+for fixture in valid.elf valid.macho valid.exe; do
+  "$test_python" "$auditable_verifier" \
+    "$audit_fixtures/$fixture" mcp-repl "$version" > /dev/null
+done
+for fixture in wrong-root.elf unreachable.elf missing.elf; do
+  if "$test_python" "$auditable_verifier" \
+    "$audit_fixtures/$fixture" mcp-repl "$version" > /dev/null 2>&1; then
+    echo "native audit verifier accepted invalid fixture: $fixture" >&2
+    exit 1
+  fi
+done
+
 cat > "$work/bin/gh" <<'STUB'
 #!/bin/sh
 set -eu

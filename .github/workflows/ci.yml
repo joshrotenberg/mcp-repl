@@ -81,6 +81,8 @@ jobs:
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
       msrv: ${{ steps.targets.outputs.msrv }}
+      source_date_epoch: ${{ steps.targets.outputs.source_date_epoch }}
+      source_sha: ${{ steps.targets.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -89,11 +91,33 @@ jobs:
       - name: Validate and export exact-MSRV targets
         id: targets
         shell: bash
+        env:
+          EXPECTED_SOURCE: ${{ inputs.release_ref || github.sha }}
         run: |
           set -euo pipefail
+          if [[ ! "$EXPECTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release rehearsal source must be a lowercase 40-character commit" >&2
+            exit 1
+          fi
+          source_sha=$(git rev-parse HEAD)
+          if [[ "$source_sha" != "$EXPECTED_SOURCE" ]]; then
+            echo "Release target checkout $source_sha differs from $EXPECTED_SOURCE" >&2
+            exit 1
+          fi
           ./scripts/release-targets.sh validate
-          echo "matrix=$(./scripts/release-targets.sh msrv-matrix)" >> "$GITHUB_OUTPUT"
-          echo "msrv=$(jq -er '.rust.msrv' release-targets.json)" >> "$GITHUB_OUTPUT"
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          if [[ ! "$source_date_epoch" =~ ^[1-9][0-9]*$ ||
+                "$source_date_epoch" -lt 315532800 ||
+                "$source_date_epoch" -gt 2147483647 ]]; then
+            echo "Invalid source commit epoch: $source_date_epoch" >&2
+            exit 1
+          fi
+          {
+            echo "matrix=$(./scripts/release-targets.sh msrv-matrix)"
+            echo "msrv=$(jq -er '.rust.msrv' release-targets.json)"
+            echo "source_date_epoch=$source_date_epoch"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
 
   msrv:
     name: MSRV (${{ matrix.target }})
@@ -160,10 +184,14 @@ jobs:
         # and these only run while a release is being published. This drives
         # them against a stubbed `gh`.
         run: |
-          ./scripts/test-release-guards.sh
+          ./scripts/test-publish-release.sh
           ./scripts/test-release-workflow.sh
           ./scripts/test-source-release.sh
           ./scripts/test-container-manifest.sh
+          ./scripts/test-container-sbom.sh
+          ./scripts/test-release-record.sh
+          ./scripts/test-select-run-artifacts.sh
+          ./scripts/test-normalize-release-sbom.sh
           ./scripts/test-release-targets.sh
           ./scripts/test-installer.sh
           ./scripts/test-package-release.sh
@@ -190,11 +218,29 @@ jobs:
       (github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository) ||
       inputs.release_ref != ''
+    needs: release-targets
     uses: ./.github/workflows/release-build.yml
     with:
-      ref: ${{ inputs.release_ref || github.event.pull_request.head.sha || github.sha }}
+      ref: ${{ needs.release-targets.outputs.source_sha }}
       version: ci-${{ github.run_id }}-${{ github.run_attempt }}
       upload: false
+      toolchain: stable
+
+  release-container:
+    name: Container release rehearsal
+    if: >-
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      inputs.release_ref != ''
+    needs: release-targets
+    permissions:
+      contents: read
+    uses: ./.github/workflows/container-build.yml
+    with:
+      ref: ${{ needs.release-targets.outputs.source_sha }}
+      version: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      source_date_epoch: ${{ needs.release-targets.outputs.source_date_epoch }}
+      push: false
 
   release-gate:
     name: Release gate
@@ -211,6 +257,7 @@ jobs:
       - windows-directories
       - deny
       - release-native
+      - release-container
     runs-on: ubuntu-latest
     outputs:
       gate_result: ${{ steps.gate.outputs.gate_result }}
@@ -224,8 +271,10 @@ jobs:
       WINDOWS_DIRECTORIES: ${{ needs.windows-directories.result }}
       DEPENDENCIES: ${{ needs.deny.result }}
       NATIVE_RELEASE: ${{ needs.release-native.result }}
+      CONTAINER_RELEASE: ${{ needs.release-container.result }}
       RUN_NATIVE_RELEASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || inputs.release_ref != '' }}
-      VALIDATED_REF: ${{ inputs.release_ref || github.event.pull_request.head.sha || github.sha }}
+      RUN_CONTAINER_RELEASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || inputs.release_ref != '' }}
+      VALIDATED_REF: ${{ needs.release-targets.outputs.source_sha }}
     steps:
       - name: Require every release prerequisite
         id: gate
@@ -254,6 +303,16 @@ jobs:
 
           if [[ "$RUN_NATIVE_RELEASE" != true && "$NATIVE_RELEASE" != skipped ]]; then
             echo "Unexpected native release rehearsal status: $NATIVE_RELEASE" >&2
+            exit 1
+          fi
+
+          if [[ "$RUN_CONTAINER_RELEASE" == true && "$CONTAINER_RELEASE" != success ]]; then
+            echo "Container release rehearsal finished with status: $CONTAINER_RELEASE" >&2
+            exit 1
+          fi
+
+          if [[ "$RUN_CONTAINER_RELEASE" != true && "$CONTAINER_RELEASE" != skipped ]]; then
+            echo "Unexpected container release rehearsal status: $CONTAINER_RELEASE" >&2
             exit 1
           fi
 

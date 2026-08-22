@@ -1,14 +1,10 @@
-# Everything the build does not read. `target` above all: copying a host build
-# into the context is slow and its artifacts are for the wrong platform.
-target
-.git
-.github
-docs
-tests
-*.md
-!README.md
-.dockerignore
-Dockerfile
-install.sh
-deny.toml
-scripts
+# The Dockerfile reads exactly these manifests and source trees. A deny-by-
+# default context keeps unrelated repository files out of both build inputs
+# and provenance materials.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!examples/
+!examples/**

@@ -5,6 +5,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 reconcile="$root/scripts/reconcile-source-release.sh"
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+source_epoch=1700000001
 metadata=$(cargo metadata --locked --no-deps --format-version 1)
 version=$(jq -er '.packages[] | select(.name == "mcp-repl") | .version' <<<"$metadata")
 tag="v$version"
@@ -41,31 +42,250 @@ if ! awk -v prefix="## [$version] - " '
 fi
 
 # The published-retry path must prove that the already-public release is the
-# complete binary release that downstream recovery expects, not just a valid
-# release object. Seed every manifest-derived archive and self-bound checksum
-# produced by the native publication workflow.
+# complete supply-chain release that downstream recovery expects, not just a
+# valid release object. Seed the exact manifest-derived durable asset set and
+# build its canonical release record with the production helper.
 public_assets="$work/published-assets"
-mkdir -p "$public_assets"
+fixture_native="$work/published-native"
+fixture_container="$work/published-container"
+mkdir -p "$public_assets" "$fixture_native" "$fixture_container"
+
+sha256_file() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+write_spdx() {
+  local path=$1 name=$2 digest=$3
+  jq -nS \
+    --arg name "$name" \
+    --arg version "$version" \
+    --arg digest "$digest" \
+    --arg evident_comment "evident-by: indicates the package's existence is evident by the given file" \
+    --arg namespace "https://github.com/test/project/releases/download/$tag/$name.spdx.json#$sha-$digest" '{
+    spdxVersion: "SPDX-2.3",
+    SPDXID: "SPDXRef-DOCUMENT",
+    dataLicense: "CC0-1.0",
+    name: $name,
+    documentNamespace: $namespace,
+    creationInfo: {
+      created: "2023-11-14T22:13:21Z",
+      creators: ["Tool: source-release-test"]
+    },
+    packages: [
+      {
+        SPDXID: "SPDXRef-DocumentRoot",
+        name: $name,
+        versionInfo: $version,
+        supplier: "NOASSERTION",
+        downloadLocation: "NOASSERTION",
+        filesAnalyzed: false,
+        checksums: [{algorithm: "SHA256", checksumValue: $digest}],
+        licenseConcluded: "NOASSERTION",
+        licenseDeclared: "NOASSERTION",
+        copyrightText: "NOASSERTION",
+        primaryPackagePurpose: "FILE"
+      },
+      {
+        SPDXID: "SPDXRef-mcp-repl",
+        name: "mcp-repl",
+        versionInfo: $version,
+        downloadLocation: "NOASSERTION",
+        externalRefs: [{
+          referenceCategory: "PACKAGE-MANAGER",
+          referenceType: "purl",
+          referenceLocator: ("pkg:cargo/mcp-repl@" + $version)
+        }]
+      },
+      {
+        SPDXID: "SPDXRef-dependency",
+        name: "dependency",
+        versionInfo: "9.8.7",
+        externalRefs: [{
+          referenceCategory: "PACKAGE-MANAGER",
+          referenceType: "purl",
+          referenceLocator: "pkg:cargo/dependency@9.8.7"
+        }]
+      }
+    ],
+    files: [{SPDXID: "SPDXRef-File-mcp-repl", fileName: "mcp-repl"}],
+    relationships: [
+      {
+        spdxElementId: "SPDXRef-DOCUMENT",
+        relationshipType: "DESCRIBES",
+        relatedSpdxElement: "SPDXRef-DocumentRoot"
+      },
+      {
+        spdxElementId: "SPDXRef-DocumentRoot",
+        relationshipType: "CONTAINS",
+        relatedSpdxElement: "SPDXRef-mcp-repl"
+      },
+      {
+        spdxElementId: "SPDXRef-dependency",
+        relationshipType: "DEPENDENCY_OF",
+        relatedSpdxElement: "SPDXRef-mcp-repl"
+      },
+      {
+        spdxElementId: "SPDXRef-mcp-repl",
+        relationshipType: "OTHER",
+        comment: $evident_comment,
+        relatedSpdxElement: "SPDXRef-File-mcp-repl"
+      }
+    ]
+  }' > "$path"
+}
+
+write_bundle() {
+  local path=$1 subject_name=$2 subject_sha256=$3 predicate_type=$4
+  local predicate='{"fixture":true}'
+  if [[ $# -eq 5 ]]; then
+    predicate=$(jq -c . "$5")
+  fi
+  jq -nS \
+    --arg subject_name "$subject_name" \
+    --arg subject_sha256 "$subject_sha256" \
+    --arg predicate_type "$predicate_type" \
+    --argjson predicate "$predicate" '
+    {
+      _type: "https://in-toto.io/Statement/v1",
+      subject: [{name: $subject_name, digest: {sha256: $subject_sha256}}],
+      predicateType: $predicate_type,
+      predicate: $predicate
+    } as $statement |
+    {
+    mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+    verificationMaterial: {fixture: true},
+    dsseEnvelope: {
+      payloadType: "application/vnd.in-toto+json",
+      payload: ($statement | tojson | @base64),
+      signatures: [{sig: "fixture-signature"}]
+    }
+  }' > "$path"
+}
+
 for row in "${target_rows[@]}"; do
   IFS=$'\t' read -r target extension _binary <<<"$row"
   archive_name="mcp-repl-${tag}-${target}.${extension}"
-  printf 'archive for %s\n' "$target" > "$public_assets/$archive_name"
-  if command -v sha256sum > /dev/null 2>&1; then
-    checksum=$(sha256sum "$public_assets/$archive_name" | awk '{print $1}')
-  else
-    checksum=$(shasum -a 256 "$public_assets/$archive_name" | awk '{print $1}')
-  fi
+  printf 'archive for %s\n' "$target" > "$fixture_native/$archive_name"
+  checksum=$(sha256_file "$fixture_native/$archive_name")
   printf '%s  %s\n' "$checksum" "$archive_name" \
-    > "$public_assets/$archive_name.sha256"
+    > "$fixture_native/$archive_name.sha256"
+  write_spdx "$fixture_native/$archive_name.spdx.json" "$archive_name" "$checksum"
+  write_bundle \
+    "$fixture_native/$archive_name.provenance.sigstore.json" \
+    "$archive_name" "$checksum" "https://slsa.dev/provenance/v1"
+  write_bundle \
+    "$fixture_native/$archive_name.sbom.sigstore.json" \
+    "$archive_name" "$checksum" "https://spdx.dev/Document/v2.3" \
+    "$fixture_native/$archive_name.spdx.json"
 done
+
+platforms_file="$work/published-platforms.jsonl"
+: > "$platforms_file"
+platform_index=0
+while IFS= read -r platform; do
+  platform_index=$((platform_index + 1))
+  if [[ "$platform_index" -eq 1 ]]; then
+    runnable_digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    build_digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  else
+    runnable_digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    build_digest=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  fi
+  platform_file=${platform//\//-}.json
+  jq -nS \
+    --arg tag "$tag" \
+    --arg source_sha "$sha" \
+    --argjson source_epoch "$source_epoch" \
+    --arg platform "$platform" \
+    --arg runnable_digest "$runnable_digest" \
+    --arg build_digest "$build_digest" '{
+      schema_version: 1,
+      package: "mcp-repl",
+      tag: $tag,
+      source_sha: $source_sha,
+      source_epoch: $source_epoch,
+      image: "ghcr.io/test/project",
+      platform: $platform,
+      runnable_digest: $runnable_digest,
+      build_digest: $build_digest,
+      buildkit: {provenance: true, sbom: true}
+    }' > "$fixture_container/$platform_file"
+  jq -cn \
+    --arg platform "$platform" \
+    --arg runnable_digest "$runnable_digest" \
+    --arg build_digest "$build_digest" '{
+      platform: $platform,
+      runnable_digest: $runnable_digest,
+      build_digest: $build_digest
+    }' >> "$platforms_file"
+done < <("$root/scripts/release-targets.sh" container-platforms)
+platforms=$(jq -cs 'sort_by(.platform)' "$platforms_file")
+manifest_digest=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+jq -nS \
+  --arg tag "$tag" \
+  --arg source_sha "$sha" \
+  --argjson source_epoch "$source_epoch" \
+  --arg manifest_digest "$manifest_digest" \
+  --argjson platforms "$platforms" '{
+    schema_version: 1,
+    package: "mcp-repl",
+    tag: $tag,
+    source_sha: $source_sha,
+    source_epoch: $source_epoch,
+    image: "ghcr.io/test/project",
+    staging_ref: ("ghcr.io/test/project:sha-" + $source_sha),
+    manifest_digest: $manifest_digest,
+    platforms: $platforms
+  }' > "$fixture_container/image-manifest.json"
+
+container_base="$fixture_container/mcp-repl-$tag-container"
+"$root/scripts/build-container-sbom.sh" \
+  "$fixture_container/image-manifest.json" \
+  "$container_base.spdx.json" > /dev/null
+write_bundle \
+  "$container_base.provenance.sigstore.json" \
+  "ghcr.io/test/project" "${manifest_digest#sha256:}" \
+  "https://slsa.dev/provenance/v1"
+write_bundle \
+  "$container_base.sbom.sigstore.json" \
+  "ghcr.io/test/project" "${manifest_digest#sha256:}" \
+  "https://spdx.dev/Document/v2.3" \
+  "$container_base.spdx.json"
+"$root/scripts/build-release-record.sh" \
+  "$tag" "$sha" "$source_epoch" \
+  "$fixture_native" "$fixture_container" \
+  "$public_assets/mcp-repl-$tag-release.json" > /dev/null
+cp "$fixture_native"/* "$public_assets/"
+cp "$container_base.spdx.json" \
+  "$container_base.provenance.sigstore.json" \
+  "$container_base.sbom.sigstore.json" \
+  "$public_assets/"
+expected_public_assets=$("$root/scripts/release-targets.sh" \
+  expected-release-assets "$tag" | LC_ALL=C sort)
+actual_public_assets=$(find "$public_assets" -mindepth 1 -maxdepth 1 \
+  -exec basename {} \; | LC_ALL=C sort)
+[[ "$actual_public_assets" == "$expected_public_assets" ]] || {
+  echo "Published fixture does not contain the exact release asset set" >&2
+  exit 1
+}
 
 cat > "$work/bin/git" <<'STUB'
 #!/bin/sh
 set -eu
-if [ "${1:-} ${2:-}" = "rev-parse HEAD" ]; then
-  printf '%s\n' "${TEST_SOURCE_SHA:?}"
-  exit 0
-fi
+case "$*" in
+  "rev-parse HEAD" | "-C ${TEST_ROOT:?} rev-parse --verify HEAD")
+    printf '%s\n' "${TEST_SOURCE_SHA:?}"
+    exit 0
+    ;;
+  "-C ${TEST_ROOT:?} show -s --format=%ct HEAD")
+    printf '%s\n' "${TEST_SOURCE_EPOCH:?}"
+    exit 0
+    ;;
+esac
 echo "unexpected git call: $*" >&2
 exit 1
 STUB
@@ -448,6 +668,8 @@ check_reconcile() {
     SOURCE_RELEASE_MAX_ATTEMPTS=1 \
     SOURCE_RELEASE_RETRY_DELAY_SECONDS=0 \
     TEST_SOURCE_SHA="$sha" \
+    TEST_SOURCE_EPOCH="$source_epoch" \
+    TEST_ROOT="$root" \
     TEST_VERSION="$version" \
     TEST_TAG="$tag" \
     TEST_TARGET_DIR="$work/target" \
@@ -530,7 +752,8 @@ check_reconcile "an exact immutable public release recovers a repeated publish" 
 check_reconcile "a mutable public release is refused" mutable_public success 1 "trusted published boundary" none false
 check_reconcile "a public release with the wrong title is refused" wrong_public success 1 "unexpected title or notes" none false
 check_reconcile "a foreign public release is refused" foreign_public success 1 "trusted published boundary" none false
-check_reconcile "an incomplete public release is refused" incomplete_public success 1 "not the exact expected" none false
+check_reconcile "an incomplete public release is refused" incomplete_public success 1 \
+  "does not contain the exact expected" none false
 
 if [[ "$failures" -ne 0 ]]; then
   echo "$failures source release check(s) failed" >&2

@@ -3,11 +3,51 @@
   "package": "mcp-repl",
   "rust": {
     "msrv": "1.90.0",
-    "rehearsal": "stable"
+    "rehearsal": "stable",
+    "release": "1.97.1",
+    "cargo_auditable": "0.7.5",
+    "archive_python": "3.13.7"
   },
   "linux": {
     "gnu_max_glibc": "2.34",
     "fallback_libc": "musl"
+  },
+  "musl_toolchain": {
+    "version": "1.2.2-4",
+    "architectures": {
+      "x86_64": {
+        "deb_arch": "amd64",
+        "base_url": "https://archive.ubuntu.com/ubuntu/pool/universe/m/musl",
+        "sha256": {
+          "musl": "11540d5b484ae7e849232f4fbc18511bfa1d47ab764443aa0cc379f221c19110",
+          "musl-dev": "eca3c679ffc7fc88ddd4a70dc9ebe4c4cb8edefcc2ae5067b9de15f7a2aa9212",
+          "musl-tools": "e21d8ca30c5edad127917521117e6800791d9dc35b3d5de447058bbbd7aa893a"
+        }
+      },
+      "aarch64": {
+        "deb_arch": "arm64",
+        "base_url": "https://ports.ubuntu.com/ubuntu-ports/pool/universe/m/musl",
+        "sha256": {
+          "musl": "d3f136849d0740cac16804e40d9a31bb9339469be647c1a99bde004f2a286e99",
+          "musl-dev": "3658881ae289ceec722dba2b0c6c6265f3af1508c49e8d34f9a56d603cbbcecb",
+          "musl-tools": "eb734c0e0ddb5a9a30397199cf4a0b1bef47bef8496ecd1f9089461b19e1650f"
+        }
+      }
+    }
+  },
+  "container_build": {
+    "rust_base": "docker.io/library/rust:1.90.0-slim-bookworm@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9",
+    "runtime_base": "docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241",
+    "buildkit_image": "docker.io/moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8",
+    "buildx_version": "v0.36.1",
+    "buildx_sha256": {
+      "linux/amd64": "48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778",
+      "linux/arm64": "5d0cafd9d16afe1a0f0d9529885344ace2cc99efdd531b6c783c5455a6001569"
+    },
+    "sbom_generator": "docker.io/docker/buildkit-syft-scanner:1.11.0@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68",
+    "syft_version": "1.51.0",
+    "syft_linux_amd64_sha256": "2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f",
+    "exporter_compatibility_version": 30
   },
   "native": [
     {

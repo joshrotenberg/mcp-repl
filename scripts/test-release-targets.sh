@@ -93,9 +93,44 @@ container_matrix=$("$helper" container-matrix)
 [[ "$container_matrix" != *$'\n'* ]] || fail "container matrix is not compact JSON"
 jq -e '
   (.include | length) == 2 and
-  all(.include[]; (keys | sort) == (["platform", "runner"] | sort)) and
+  all(.include[];
+    (keys | sort) ==
+      (["platform", "runner", "platform_slug", "buildx_asset", "buildx_sha256"] | sort) and
+    (.platform_slug | test("^linux-(amd64|arm64)$")) and
+    (.buildx_asset | test("^buildx-v[0-9]+\\.[0-9]+\\.[0-9]+\\.linux-(amd64|arm64)$")) and
+    (.buildx_sha256 | test("^[0-9a-f]{64}$"))) and
   ([.include[].platform] | sort) == (["linux/amd64", "linux/arm64"] | sort)
 ' <<<"$container_matrix" > /dev/null || fail "container matrix is incomplete"
+
+container_build=$("$helper" container-build)
+[[ "$container_build" != *$'\n'* ]] || fail "container build config is not compact JSON"
+jq -e '
+  .exporter_compatibility_version == 30 and
+  ([.rust_base, .runtime_base, .buildkit_image, .sbom_generator] |
+    all(test("@sha256:[0-9a-f]{64}$"))) and
+  (.buildx_sha256 | length) == 2
+' <<<"$container_build" > /dev/null || fail "container build inputs are incomplete"
+
+for musl_arch in x86_64 aarch64; do
+  musl_toolchain=$("$helper" musl-toolchain "$musl_arch")
+  [[ "$musl_toolchain" != *$'\n'* ]] ||
+    fail "musl toolchain config for $musl_arch is not compact JSON"
+  jq -e --arg architecture "$musl_arch" '
+    .musl_toolchain as $tool |
+    $tool.architectures[$architecture] as $wanted |
+    $actual |
+    .version == $tool.version and
+    .deb_arch == $wanted.deb_arch and
+    .base_url == $wanted.base_url and
+    [.packages[].name] == ["musl", "musl-dev", "musl-tools"] and
+    all(.packages[];
+      .filename == (.name + "_" + $tool.version + "_" + $wanted.deb_arch + ".deb") and
+      .sha256 == $wanted.sha256[.name])
+  ' --argjson actual "$musl_toolchain" "$manifest" > /dev/null ||
+    fail "musl toolchain config for $musl_arch is incomplete"
+done
+expect_fail "unknown musl architecture" "unsupported musl toolchain architecture" \
+  "$helper" musl-toolchain riscv64
 
 container_platforms=$("$helper" container-platforms)
 container_platform_count=$(wc -l <<<"$container_platforms" | tr -d '[:space:]')
@@ -126,6 +161,29 @@ jq -e --arg version "$asset_version" --argjson actual "$asset_json" '
 ' "$manifest" > /dev/null || fail "expected-assets order or names are wrong"
 expect_fail "unsafe asset version" "unsafe release version" \
   "$helper" expected-assets '../v9.8.7'
+
+release_assets=$("$helper" expected-release-assets "$asset_version")
+release_asset_count=$(wc -l <<<"$release_assets" | tr -d '[:space:]')
+[[ "$release_asset_count" == 39 ]] ||
+  fail "expected-release-assets emitted $release_asset_count names instead of 39"
+release_asset_json=$(jq -Rsc 'split("\n") | map(select(length > 0))' \
+  <<<"$release_assets")
+jq -e --arg version "$asset_version" --argjson actual "$release_asset_json" '
+  .package as $package |
+  ([.native[] |
+    ("\($package)-\($version)-\(.target).\(.archive)") as $archive |
+    $archive,
+    "\($archive).sha256",
+    "\($archive).spdx.json",
+    "\($archive).provenance.sigstore.json",
+    "\($archive).sbom.sigstore.json"] +
+   ["\($package)-\($version)-container.spdx.json",
+    "\($package)-\($version)-container.provenance.sigstore.json",
+    "\($package)-\($version)-container.sbom.sigstore.json",
+    "\($package)-\($version)-release.json"]) == $actual
+' "$manifest" > /dev/null || fail "expected-release-assets order or names are wrong"
+expect_fail "noncanonical release asset version" "canonical vX.Y.Z" \
+  "$helper" expected-release-assets 'v01.2.3'
 
 bad="$work/malformed.json"
 printf '{\n' > "$bad"
@@ -167,13 +225,57 @@ jq '.containers = .containers[:-1]' "$manifest" > "$bad"
 expect_fail "incomplete container set" "complete fixed" \
   env RELEASE_TARGETS_FILE="$bad" "$helper" validate
 
+bad="$work/mutable-container-base.json"
+jq '.container_build.runtime_base = "docker.io/library/debian:bookworm-slim"' \
+  "$manifest" > "$bad"
+expect_fail "mutable container base" "complete immutable tool and base-image set" \
+  env RELEASE_TARGETS_FILE="$bad" "$helper" validate
+
+bad="$work/incomplete-buildx-checksums.json"
+jq 'del(.container_build.buildx_sha256["linux/arm64"])' "$manifest" > "$bad"
+expect_fail "incomplete Buildx checksums" "complete immutable tool and base-image set" \
+  env RELEASE_TARGETS_FILE="$bad" "$helper" validate
+
+bad="$work/invalid-musl-checksum.json"
+jq '.musl_toolchain.architectures.x86_64.sha256.musl = "nope"' \
+  "$manifest" > "$bad"
+expect_fail "invalid musl checksum" "exact checksummed Jammy package set" \
+  env RELEASE_TARGETS_FILE="$bad" "$helper" validate
+
+bad="$work/mutable-musl-url.json"
+jq '.musl_toolchain.architectures.aarch64.base_url = "https://example.invalid"' \
+  "$manifest" > "$bad"
+expect_fail "mutable musl URL" "exact checksummed Jammy package set" \
+  env RELEASE_TARGETS_FILE="$bad" "$helper" validate
+
 mirror_root="$work/mirrors"
-mkdir -p "$mirror_root"
+mkdir -p "$mirror_root/.github/workflows"
 cp "$manifest" "$mirror_root/release-targets.json"
 cp "$root/Cargo.toml" "$mirror_root/Cargo.toml"
 cp "$root/Dockerfile" "$mirror_root/Dockerfile"
 cp "$root/install.sh" "$mirror_root/install.sh"
+cp "$root/.github/workflows/release-plz.yml" \
+  "$root/.github/workflows/release-publish.yml" \
+  "$mirror_root/.github/workflows/"
 env RELEASE_TARGETS_ROOT="$mirror_root" "$helper" validate
+
+release_plz_drift="$work/release-plz-drift"
+cp -R "$mirror_root" "$release_plz_drift"
+sed 's/^[[:space:]]*RELEASE_RUST:.*/  RELEASE_RUST: 0.0.0/' \
+  "$release_plz_drift/.github/workflows/release-plz.yml" \
+  > "$release_plz_drift/.github/workflows/release-plz.yml.new"
+mv "$release_plz_drift/.github/workflows/release-plz.yml.new" \
+  "$release_plz_drift/.github/workflows/release-plz.yml"
+expect_fail "release-plz Rust drift" "release-plz.yml must mirror" \
+  env RELEASE_TARGETS_ROOT="$release_plz_drift" "$helper" validate
+
+release_publish_duplicate="$work/release-publish-duplicate"
+cp -R "$mirror_root" "$release_publish_duplicate"
+printf '  RELEASE_RUST: %s\n' "$(jq -r '.rust.release' "$manifest")" \
+  >> "$release_publish_duplicate/.github/workflows/release-publish.yml"
+expect_fail "release-publish duplicate Rust mirror" \
+  "release-publish.yml must mirror" \
+  env RELEASE_TARGETS_ROOT="$release_publish_duplicate" "$helper" validate
 
 cargo_drift="$work/cargo-drift"
 cp -R "$mirror_root" "$cargo_drift"
@@ -190,6 +292,22 @@ sed 's/^ARG RUST_VERSION=.*/ARG RUST_VERSION=0.0.0/' \
 mv "$docker_drift/Dockerfile.new" "$docker_drift/Dockerfile"
 expect_fail "Docker MSRV drift" "Dockerfile must mirror" \
   env RELEASE_TARGETS_ROOT="$docker_drift" "$helper" validate
+
+docker_base_drift="$work/docker-base-drift"
+cp -R "$mirror_root" "$docker_base_drift"
+sed 's/^ARG RUNTIME_BASE=.*/ARG RUNTIME_BASE=docker.io\/library\/debian:bookworm-slim@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/' \
+  "$docker_base_drift/Dockerfile" > "$docker_base_drift/Dockerfile.new"
+mv "$docker_base_drift/Dockerfile.new" "$docker_base_drift/Dockerfile"
+expect_fail "Docker base drift" "exact runtime base image" \
+  env RELEASE_TARGETS_ROOT="$docker_base_drift" "$helper" validate
+
+docker_auditable_drift="$work/docker-auditable-drift"
+cp -R "$mirror_root" "$docker_auditable_drift"
+sed 's/^ARG CARGO_AUDITABLE_VERSION=.*/ARG CARGO_AUDITABLE_VERSION=0.0.0/' \
+  "$docker_auditable_drift/Dockerfile" > "$docker_auditable_drift/Dockerfile.new"
+mv "$docker_auditable_drift/Dockerfile.new" "$docker_auditable_drift/Dockerfile"
+expect_fail "Docker cargo-auditable drift" "Dockerfile must mirror cargo-auditable" \
+  env RELEASE_TARGETS_ROOT="$docker_auditable_drift" "$helper" validate
 
 installer_msrv_drift="$work/installer-msrv-drift"
 cp -R "$mirror_root" "$installer_msrv_drift"

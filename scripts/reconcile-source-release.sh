@@ -292,8 +292,17 @@ case "$release_is_draft" in
     # pass the same content-bound recovery verification used by the binary
     # publisher. This lets downstream jobs proceed without trusting a merely
     # public, incomplete, or manually replaced release.
+    published_assets="$work/published-assets"
+    mkdir "$published_assets"
+    if ! GH_TOKEN="$github_token" gh release download "$tag" \
+      --repo "$repository" \
+      --dir "$published_assets"; then
+      echo "Could not download published release assets for $tag" >&2
+      exit 1
+    fi
     GH_TOKEN="$github_token" GH_REPO="$repository" \
-      "$root/scripts/publish-release.sh" "$tag" > /dev/null
+      "$root/scripts/publish-release.sh" verify "$tag" \
+      "$published_assets" > /dev/null
     echo "Published immutable GitHub release $tag is complete and ready for downstream recovery"
     ;;
   *)

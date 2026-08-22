@@ -49,34 +49,56 @@ binaries.
    GitHub objects existed, without ever colocating both high-value credentials
    or their runners. A separate job dispatches `release-binaries.yml`.
 8. Dispatch carries both the tag and the release-merge SHA. The binary workflow
-   must resolve to that SHA, checks it out by hash everywhere, rechecks the live
-   tag before publication, and verifies the Cargo version. An active repository
-   ruleset allows new `v*` tags but forbids updating or deleting them. The
-   workflow rebuilds the manifest-derived target matrix through the same
-   reusable workflow and `scripts/package-release.sh`; each job stores its
-   archive and checksum as a private workflow artifact.
-9. Only after every manifest target succeeds does the final binary-asset job
-   download and verify the complete archive/checksum set, upload it to the
-   same bot-owned draft, re-read GitHub's complete paginated asset set, bind
-   every stored digest and size to the local file, and publish the GitHub
-   release. Repository release
-   immutability then locks the release, tag, and assets and requires GitHub's
-   generated release attestation. Container jobs build both architectures by
-   digest. Every version's manifest job is allowed to run: a shared GitHub
-   concurrency key would coalesce rather than durably queue pending releases.
-   The job creates a version tag only after GHCR returns its exact not-found
-   response, and refuses an existing tag unless it contains the run's exact two
-   digests. The workflow-level per-tag concurrency key serializes repository
-   retries for the same version. It then reconciles `latest` to GitHub's current
-   bot-owned immutable release, re-reading that release around the mutable-tag
-   write so overlapping versions and older retries converge instead of leaving
-   `latest` rolled back. GHCR does not document an atomic create-if-absent or
-   immutable-tag control, so package write access must remain restricted to
-   this repository; #196 tracks attested digest identity and a registry-native
-   immutability boundary. A container failure can leave the source and binary
-   release public and the container publication partially complete, but every
-   completed workflow write is verified and a retry either resumes safely or
-   fails closed.
+   checks out that SHA everywhere, rechecks the immutable annotated tag, and
+   verifies Cargo's version. An active repository ruleset allows new `v*` tags
+   but forbids updating or deleting them. Native jobs use the manifest's exact
+   Rust, Python, cargo-auditable, and checksum-pinned musl inputs. They build all
+   seven targets, enforce Linux ABI policy, execute each binary, and create
+   archives whose paths, modes, timestamps, order, ZIP storage, and raw stored
+   gzip stream are independent of host archiver or zlib behavior.
+9. A separate read-only attestation matrix verifies each archive checksum,
+   creates a deterministic normalized SPDX 2.3 inventory, and signs both SLSA
+   v1 provenance and the SPDX predicate. The bundles are verified against the
+   exact repository workflow, source digest, tag ref, and public trusted root
+   before they become workflow artifacts.
+10. Container jobs use digest-pinned base, BuildKit, and SBOM-generator images
+    plus a checksum-pinned Buildx binary. Each architecture builds natively,
+    rewrites layer timestamps to the source commit epoch, pushes by digest, and
+    is executed by its runnable digest. The job hashes the raw registry index
+    and every mapped attestation manifest, checks descriptor sizes and subjects,
+    and requires aggregate BuildKit SLSA and SPDX predicates before claiming
+    that evidence in its platform metadata.
+11. The index job accepts exactly one metadata file per supported platform,
+    stages their attested multi-platform index at `sha-<source SHA>`, and creates
+    a deterministic index SPDX document. GitHub then signs SLSA v1 provenance
+    and the SPDX 2.3 predicate for the final index digest and also attaches both
+    to GHCR. Both the downloaded bundles and registry referrers are verified.
+    An anonymous job pulls and executes the content-addressed staging index
+    before any public release transition.
+12. The assembly job selects the newest complete artifact for each logical
+    target across all attempts in the same workflow run. It accepts exactly 39
+    durable assets: archive, checksum, SPDX, provenance bundle, and SBOM bundle
+    for each of seven native targets; three equivalent container evidence
+    files; and one canonical release record. That record binds the exact source,
+    release-target manifest, native file identities, final container digest and
+    runnable platform digests. It decodes every DSSE statement and rejects a
+    subject or predicate that belongs to anything else.
+13. Publication stages the exact 39-file set on the bot-owned draft without
+    replacement. A retry may fill a byte-identical partial subset, but an extra,
+    duplicate, or mismatched asset fails closed. While the release is still a
+    trusted draft, the workflow creates or verifies the immutable version image.
+    It then publishes the draft with GitHub's legacy latest-selection behavior;
+    repository release immutability locks its tag and assets. Lost responses and
+    failed-job reruns re-read live state and succeed only for the same immutable,
+    complete, byte-identical release.
+14. After publication, `latest` is reconciled to GitHub's current bot-owned
+    immutable latest release. The workflow re-reads that release around the
+    mutable-tag write so overlapping versions and older retries converge instead
+    of rolling it back. GHCR does not expose an immutable-tag policy, so package
+    write access stays restricted to this repository and every version/latest
+    read is compared to raw registry bytes by digest. A final anonymous job
+    executes both the version and `latest` images and proves that their raw
+    indexes identify the release record's digest.
 
 The status reporter is intentionally narrow and the whole update/validation
 graph is serialized. It runs from the trusted default branch, grants only its
@@ -100,22 +122,79 @@ release verifier requires the API's `immutable: true` state before a retry is
 accepted. The separate `v*` tag ruleset remains defense in depth before a draft
 is published.
 
-`release-targets.json` is the authoritative native/container platform and Rust
-support contract. `scripts/release-targets.sh` validates its exact schema and
-exports the release, MSRV, publication, installer-check, and container views;
-workflow runner labels are accepted only from a fixed validator allowlist.
-Both the PR rehearsal and publication call the same reusable build workflow.
-Packaging logic lives in `scripts/package-release.sh`, Linux ABI enforcement in
-`scripts/verify-release-binary.sh`, and verification/publication in
-`scripts/publish-release.sh`. Behavior tests prove the generated views remain
-complete and that no production target table drifts away from the manifest.
+`release-targets.json` is the authoritative native/container platform, ABI, and
+release-tool input contract. `scripts/release-targets.sh` validates its exact
+schema and its mirrors in Cargo, Docker, and the installer; workflow runner
+labels are accepted only from a fixed allowlist. The same reusable native and
+container workflows serve PR rehearsal and publication.
 
-Those guards decide whether a release becomes public and otherwise run only
-while one is being cut, so `scripts/test-release-guards.sh` drives them
-against a stubbed `gh`: an unreachable API, an already published release, a
-missing archive or checksum, an unexpected local or remote file, a checksum
-that does not verify, a mismatched remote digest, and the complete set that
-should publish. CI runs it in the workflow-lint job.
+Packaging lives in `scripts/package-release.sh`, Linux ABI enforcement in
+`scripts/verify-release-binary.sh`, container evidence in
+`scripts/publish-container-manifest.sh`, canonical identity assembly in
+`scripts/build-release-record.sh`, and GitHub publication in
+`scripts/publish-release.sh`. Their behavior suites exercise races, malformed
+schemas, mixed-attempt selection, partial uploads, lost responses, moved tags,
+unrelated SPDX documents, swapped DSSE subjects and predicates, missing OCI
+attestations, and byte-different retries. CI runs those suites in the
+workflow-lint job.
+
+## Verify a downloaded release
+
+The checksum is the quickest integrity check; the bundles add source/workflow
+identity. Download the archive, its four adjacent evidence files, and the
+canonical release record, then run:
+
+```bash
+archive=mcp-repl-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+tag=vX.Y.Z
+record=mcp-repl-$tag-release.json
+source_sha=$(jq -r '.source_sha' "$record")
+common=(
+  --repo joshrotenberg/mcp-repl
+  --signer-workflow joshrotenberg/mcp-repl/.github/workflows/release-binaries.yml
+  --source-ref "refs/tags/$tag"
+  --source-digest "$source_sha"
+  --deny-self-hosted-runners
+)
+sha256sum --check "$archive.sha256"
+gh attestation verify "$archive" \
+  --bundle "$archive.provenance.sigstore.json" \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  "${common[@]}"
+gh attestation verify "$archive" \
+  --bundle "$archive.sbom.sigstore.json" \
+  --predicate-type https://spdx.dev/Document/v2.3 \
+  "${common[@]}"
+```
+
+The release record names the final container index rather than a mutable tag:
+
+```bash
+tag=vX.Y.Z
+record=mcp-repl-$tag-release.json
+source_sha=$(jq -r '.source_sha' "$record")
+digest=$(jq -r '.container.manifest_digest' "$record")
+subject="oci://ghcr.io/joshrotenberg/mcp-repl@$digest"
+common=(
+  --repo joshrotenberg/mcp-repl
+  --signer-workflow joshrotenberg/mcp-repl/.github/workflows/release-binaries.yml
+  --source-ref "refs/tags/$tag"
+  --source-digest "$source_sha"
+  --deny-self-hosted-runners
+)
+gh attestation verify "$subject" \
+  --bundle "mcp-repl-$tag-container.provenance.sigstore.json" \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  "${common[@]}"
+gh attestation verify "$subject" \
+  --bundle "mcp-repl-$tag-container.sbom.sigstore.json" \
+  --predicate-type https://spdx.dev/Document/v2.3 \
+  "${common[@]}"
+```
+
+For a high-assurance audit, also hash every downloaded durable asset and compare
+its name, size, and SHA-256 with the corresponding identity in the canonical
+compact release record.
 
 ## Failure and retry behavior
 
@@ -135,28 +214,24 @@ should publish. CI runs it in the workflow-lint job.
   crate-only partial publication only after proving the exact archive's VCS and
   registry checksums; a yanked or mismatched crate, noncanonical or moved tag,
   conflicting draft, or mismatched canonical notes fails closed.
-- A failed native binary target after the crate is published leaves the GitHub
-  release in draft form. No incomplete binary release is public. A container
-  failure occurs after source and binary publication. It may leave the
-  version manifest present while `latest` is still unchanged; the
-  manifest job refuses a pre-existing version tag that differs from its exact
-  architecture digests.
-- Rerun **Release binaries** at the existing immutable tag after a transient
-  native or container failure with **Re-run all jobs**. GitHub artifacts are
-  scoped to a run attempt, so rerunning only failed jobs cannot reliably reuse
-  successful native packages or architecture digests from the prior attempt,
-  regardless of their retention period. The manifest job refuses anything
-  other than two distinct, regular SHA-256 digest filenames and will fail
-  closed if a fresh rebuild differs from an already-published version manifest.
-  The publication job downloads already-public immutable binary assets and
-  verifies their exact names, self-bound checksums, API digests, sizes, and
-  upload state; it does not assume a fresh native rebuild is byte-identical. An
-  older tag retry reconciles `latest` to GitHub's current immutable release, not
-  to itself. The workflow runs from the immutable tag, so a later `main`
-  workflow cannot silently attest different source while publishing old
-  binaries. If an existing container version conflicts or the tagged pipeline
-  itself is defective, stop and use a separately reviewed recovery workflow;
-  never replace a version tag or move the source tag.
+- A failed native target, container build, attestation, assembly, or staging
+  smoke after the crate is published leaves the GitHub release in draft form.
+  No incomplete binary/container release is public. Content-addressed platform
+  objects or a private partial draft may remain, but every retry verifies them
+  before reuse.
+- For transient failures in **Release binaries**, **Re-run failed jobs** is
+  supported. The workflow downloads all same-run artifact attempts and selects
+  the newest complete attempt per logical target, so successful prior jobs need
+  not rebuild. **Re-run all jobs** remains safe when a complete rebuild is
+  desired. Duplicate candidates within one attempt, missing targets, stale
+  newer attempts, or differing published bytes fail closed.
+- A retry after draft publication re-reads live state. It accepts only the same
+  bot-owned immutable release with the exact 39 byte-identical assets; it never
+  trusts a stale prerequisite output or replaces an asset. An older tag retry
+  reconciles `latest` to GitHub's current immutable latest release, not itself.
+  If an existing container version conflicts or the tagged pipeline itself is
+  defective, stop and use a separately reviewed recovery workflow; never move a
+  source tag, replace a version image, or disable release immutability.
 - Never manually publish the draft to work around a failed target. That would
   bypass the complete-set guarantee.
 
@@ -171,10 +246,14 @@ actionlint
 shellcheck install.sh scripts/*.sh
 sh -n install.sh
 for script in scripts/*.sh; do bash -n "$script"; done
-./scripts/test-release-guards.sh
+./scripts/test-publish-release.sh
 ./scripts/test-release-workflow.sh
 ./scripts/test-source-release.sh
 ./scripts/test-container-manifest.sh
+./scripts/test-container-sbom.sh
+./scripts/test-release-record.sh
+./scripts/test-select-run-artifacts.sh
+./scripts/test-normalize-release-sbom.sh
 ./scripts/test-release-targets.sh
 ./scripts/test-installer.sh
 ./scripts/test-package-release.sh
