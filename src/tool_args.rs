@@ -47,6 +47,7 @@ fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::V
         .and_then(|property| property.get("type"))
         .and_then(|kind| kind.as_str());
     match ty {
+        Some("string") => serde_json::Value::String(raw.to_string()),
         Some("integer") => raw
             .parse::<i64>()
             .map(Into::into)
@@ -120,6 +121,7 @@ mod tests {
                 "count": {"type": "integer"},
                 "ratio": {"type": "number"},
                 "enabled": {"type": "boolean"},
+                "text": {"type": "string"},
                 "items": {"type": "array"},
                 "metadata": {"type": "object"},
                 "untyped": {}
@@ -135,6 +137,7 @@ mod tests {
                 "count=2",
                 "ratio=1.5",
                 "enabled=true",
+                "text=null",
                 "items=[1,2]",
                 r#"metadata={"source":"test"}"#,
                 "untyped=null",
@@ -145,10 +148,21 @@ mod tests {
         assert_eq!(parsed["count"], 2);
         assert_eq!(parsed["ratio"], 1.5);
         assert_eq!(parsed["enabled"], true);
+        assert_eq!(parsed["text"], "null");
         assert_eq!(parsed["items"], json!([1, 2]));
         assert_eq!(parsed["metadata"], json!({"source": "test"}));
         assert_eq!(parsed["untyped"], serde_json::Value::Null);
         assert_eq!(parsed["bad_count"], "two");
+    }
+
+    #[test]
+    fn schema_declared_strings_preserve_json_looking_text() {
+        for raw in ["true", "123", "null", "[1,2]", r#"{"source":"test"}"#] {
+            let argument = format!("text={raw}");
+            let parsed = parse_kv_args(&schema(), &[&argument]).unwrap();
+            assert_eq!(parsed["text"], raw);
+            assert!(parsed["text"].is_string());
+        }
     }
 
     #[test]
@@ -199,6 +213,14 @@ mod tests {
         assert_eq!(filled["count"], json!(2));
         assert!(filled["count"].is_number());
         assert_eq!(filled["ratio"], 1.5);
+    }
+
+    #[test]
+    fn a_string_bind_preserves_json_looking_text() {
+        let parsed = parse_kv_args(&schema(), &["count=2"]).unwrap();
+        let filled = apply_binds(&schema(), &binds(&[("text", "true")]), parsed);
+        assert_eq!(filled["text"], "true");
+        assert!(filled["text"].is_string());
     }
 
     #[test]

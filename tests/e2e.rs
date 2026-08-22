@@ -2844,6 +2844,35 @@ async fn exercise_bind(fixture: &Path, temp: &TempDir) {
     );
 }
 
+/// Values that happen to be valid JSON literals still remain text when the
+/// tool schema declares a string (#221).
+async fn exercise_string_tool_arguments() {
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "--exec",
+        "echo message=true",
+        "--exec",
+        "echo message=123",
+        "--exec",
+        "echo message=null",
+        "--exec",
+        "echo message=[1,2]",
+    ]);
+    let output = run(command, "string tool arguments", CASE_TIMEOUT).await;
+    assert_success(&output, "string tool arguments");
+    let values = json_lines(&output, "string tool arguments");
+    assert_eq!(values.len(), 4, "one result per string tool argument");
+    for (value, expected) in values.iter().zip(["true", "123", "null", "[1,2]"]) {
+        assert_eq!(
+            value.pointer("/content/0/text"),
+            Some(&serde_json::json!(expected)),
+            "the schema-declared string changed JSON type: {value:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
@@ -2875,6 +2904,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_bearer_fd(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;
         exercise_bind(&fixture, &temp).await;
+        exercise_string_tool_arguments().await;
     })
     .await
     .expect("mcp-repl E2E suite exceeded its job-level timeout");
