@@ -84,14 +84,19 @@ editor behavior over a repository-wide vanity percentage.
 Adding or updating a dependency also needs:
 
 ```bash
-cargo deny check
+cargo deny check \
+  -D unmatched-skip \
+  -D unnecessary-skip \
+  advisories licenses bans sources
 ```
 
 which checks the graph against RUSTSEC advisories, the license allowlist in
-`deny.toml`, and the ban on wildcard versions and non-crates.io sources. CI
-runs it on every pull request and `main` push, and daily, since an advisory can
-be published against a dependency that has not changed. Install it with
-`cargo install cargo-deny`.
+`deny.toml`, the exact reviewed duplicate-version baseline, and the bans on
+wildcard versions and non-crates.io sources. New duplicate groups fail; a
+resolved or unmatched baseline entry also fails so the allowlist cannot become
+stale. CI runs it on every pull request and `main` push, and daily, since an
+advisory can be published against a dependency that has not changed. Install
+it with `cargo install cargo-deny`.
 
 ## Commit Messages
 
