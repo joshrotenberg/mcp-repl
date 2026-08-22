@@ -2822,6 +2822,36 @@ async fn exercise_bind(fixture: &Path, temp: &TempDir) {
         values[4]
     );
 
+    // `bench` promises the same prepared request as a direct call. Fill a
+    // required numeric argument from a bind, then make that bind invalid and
+    // prove an explicit benchmark argument still wins over it (#222).
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "--exec",
+        "bind value=100",
+        "--exec",
+        "bench convert from=celsius to=fahrenheit --n 1",
+        "--exec",
+        "bind value=not-a-number",
+        "--exec",
+        "bench convert value=100 from=celsius to=fahrenheit --n 1",
+    ]);
+    let output = run(command, "bench honors binds", CASE_TIMEOUT).await;
+    assert_success(&output, "bench honors binds");
+    let values = json_lines(&output, "bench honors binds");
+    assert_eq!(
+        values.len(),
+        4,
+        "two bind reports and two benchmark results"
+    );
+    for value in [&values[1], &values[3]] {
+        assert_eq!(value["calls"], 1, "{value:?}");
+        assert_eq!(value["ok"], 1, "{value:?}");
+        assert_eq!(value["errors"], 0, "{value:?}");
+    }
+
     // A bind for a parameter no tool declares warns at bind time rather than
     // failing silently at call time, and still succeeds.
     let mut command = repl_command();
