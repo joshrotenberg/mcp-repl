@@ -963,7 +963,7 @@ const BUILTIN_GUIDES: &[BuiltinGuide] = &[
     BuiltinGuide {
         name: "bench",
         details: &[
-            "Arguments are coerced exactly like a direct tool call. --n defaults to 20; --concurrency defaults to 1 and never exceeds the call count.",
+            "Arguments and active binds are resolved exactly like a direct tool call; an explicit bench argument wins over a bind. --n defaults to 20; --concurrency defaults to 1 and never exceeds the call count.",
             "The distribution uses successful calls. Failures are counted separately, the first error is shown, and any failure sets a non-zero exit status.",
         ],
         examples: &[
@@ -6082,6 +6082,7 @@ async fn handle_line(
             handle_bench(
                 client.as_ref().expect("connected above"),
                 surface,
+                binds,
                 schema_contracts,
                 rest,
                 background,
@@ -6680,6 +6681,7 @@ async fn dispatch_direct_tool(
 async fn handle_bench(
     client: &Arc<McpClient>,
     surface: &Arc<RwLock<Surface>>,
+    binds: &Arc<RwLock<Binds>>,
     schema_contracts: &schema_contract::ContractSet,
     rest: &[&str],
     background: bool,
@@ -6728,6 +6730,7 @@ async fn handle_bench(
             return;
         }
     };
+    let arguments = tool_args::apply_binds(&schema, &binds.read().unwrap(), arguments);
 
     let outcome = bench::run(client, &plan.tool, arguments, plan.n, plan.concurrency).await;
     // A run with failures in it exits non-zero, like any other failing
