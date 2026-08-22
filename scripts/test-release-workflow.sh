@@ -106,6 +106,44 @@ fi
   echo "native audit verification must bind the matrix binary to the package version" >&2
   exit 1
 }
+if grep -Fq 'cargo auditable --version' "$release_build" "$root/Dockerfile"; then
+  echo "cargo-auditable identity must not be confused with Cargo's global version flag" >&2
+  exit 1
+fi
+auditable_install_line=$(grep -Fn \
+  "cargo install --locked --version \"\$CARGO_AUDITABLE_VERSION\" cargo-auditable" \
+  "$release_build" | cut -d: -f1)
+auditable_metadata_line=$(grep -Fn \
+  "grep -Fx \"cargo-auditable v\$CARGO_AUDITABLE_VERSION:\"" \
+  "$release_build" | cut -d: -f1)
+auditable_command_line=$(grep -Fn 'command -v cargo-auditable > /dev/null' \
+  "$release_build" | cut -d: -f1)
+docker_auditable_install_line=$(grep -Fn \
+  "cargo install --locked --version \"\$CARGO_AUDITABLE_VERSION\" cargo-auditable" \
+  "$root/Dockerfile" | cut -d: -f1)
+docker_auditable_metadata_line=$(grep -Fn \
+  "grep -Fx \"cargo-auditable v\$CARGO_AUDITABLE_VERSION:\"" \
+  "$root/Dockerfile" | cut -d: -f1)
+docker_auditable_command_line=$(grep -Fn 'command -v cargo-auditable > /dev/null' \
+  "$root/Dockerfile" | cut -d: -f1)
+docker_auditable_build_line=$(grep -Fn 'cargo auditable build --release --locked' \
+  "$root/Dockerfile" | cut -d: -f1)
+if [[ ! "$auditable_install_line" =~ ^[0-9]+$ ||
+      ! "$auditable_metadata_line" =~ ^[0-9]+$ ||
+      ! "$auditable_command_line" =~ ^[0-9]+$ ||
+      ! "$docker_auditable_install_line" =~ ^[0-9]+$ ||
+      ! "$docker_auditable_metadata_line" =~ ^[0-9]+$ ||
+      ! "$docker_auditable_command_line" =~ ^[0-9]+$ ||
+      ! "$docker_auditable_build_line" =~ ^[0-9]+$ ||
+      "$auditable_install_line" -ge "$auditable_metadata_line" ||
+      "$auditable_metadata_line" -ge "$auditable_command_line" ||
+      "$auditable_command_line" -ge "$auditable_build_line" ||
+      "$docker_auditable_install_line" -ge "$docker_auditable_metadata_line" ||
+      "$docker_auditable_metadata_line" -ge "$docker_auditable_command_line" ||
+      "$docker_auditable_command_line" -ge "$docker_auditable_build_line" ]]; then
+  echo "native and container builds must verify cargo-auditable's installed package metadata" >&2
+  exit 1
+fi
 
 for candidate in python3 python; do
   if command -v "$candidate" > /dev/null 2>&1 &&

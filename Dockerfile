@@ -18,8 +18,9 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 WORKDIR /src
 
 RUN cargo install --locked --version "$CARGO_AUDITABLE_VERSION" cargo-auditable \
- && test "$(cargo auditable --version)" = \
-      "cargo-auditable $CARGO_AUDITABLE_VERSION"
+ && cargo install --list | \
+      grep -Fx "cargo-auditable v$CARGO_AUDITABLE_VERSION:" > /dev/null \
+ && command -v cargo-auditable > /dev/null
 
 # Dependencies first, from the manifests alone, so editing sources does not
 # rebuild the dependency graph. The dummy targets exist only to give cargo

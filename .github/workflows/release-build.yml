@@ -187,7 +187,12 @@ jobs:
         run: |
           set -euo pipefail
           cargo install --locked --version "$CARGO_AUDITABLE_VERSION" cargo-auditable
-          test "$(cargo auditable --version)" = "cargo-auditable $CARGO_AUDITABLE_VERSION"
+          if ! cargo install --list |
+            grep -Fx "cargo-auditable v$CARGO_AUDITABLE_VERSION:" > /dev/null ||
+            ! command -v cargo-auditable > /dev/null; then
+            echo "cargo-auditable $CARGO_AUDITABLE_VERSION was not installed exactly" >&2
+            exit 1
+          fi
 
       - name: Build and verify native binary with embedded dependency inventory
         shell: bash
