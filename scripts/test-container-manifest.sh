@@ -16,8 +16,17 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
 mkdir -p "$work/bin" "$work/base"
 
-export TEST_TAG=v0.3.0
-export TEST_NEXT_TAG=v0.3.1
+metadata=$(cargo metadata --locked --no-deps --format-version 1)
+fixture_version=$(jq -er \
+  '.packages[] | select(.name == "mcp-repl") | .version' <<<"$metadata")
+if [[ ! "$fixture_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "mcp-repl returned an invalid fixture version: $fixture_version" >&2
+  exit 1
+fi
+IFS=. read -r version_major version_minor version_patch <<<"$fixture_version"
+next_patch=$((10#$version_patch + 1))
+export TEST_TAG="v$fixture_version"
+export TEST_NEXT_TAG="v$version_major.$version_minor.$next_patch"
 export TEST_SOURCE_SHA=1111111111111111111111111111111111111111
 export TEST_OTHER_SOURCE_SHA=2222222222222222222222222222222222222222
 export TEST_SOURCE_EPOCH=1700000001
