@@ -12,6 +12,11 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "Could not determine the current mcp-repl version" >&2
   exit 1
 fi
+"$root/scripts/release-targets.sh" validate
+target_rows=()
+while IFS= read -r row; do
+  target_rows+=("$row")
+done < <("$root/scripts/release-targets.sh" rows)
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
@@ -37,14 +42,12 @@ fi
 
 # The published-retry path must prove that the already-public release is the
 # complete binary release that downstream recovery expects, not just a valid
-# release object. Seed the exact five archives and five self-bound checksums
+# release object. Seed every manifest-derived archive and self-bound checksum
 # produced by the native publication workflow.
 public_assets="$work/published-assets"
 mkdir -p "$public_assets"
-for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
-              x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
-  extension=tar.gz
-  [[ "$target" == x86_64-pc-windows-msvc ]] && extension=zip
+for row in "${target_rows[@]}"; do
+  IFS=$'\t' read -r target extension _binary <<<"$row"
   archive_name="mcp-repl-${tag}-${target}.${extension}"
   printf 'archive for %s\n' "$target" > "$public_assets/$archive_name"
   if command -v sha256sum > /dev/null 2>&1; then

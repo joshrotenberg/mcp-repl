@@ -2,7 +2,7 @@
 name = "mcp-repl"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.90.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/joshrotenberg/mcp-repl"
 readme = "README.md"

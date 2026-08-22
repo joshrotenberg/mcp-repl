@@ -27,22 +27,21 @@ if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
   exit 2
 fi
 
-targets=(
-  x86_64-unknown-linux-gnu
-  aarch64-unknown-linux-gnu
-  x86_64-apple-darwin
-  aarch64-apple-darwin
-  x86_64-pc-windows-msvc
-)
-
-expected_count=$((${#targets[@]} * 2))
+"$root/scripts/release-targets.sh" validate
+target_rows=()
+while IFS= read -r row; do
+  target_rows+=("$row")
+done < <("$root/scripts/release-targets.sh" rows)
 expected_asset_names=()
-for target in "${targets[@]}"; do
-  extension=tar.gz
-  [[ "$target" == x86_64-pc-windows-msvc ]] && extension=zip
-  archive_name="mcp-repl-${tag}-${target}.${extension}"
-  expected_asset_names+=("$archive_name" "$archive_name.sha256")
-done
+while IFS= read -r asset_name; do
+  expected_asset_names+=("$asset_name")
+done < <("$root/scripts/release-targets.sh" expected-assets "$tag")
+expected_count=${#expected_asset_names[@]}
+if [[ "${#target_rows[@]}" -eq 0 ||
+      "$expected_count" -ne $((${#target_rows[@]} * 2)) ]]; then
+  echo "Release target manifest produced an inconsistent asset set" >&2
+  exit 1
+fi
 
 assets=()
 verify_local_assets() {
@@ -52,9 +51,9 @@ verify_local_assets() {
   local entry_count actual_entries expected_entries
 
   assets=()
-  for target in "${targets[@]}"; do
-    extension=tar.gz
-    [[ "$target" == x86_64-pc-windows-msvc ]] && extension=zip
+  local row _binary
+  for row in "${target_rows[@]}"; do
+    IFS=$'\t' read -r target extension _binary <<<"$row"
     archive="${directory}/mcp-repl-${tag}-${target}.${extension}"
     # A bare test would exit through `set -e` and say nothing at all, leaving a
     # log that ends in a bare failure with no cause named anywhere.
@@ -216,7 +215,7 @@ fi
 
 # `gh release upload --clobber` replaces expected names but deliberately leaves
 # unrelated assets alone. Bind the complete remote release—not merely the
-# local directory—to the reviewed ten-file set before changing visibility.
+# local directory—to the manifest-derived exact set before changing visibility.
 load_remote_assets "$release_id"
 verify_remote_asset_content
 

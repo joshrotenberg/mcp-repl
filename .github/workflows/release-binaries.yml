@@ -3,9 +3,9 @@ name: Release binaries
 # Source-release reconciliation creates or verifies a draft GitHub release
 # before dispatching this workflow.
 # Every native target must build and package successfully before this workflow
-# uploads any public asset. The release is published only after all ten files
-# are present and their checksums verify, so a failed target cannot expose a
-# partial binary release.
+# uploads any public asset. The release is published only after the complete
+# manifest-derived archive and checksum set is present and verifies, so a
+# failed target cannot expose a partial binary release.
 on:
   workflow_dispatch:
     inputs:
@@ -30,12 +30,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      container_matrix: ${{ steps.source.outputs.container_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: Match the workflow ref, tag, and package version
+        id: source
         shell: bash
         env:
           TAG: ${{ inputs.tag }}
@@ -68,6 +71,9 @@ jobs:
             echo "Cargo version $version does not match release tag $TAG" >&2
             exit 1
           fi
+          ./scripts/release-targets.sh validate
+          echo "container_matrix=$(./scripts/release-targets.sh container-matrix)" \
+            >> "$GITHUB_OUTPUT"
 
   build:
     name: Build and package every target
@@ -120,22 +126,19 @@ jobs:
   # never exist on ghcr.io without the matching binaries on the release page.
   container:
     name: Build container image (${{ matrix.platform }})
-    needs: publish
-    runs-on: ${{ matrix.os }}
+    needs:
+      - verify
+      - publish
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Native runners per architecture, for the same reason the binaries
-          # use them: a Rust release build under QEMU emulation is slow enough
-          # to be its own failure mode.
-          - platform: linux/amd64
-            os: ubuntu-22.04
-          - platform: linux/arm64
-            os: ubuntu-22.04-arm
+      # Native runners per architecture, for the same reason the binaries use
+      # them: a Rust release build under QEMU is slow enough to be a failure
+      # mode of its own. The validated manifest owns both rows.
+      matrix: ${{ fromJSON(needs.verify.outputs.container_matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

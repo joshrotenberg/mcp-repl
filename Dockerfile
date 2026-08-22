@@ -1,7 +1,9 @@
 # Build the binary against the same source the release builds, so an image
 # tagged for a version contains that version rather than whatever the base
-# image happened to have.
-FROM rust:1.90-slim-bookworm AS build
+# image happened to have. release-targets.json owns this exact MSRV; its
+# validator keeps the Docker mirror synchronized.
+ARG RUST_VERSION=1.90.0
+FROM rust:${RUST_VERSION}-slim-bookworm AS build
 WORKDIR /src
 
 # Dependencies first, from the manifests alone, so editing sources does not

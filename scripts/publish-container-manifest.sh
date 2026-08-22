@@ -3,6 +3,9 @@
 # that differs, then reconcile `latest` to GitHub's current immutable release.
 set -euo pipefail
 
+root=$(cd "$(dirname "$0")/.." && pwd)
+release_targets="$root/scripts/release-targets.sh"
+
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "usage: $0 <vX.Y.Z> [digest-directory]" >&2
   exit 2
@@ -28,6 +31,20 @@ die() {
   echo "$*" >&2
   exit 1
 }
+
+if ! platform_output=$("$release_targets" container-platforms); then
+  die "Could not load the supported container platforms"
+fi
+expected_platforms=()
+while IFS= read -r platform; do
+  [[ -n "$platform" ]] && expected_platforms+=("$platform")
+done <<<"$platform_output"
+expected_platform_count=${#expected_platforms[@]}
+if [[ "$expected_platform_count" -eq 0 ]]; then
+  die "The release target manifest contains no container platforms"
+fi
+expected_platforms_json=$(printf '%s\n' "${expected_platforms[@]}" |
+  jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
 
 trusted_release_tag() {
   local endpoint=$1
@@ -57,24 +74,24 @@ manifest_digest_set() {
   local raw=$1
   local label=$2
 
-  jq -er --arg label "$label" '
+  jq -er --arg label "$label" --argjson expected "$expected_platforms_json" '
     if
       type == "object" and
       (.manifests | type) == "array" and
-      (.manifests | length) == 2 and
-      ([.manifests[].digest] | unique | length) == 2 and
+      (.manifests | length) == ($expected | length) and
+      ([.manifests[].digest] | unique | length) == ($expected | length) and
       ([.manifests[].digest] |
         all(type == "string" and test("^sha256:[0-9a-f]{64}$"))) and
       ([.manifests[].platform | (.os + "/" + .architecture)] | sort) ==
-        ["linux/amd64", "linux/arm64"]
+        $expected
     then
       [.manifests[].digest] | sort | .[]
     else
-      error($label + " is not the exact two-platform manifest")
+      error($label + " is not the exact supported-platform manifest")
     end
   ' <<<"$raw" 2> "$work/jq-error" || {
     sed -n '1,5p' "$work/jq-error" >&2
-    die "$label is not the exact two-platform manifest"
+    die "$label is not the exact supported-platform manifest"
   }
 }
 
@@ -93,8 +110,8 @@ entries=()
 while IFS= read -r -d '' entry; do
   entries+=("$entry")
 done < <(find "$digest_dir" -mindepth 1 -maxdepth 1 -print0)
-if [[ ${#entries[@]} -ne 2 ]]; then
-  die "Expected exactly two architecture digest artifacts, found ${#entries[@]}"
+if [[ ${#entries[@]} -ne "$expected_platform_count" ]]; then
+  die "Expected exactly $expected_platform_count architecture digest artifacts, found ${#entries[@]}"
 fi
 
 refs=()

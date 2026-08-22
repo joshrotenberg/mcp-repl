@@ -42,6 +42,18 @@ It tests and installs the extracted crate with its lockfile, then executes the
 installed binary. Repository-only fixtures and release infrastructure are
 required to stay out of that source package.
 
+Release platform, workflow, or installer changes additionally need:
+
+```bash
+./scripts/release-targets.sh validate
+./scripts/test-release-targets.sh
+./scripts/test-installer.sh
+./scripts/test-package-release.sh
+```
+
+`release-targets.json` is the sole platform/MSRV inventory; do not copy a
+production target table into a workflow, publication guard, or installer.
+
 The command, routing/path, imported-config, wire-redaction, and alias
 boundaries also have a dependency-free deterministic property corpus. Run it
 on its own with:

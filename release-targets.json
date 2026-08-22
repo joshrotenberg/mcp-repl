@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "package": "mcp-repl",
+  "rust": {
+    "msrv": "1.90.0",
+    "rehearsal": "stable"
+  },
+  "linux": {
+    "gnu_max_glibc": "2.34",
+    "fallback_libc": "musl"
+  },
+  "native": [
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "runner": "ubuntu-22.04",
+      "os": "linux",
+      "arch": "x86_64",
+      "libc": "gnu",
+      "archive": "tar.gz",
+      "binary": "mcp-repl",
+      "installer": {
+        "uname_s": "Linux",
+        "uname_m": [
+          "x86_64",
+          "amd64"
+        ]
+      }
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "runner": "ubuntu-22.04-arm",
+      "os": "linux",
+      "arch": "aarch64",
+      "libc": "gnu",
+      "archive": "tar.gz",
+      "binary": "mcp-repl",
+      "installer": {
+        "uname_s": "Linux",
+        "uname_m": [
+          "aarch64",
+          "arm64"
+        ]
+      }
+    },
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "runner": "ubuntu-22.04",
+      "os": "linux",
+      "arch": "x86_64",
+      "libc": "musl",
+      "archive": "tar.gz",
+      "binary": "mcp-repl",
+      "installer": {
+        "uname_s": "Linux",
+        "uname_m": [
+          "x86_64",
+          "amd64"
+        ]
+      }
+    },
+    {
+      "target": "aarch64-unknown-linux-musl",
+      "runner": "ubuntu-22.04-arm",
+      "os": "linux",
+      "arch": "aarch64",
+      "libc": "musl",
+      "archive": "tar.gz",
+      "binary": "mcp-repl",
+      "installer": {
+        "uname_s": "Linux",
+        "uname_m": [
+          "aarch64",
+          "arm64"
+        ]
+      }
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "runner": "macos-15-intel",
+      "os": "macos",
+      "arch": "x86_64",
+      "libc": null,
+      "archive": "tar.gz",
+      "binary": "mcp-repl",
+      "installer": {
+        "uname_s": "Darwin",
+        "uname_m": [
+          "x86_64",
+          "amd64"
+        ]
+      }
+    },
+    {
+      "target": "aarch64-apple-darwin",
+      "runner": "macos-15",
+      "os": "macos",
+      "arch": "aarch64",
+      "libc": null,
+      "archive": "tar.gz",
+      "binary": "mcp-repl",
+      "installer": {
+        "uname_s": "Darwin",
+        "uname_m": [
+          "aarch64",
+          "arm64"
+        ]
+      }
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "runner": "windows-2025",
+      "os": "windows",
+      "arch": "x86_64",
+      "libc": null,
+      "archive": "zip",
+      "binary": "mcp-repl.exe",
+      "installer": null
+    }
+  ],
+  "msrv": [
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "runner": "ubuntu-22.04"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "runner": "macos-15-intel"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "runner": "windows-2025"
+    }
+  ],
+  "containers": [
+    {
+      "platform": "linux/amd64",
+      "runner": "ubuntu-22.04"
+    },
+    {
+      "platform": "linux/arm64",
+      "runner": "ubuntu-22.04-arm"
+    }
+  ]
+}
