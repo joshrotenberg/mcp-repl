@@ -479,6 +479,12 @@ pull_json() {
     cross_repo | validation_cross_repo) repository=other/project ;;
     wrong_author | validation_wrong_author) author=octocat; author_type=User ;;
     moved_head | validation_moved_pull) head_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    propagating_head)
+      if [ ! -f "${GH_DISCOVERY_STATE:?}" ]; then
+        touch "$GH_DISCOVERY_STATE"
+        head_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      fi
+      ;;
     validation_wrong_branch) head_branch=release-plz-other ;;
     report_wrong_base) base_sha=dddddddddddddddddddddddddddddddddddddddd ;;
     bad_sha) head_sha=short ;;
@@ -578,8 +584,30 @@ if [ "${1:-}" = api ]; then
     --paginate)
       case "$*" in
         "--paginate --slurp repos/test/project/pulls?state=open&base=main&per_page=100")
+          if [ -n "${GH_DISCOVERY_LOG:-}" ]; then
+            printf 'list\n' >> "$GH_DISCOVERY_LOG"
+          fi
           case "$mode" in
             none) printf '[[]]\n' ;;
+            propagating_missing)
+              if [ ! -f "${GH_DISCOVERY_STATE:?}" ]; then
+                touch "$GH_DISCOVERY_STATE"
+                printf '[[]]\n'
+              else
+                printf '[[%s]]\n' "$(pull_json)"
+              fi
+              ;;
+            propagating_multiple)
+              one=$(pull_json)
+              if [ ! -f "${GH_DISCOVERY_STATE:?}" ]; then
+                touch "$GH_DISCOVERY_STATE"
+                one=$(printf '%s' "$one" | sed "s/$sha/$release_head/")
+                printf '[[%s]]\n' "$one"
+              else
+                two=$(printf '%s' "$one" | sed 's/"number":42/"number":43/')
+                printf '[[%s,%s]]\n' "$one" "$two"
+              fi
+              ;;
             malformed_list) printf '{}\n' ;;
             malformed_page) printf '[{}]\n' ;;
             multiple)
@@ -628,6 +656,9 @@ if [ "${1:-}" = api ]; then
           esac
           ;;
         "--paginate --slurp repos/test/project/pulls/42/files?per_page=100")
+          if [ -n "${GH_DISCOVERY_LOG:-}" ]; then
+            printf 'files\n' >> "$GH_DISCOVERY_LOG"
+          fi
           if [ "$mode" = files_api_failure ] || [ "$mode" = merge_files_api_failure ]; then
             echo "files API unavailable" >&2
             exit 1
@@ -1197,11 +1228,19 @@ check_source_request() {
 
 check_discovery() {
   local name=$1 mode=$2 want_status=$3 want_text=$4 want_file_text=${5:-} expected_head=${6:-}
-  local output status output_file="$work/github-output"
+  local attempts=${7:-1}
+  local want_calls=${8:-} output status output_file="$work/github-output"
+  local discovery_log="$work/discovery-calls"
   : > "$output_file"
+  : > "$discovery_log"
+  rm -f "$work/discovery-state"
   set +e
   output=$(PATH="$work/bin:$PATH" GH_MODE="$mode" GH_LOG="$log" \
+    GH_DISCOVERY_STATE="$work/discovery-state" \
+    GH_DISCOVERY_LOG="$discovery_log" \
     GITHUB_REPOSITORY=test/project EXPECTED_RELEASE_HEAD_SHA="$expected_head" \
+    RELEASE_PR_DISCOVERY_ATTEMPTS="$attempts" \
+    RELEASE_PR_DISCOVERY_RETRY_DELAY_SECONDS=0 \
     "$discover" "$output_file" 2>&1)
   status=$?
   set -e
@@ -1210,6 +1249,14 @@ check_discovery() {
   fi
   if [[ -n "$want_file_text" ]] && ! grep -Fq "$want_file_text" "$output_file"; then
     printf 'FAIL %s: output file did not contain %q\n' "$name" "$want_file_text" >&2
+    failures=$((failures + 1))
+  fi
+  if [[ "$want_status" != 0 && -s "$output_file" ]]; then
+    printf 'FAIL %s: failed discovery wrote trusted outputs\n' "$name" >&2
+    failures=$((failures + 1))
+  fi
+  if [[ -n "$want_calls" && $(<"$discovery_log") != "$want_calls" ]]; then
+    printf 'FAIL %s: discovery calls were not exact\n' "$name" >&2
     failures=$((failures + 1))
   fi
 }
@@ -1350,9 +1397,10 @@ check_source_request "a mismatched identity artifact cannot authorize source" \
 
 check_discovery "trusted release PR is discovered" valid 0 "Discovered trusted" "head_sha=$sha"
 check_discovery "no release PR is a clean no-op" none 0 "No open" "pr_number="
-check_discovery "multiple release PRs are refused" multiple 1 "found 2"
+check_discovery "multiple release PRs are refused" multiple 1 "found 2" "" "$sha" 2 list
 check_discovery "release PRs on multiple pages are all counted" paged_multiple 1 "found 2"
-check_discovery "malformed release PR data is refused" malformed_list 1 "malformed pull-request data"
+check_discovery "malformed release PR data is refused" malformed_list 1 \
+  "malformed pull-request data" "" "$sha" 2 list
 check_discovery "a malformed release PR page is refused" malformed_page 1 "malformed pull-request data"
 check_discovery "cross-repository release lookalike is ignored" cross_repo 0 "No open" "pr_number="
 check_discovery "wrong-author release lookalike is ignored" wrong_author 0 "No open" "pr_number="
@@ -1363,13 +1411,26 @@ check_discovery "a renamed workflow cannot masquerade as a release file" renamed
 check_discovery "a copied workflow cannot masquerade as a release file" copied_files 1 "unexpected file set"
 check_discovery "malformed release file data is refused" malformed_files 1 "malformed release-PR file data"
 check_discovery "a malformed release file page is refused" malformed_file_page 1 "malformed release-PR file data"
-check_discovery "a release file API failure is preserved" files_api_failure 1 "Could not list files"
+check_discovery "a release PR API failure is preserved" list_api_failure 1 \
+  "Could not list open release pull requests" "" "$sha" 2 list
+check_discovery "a release file API failure is preserved" files_api_failure 1 \
+  "Could not list files" "" "$sha" 2 $'list\nfiles'
 check_discovery "the generated release head is bound exactly" valid 0 \
   "Discovered trusted" "head_sha=$sha" "$sha"
-check_discovery "a raced generated release head is refused" moved_head 1 \
-  "differs from generated" "" "$sha"
-check_discovery "a missing generated release PR is refused" none 1 \
-  "has no trusted pull request" "" "$sha"
+check_discovery "a just-pushed release head is retried until visible" \
+  propagating_head 0 "Discovered trusted" "head_sha=$sha" "$sha" 2 \
+  $'list\nlist\nfiles'
+check_discovery "a just-created release PR is retried until visible" \
+  propagating_missing 0 "Discovered trusted" "head_sha=$sha" "$sha" 2 \
+  $'list\nlist\nfiles'
+check_discovery "a duplicate release PR appearing during retry is refused" \
+  propagating_multiple 1 "found 2" "" "$sha" 2 $'list\nlist'
+check_discovery "a persistently raced generated release head is refused" moved_head 1 \
+  "differs from generated" "" "$sha" 2 $'list\nlist'
+check_discovery "a missing generated release PR is refused after retry" none 1 \
+  "has no trusted pull request" "" "$sha" 2 $'list\nlist'
+check_discovery "an invalid release-PR retry policy is refused" valid 2 \
+  "Invalid release-PR discovery retry policy" "" "$sha" 0
 
 check_merge "a trusted release merge is discovered" valid 0 "exactly one trusted" "is_release_merge=true"
 check_merge "an ordinary merge is a clean no-op" merge_none 0 "did not merge" "is_release_merge=false"
