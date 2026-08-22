@@ -18,12 +18,24 @@ from pathlib import Path
 from typing import Any
 
 
-SHA256_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
 GHCR_REGISTRY = "ghcr.io"
-GHCR_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+GHCR_TOKEN_REALM = f"https://{GHCR_REGISTRY}/token"
+GHCR_BLOB_REDIRECT_HOST = "pkg-containers.githubusercontent.com"
+GHCR_BLOB_REDIRECT_HOSTS = frozenset({GHCR_REGISTRY, GHCR_BLOB_REDIRECT_HOST})
+SHA256_HEX_PATTERN = r"[0-9a-f]{64}"
+SHA256_PATTERN = rf"sha256:({SHA256_HEX_PATTERN})"
+SHA256_RE = re.compile(SHA256_PATTERN)
+GHCR_COMPONENT_PATTERN = r"[A-Za-z0-9_.-]+"
+GHCR_REPOSITORY_PATTERN = rf"({GHCR_COMPONENT_PATTERN})/({GHCR_COMPONENT_PATTERN})"
+GHCR_IMAGE_PATTERN = (
+    rf"{re.escape(GHCR_REGISTRY)}/"
+    rf"({GHCR_COMPONENT_PATTERN})/({GHCR_COMPONENT_PATTERN})"
+)
+CONTENT_LENGTH_PATTERN = r"[0-9]{1,20}"
 MAX_BLOB_SIZE = 42 * 1024 * 1024
 MAX_MANIFEST_SIZE = 4 * 1024 * 1024
 MAX_DOCKER_CONFIG_SIZE = 1024 * 1024
+MAX_TOKEN_RESPONSE_SIZE = 64 * 1024
 FILE_READ_CHUNK_SIZE = 64 * 1024
 # Evaluate support before tests or callers can wrap os.open. Runtime flags are still
 # checked immediately before each open so an incomplete platform fails closed.
@@ -89,16 +101,27 @@ def is_positive_integer(value: Any) -> bool:
 
 def parse_ghcr_image(image: str) -> str:
     """Return a validated owner/repository path, never a caller-selected host."""
+    # Keep the successful return inside a direct positive re.fullmatch guard.
+    # Besides making the complete URL authority explicit, this lets CodeQL model
+    # the validation before repository components reach a request path.
+    if re.fullmatch(GHCR_IMAGE_PATTERN, image, re.ASCII | re.IGNORECASE):
+        _, owner, repository = image.split("/", 2)
+        if owner not in {".", ".."} and repository not in {".", ".."}:
+            return f"{owner}/{repository}"
+
     parts = image.split("/")
     if len(parts) != 3 or parts[0].lower() != GHCR_REGISTRY:
         raise ValidationError("image must be an untagged GHCR GitHub repository name")
-    owner, repository = parts[1:]
-    if any(
-        component in {".", ".."} or GHCR_COMPONENT_RE.fullmatch(component) is None
-        for component in (owner, repository)
-    ):
-        raise ValidationError("image has an invalid GHCR repository path")
-    return f"{owner}/{repository}"
+    raise ValidationError("image has an invalid GHCR repository path")
+
+
+def canonical_sha256_hex(digest: str) -> str:
+    """Return only the canonical lowercase digest payload after exact validation."""
+    # Keep canonicalization inside the direct positive guard so request builders
+    # never receive or interpolate the original caller-provided digest string.
+    if re.fullmatch(SHA256_PATTERN, digest):
+        return digest.removeprefix("sha256:")
+    raise ValidationError("OCI blob descriptor is invalid")
 
 
 def buildkit_builder_id(image: str) -> str:
@@ -629,8 +652,29 @@ def docker_credentials() -> tuple[str, str] | None:
     return username, password
 
 
-class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Reject HTTPS downgrade and never forward credentials cross-origin."""
+def validated_repository_parts(repository: str) -> tuple[str, str]:
+    """Return an already-authorized GHCR repository as two safe path segments."""
+    if re.fullmatch(GHCR_REPOSITORY_PATTERN, repository):
+        owner, name = repository.split("/", 1)
+        if owner not in {".", ".."} and name not in {".", ".."}:
+            return owner, name
+    raise ValidationError("validated GHCR repository path is invalid")
+
+
+def ghcr_token_scope(repository: str) -> str:
+    owner, name = validated_repository_parts(repository)
+    return f"repository:{owner}/{name}:pull"
+
+
+def ghcr_token_url(repository: str) -> str:
+    query = urllib.parse.urlencode(
+        (("service", GHCR_REGISTRY), ("scope", ghcr_token_scope(repository)))
+    )
+    return f"{GHCR_TOKEN_REALM}?{query}"
+
+
+class GhcrBlobRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow only documented GHCR blob origins and strip cross-origin auth."""
 
     def redirect_request(
         self,
@@ -641,10 +685,23 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         headers: Any,
         new_url: str,
     ) -> urllib.request.Request | None:
-        old = urllib.parse.urlsplit(request.full_url)
-        new = urllib.parse.urlsplit(new_url)
-        if new.scheme != "https":
-            raise ValidationError("registry blob redirect attempted to leave HTTPS")
+        if any(character in new_url for character in "\r\n\t"):
+            raise ValidationError("registry blob redirect URL contains control data")
+        try:
+            old = urllib.parse.urlsplit(request.full_url)
+            new = urllib.parse.urlsplit(new_url)
+        except ValueError as error:
+            raise ValidationError("registry blob redirect URL is malformed") from error
+        if (
+            new.scheme != "https"
+            or new.netloc not in GHCR_BLOB_REDIRECT_HOSTS
+            or new.username is not None
+            or new.password is not None
+            or new.fragment
+        ):
+            raise ValidationError(
+                "registry blob redirect left its approved HTTPS origins"
+            )
         redirected = super().redirect_request(
             request, file_pointer, code, message, headers, new_url
         )
@@ -656,90 +713,145 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
+class RejectTokenRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep Docker credentials and token responses on the canonical endpoint."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        raise ValidationError("registry token endpoint attempted a redirect")
+
+
 def bearer_challenge(value: str, repository: str) -> str:
     scheme, separator, parameters = value.partition(" ")
     if separator != " " or scheme.lower() != "bearer":
-        raise ValidationError("registry did not return a Bearer authentication challenge")
-    try:
-        parsed = urllib.request.parse_keqv_list(
-            urllib.request.parse_http_list(parameters)
+        raise ValidationError(
+            "registry did not return a Bearer authentication challenge"
         )
+    try:
+        entries = urllib.request.parse_http_list(parameters)
+        parsed = urllib.request.parse_keqv_list(entries)
     except (TypeError, ValueError) as error:
         raise ValidationError("registry Bearer challenge is malformed") from error
-    realm = parsed.get("realm")
-    if not isinstance(realm, str):
-        raise ValidationError("registry Bearer challenge has no realm")
-    realm_url = urllib.parse.urlsplit(realm)
-    if (
-        realm_url.scheme != "https"
-        or realm_url.netloc != GHCR_REGISTRY
-        or realm_url.username is not None
-        or realm_url.password is not None
-        or realm_url.fragment
-    ):
-        raise ValidationError("registry Bearer realm is not same-host HTTPS")
-    query: dict[str, str] = {}
-    service = parsed.get("service")
-    scope = parsed.get("scope", f"repository:{repository}:pull")
-    if (service is not None and not isinstance(service, str)) or not isinstance(
-        scope, str
-    ):
-        raise ValidationError("registry Bearer challenge has invalid parameters")
-    if service:
-        query["service"] = service
-    query["scope"] = scope
-    return realm + ("&" if realm_url.query else "?") + urllib.parse.urlencode(query)
+    if len(entries) != 3 or set(parsed) != {"realm", "service", "scope"}:
+        raise ValidationError("registry Bearer challenge has noncanonical fields")
+    if parsed["realm"] != GHCR_TOKEN_REALM:
+        raise ValidationError(
+            "registry Bearer realm is not the canonical GHCR endpoint"
+        )
+    if parsed["service"] != GHCR_REGISTRY:
+        raise ValidationError("registry Bearer service is not canonical GHCR")
+    if parsed["scope"] != ghcr_token_scope(repository):
+        raise ValidationError(
+            "registry Bearer scope is not the exact repository pull scope"
+        )
+    return ghcr_token_url(repository)
 
 
-def request_bytes(
-    opener: urllib.request.OpenerDirector,
-    url: str,
-    authorization: str | None = None,
-    expected_size: int | None = None,
-) -> bytes:
-    headers = {"Accept": "application/octet-stream", "User-Agent": "mcp-repl-release"}
+def registry_request_headers(
+    accept: str, authorization: str | None
+) -> dict[str, str]:
+    headers = {"Accept": accept, "User-Agent": "mcp-repl-release"}
     if authorization is not None:
         headers["Authorization"] = authorization
-    # Callers provide only a hardcoded ghcr.io blob URL or the same-host HTTPS
-    # token realm accepted by bearer_challenge; repository path components are
-    # structurally constrained and percent-encoded before reaching this sink.
-    # codeql[py/partial-ssrf]
-    request = urllib.request.Request(url, headers=headers)
+    return headers
+
+
+def read_request_bytes(
+    opener: urllib.request.OpenerDirector,
+    request: urllib.request.Request,
+    label: str,
+    size_limit: int,
+    *,
+    expected_size: int | None = None,
+) -> bytes:
     try:
         with opener.open(request, timeout=30) as response:
             content_length = response.headers.get("Content-Length")
             if content_length is not None:
-                if not content_length.isdigit():
-                    raise ValidationError("registry returned an invalid Content-Length")
-                if expected_size is not None and int(content_length) != expected_size:
-                    raise ValidationError("registry blob Content-Length differs from descriptor")
-            limit = expected_size if expected_size is not None else MAX_BLOB_SIZE
-            data = response.read(limit + 1)
+                if re.fullmatch(CONTENT_LENGTH_PATTERN, content_length) is None:
+                    raise ValidationError(f"{label} returned an invalid Content-Length")
+                declared_size = int(content_length)
+                if expected_size is not None and declared_size != expected_size:
+                    raise ValidationError(
+                        "registry blob Content-Length differs from descriptor"
+                    )
+                if declared_size > size_limit:
+                    raise ValidationError(f"{label} response exceeds its size bound")
+            data = response.read(size_limit + 1)
     except ValidationError:
         raise
     except urllib.error.HTTPError:
         raise
     except (OSError, urllib.error.URLError) as error:
-        raise ValidationError(f"registry request failed: {error}") from error
-    if len(data) > limit:
-        raise ValidationError("registry response exceeds its expected size")
+        raise ValidationError(f"{label} request failed: {error}") from error
+    if len(data) > size_limit:
+        raise ValidationError(f"{label} response exceeds its size bound")
     return data
+
+
+def request_ghcr_blob(
+    opener: urllib.request.OpenerDirector,
+    repository: str,
+    digest_hex: str,
+    expected_size: int,
+    authorization: str | None = None,
+) -> bytes:
+    owner, name = validated_repository_parts(repository)
+    if re.fullmatch(SHA256_HEX_PATTERN, digest_hex):
+        canonical_digest = f"sha256:{digest_hex}"
+    else:
+        raise ValidationError("canonical OCI blob digest payload is invalid")
+    repository_path = "/".join(
+        urllib.parse.quote(component, safe="") for component in (owner, name)
+    )
+    url = f"https://{GHCR_REGISTRY}/v2/{repository_path}/blobs/{canonical_digest}"
+    request = urllib.request.Request(
+        url,
+        headers=registry_request_headers("application/octet-stream", authorization),
+    )
+    return read_request_bytes(
+        opener,
+        request,
+        "registry blob",
+        expected_size,
+        expected_size=expected_size,
+    )
+
+
+def request_ghcr_token(
+    opener: urllib.request.OpenerDirector,
+    repository: str,
+    authorization: str | None,
+) -> bytes:
+    request = urllib.request.Request(
+        ghcr_token_url(repository),
+        headers=registry_request_headers("application/json", authorization),
+    )
+    return read_request_bytes(
+        opener,
+        request,
+        "registry token",
+        MAX_TOKEN_RESPONSE_SIZE,
+    )
 
 
 def fetch_registry_blob(
     image: str, digest: str, expected_size: int, cache: str | None
 ) -> bytes:
-    digest_match = SHA256_RE.fullmatch(digest)
-    if (
-        digest_match is None
-        or not is_positive_integer(expected_size)
-        or expected_size > MAX_BLOB_SIZE
-    ):
+    if not is_positive_integer(expected_size) or expected_size > MAX_BLOB_SIZE:
         raise ValidationError("OCI blob descriptor is invalid")
-    digest_hex = digest_match.group(1)
+    digest_hex = canonical_sha256_hex(digest)
+    canonical_digest = f"sha256:{digest_hex}"
     repository = parse_ghcr_image(image)
     if cache is not None:
-        cached_label = f"cached OCI blob {digest}"
+        cached_label = f"cached OCI blob {canonical_digest}"
         data = read_regular_directory_child(
             cache,
             f"{digest_hex}.blob",
@@ -749,26 +861,27 @@ def fetch_registry_blob(
             missing_file_ok=True,
         )
         if data is None:
-            raise ValidationError(f"OCI blob cache is missing {digest}")
+            raise ValidationError(f"OCI blob cache is missing {canonical_digest}")
     else:
-        owner, name = repository.split("/", 1)
-        repository_path = "/".join(
-            urllib.parse.quote(component, safe="") for component in (owner, name)
-        )
-        url = f"https://{GHCR_REGISTRY}/v2/{repository_path}/blobs/{digest}"
         context = ssl.create_default_context()
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=context), SafeRedirectHandler()
+        blob_opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=context),
+            GhcrBlobRedirectHandler(),
         )
         try:
-            data = request_bytes(opener, url, expected_size=expected_size)
+            data = request_ghcr_blob(
+                blob_opener,
+                repository,
+                digest_hex,
+                expected_size,
+            )
         except urllib.error.HTTPError as error:
             if error.code != 401:
                 raise ValidationError(
                     f"registry blob request failed with HTTP {error.code}"
                 ) from error
             challenge = error.headers.get("WWW-Authenticate", "")
-            token_url = bearer_challenge(challenge, repository)
+            bearer_challenge(challenge, repository)
             credentials = docker_credentials()
             basic = None
             if credentials is not None:
@@ -776,8 +889,16 @@ def fetch_registry_blob(
                     f"{credentials[0]}:{credentials[1]}".encode("utf-8")
                 ).decode("ascii")
                 basic = f"Basic {encoded}"
+            token_opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=context),
+                RejectTokenRedirectHandler(),
+            )
             try:
-                token_bytes = request_bytes(opener, token_url, authorization=basic)
+                token_bytes = request_ghcr_token(
+                    token_opener,
+                    repository,
+                    basic,
+                )
             except urllib.error.HTTPError as token_error:
                 raise ValidationError(
                     f"registry token request failed with HTTP {token_error.code}"
@@ -786,14 +907,20 @@ def fetch_registry_blob(
             if not isinstance(token_document, dict):
                 raise ValidationError("registry token response is not an object")
             token = token_document.get("token", token_document.get("access_token"))
-            if not isinstance(token, str) or not token:
+            if (
+                not isinstance(token, str)
+                or not token
+                or "\r" in token
+                or "\n" in token
+            ):
                 raise ValidationError("registry token response has no token")
             try:
-                data = request_bytes(
-                    opener,
-                    url,
+                data = request_ghcr_blob(
+                    blob_opener,
+                    repository,
+                    digest_hex,
+                    expected_size,
                     authorization=f"Bearer {token}",
-                    expected_size=expected_size,
                 )
             except urllib.error.HTTPError as blob_error:
                 raise ValidationError(
@@ -801,10 +928,14 @@ def fetch_registry_blob(
                 ) from blob_error
 
     if len(data) != expected_size:
-        raise ValidationError(f"OCI blob {digest} size differs from its descriptor")
+        raise ValidationError(
+            f"OCI blob {canonical_digest} size differs from its descriptor"
+        )
     actual = hashlib.sha256(data).hexdigest()
     if actual != digest_hex:
-        raise ValidationError(f"OCI blob {digest} bytes differ from their descriptor")
+        raise ValidationError(
+            f"OCI blob {canonical_digest} bytes differ from their descriptor"
+        )
     return data
 
 
