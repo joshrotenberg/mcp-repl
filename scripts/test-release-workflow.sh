@@ -134,6 +134,10 @@ git clone --quiet --no-local "$root" "$attachment_repo"
 (
   cd "$attachment_repo"
   frozen=$(git rev-parse HEAD)
+  # A nested clone from GitHub's detached PR checkout may not advertise a
+  # local main branch. Production fetches origin/main explicitly via
+  # checkout's fetch-depth: 0, so seed the same remote-tracking topology here.
+  git update-ref refs/remotes/origin/main "$frozen"
   git checkout --quiet --detach "$frozen"
   "$attach_release_main" "$frozen" >/dev/null
   [[ $(git symbolic-ref --short HEAD) == main &&
