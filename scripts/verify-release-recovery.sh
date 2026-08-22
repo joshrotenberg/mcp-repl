@@ -128,7 +128,9 @@ while IFS= read -r -d '' path; do
     docs/releases.md | \
     scripts/discover-release-merge.sh | \
     scripts/reconcile-source-release.sh | \
+    scripts/select-run-artifacts.sh | \
     scripts/test-release-recovery.sh | \
+    scripts/test-select-run-artifacts.sh | \
     scripts/test-release-workflow.sh | \
     scripts/test-source-release.sh | \
     scripts/test-validate-oci-attestation.py | \

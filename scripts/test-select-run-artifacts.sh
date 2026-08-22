@@ -24,6 +24,11 @@ artifact() {
   printf '%s\n' "$contents" > "$downloads/$name/$file"
 }
 
+flat_file() {
+  local file=$1 contents=$2
+  printf '%s\n' "$contents" > "$downloads/$file"
+}
+
 expect_failure() {
   local label=$1 diagnostic=$2
   shift 2
@@ -39,11 +44,34 @@ artifact release-linux-1 archive one
 "$selector" 2 "$downloads" "$output" release-linux > /dev/null
 [[ $(<"$output/archive") == one ]] || fail "earlier successful attempt was not selected"
 
+setup_case flat_first
+flat_file archive one
+flat_file archive.sha256 checksum
+result=$("$selector" 1 "$downloads" "$output" release-linux)
+[[ $(<"$output/archive") == one &&
+   $(<"$output/archive.sha256") == checksum &&
+   "$result" == "Selected sole flattened artifact for release-linux" ]] ||
+  fail "sole first-attempt artifact was not selected from the flattened layout"
+
+setup_case flat_prior
+flat_file archive prior
+"$selector" 2 "$downloads" "$output" release-linux > /dev/null
+[[ $(<"$output/archive") == prior ]] ||
+  fail "sole prior-attempt artifact was not selected from the flattened layout"
+
 setup_case current
 artifact release-linux-1 archive one
 artifact release-linux-2 archive two
 "$selector" 2 "$downloads" "$output" release-linux > /dev/null
 [[ $(<"$output/archive") == two ]] || fail "current attempt did not supersede earlier output"
+
+setup_case incomplete_newer
+artifact release-linux-1 archive one
+mkdir -p "$downloads/release-linux-2"
+expect_failure incomplete_newer "release-linux-2 is empty" \
+  2 "$downloads" "$output" release-linux
+[[ ! -e "$output/archive" ]] ||
+  fail "an incomplete newer attempt fell back to older bytes"
 
 setup_case mixed
 artifact native-linux-1 linux old-linux
@@ -62,6 +90,17 @@ artifact release-linux-1 archive one
 expect_failure missing "no artifact is available for release-macos" \
   2 "$downloads" "$output" release-linux release-macos
 
+setup_case flat_multiple_bases
+flat_file archive one
+expect_failure flat_multiple_bases "cannot satisfy multiple artifact bases" \
+  2 "$downloads" "$output" release-linux release-macos
+
+setup_case mixed_layout
+flat_file direct one
+artifact release-linux-1 archive one
+expect_failure mixed_layout "mixes flattened files and artifact directories" \
+  1 "$downloads" "$output" release-linux
+
 setup_case unexpected
 artifact release-linux-1 archive one
 artifact unrelated-1 other other
@@ -73,12 +112,35 @@ artifact native-linux-1 shared linux
 artifact native-macos-1 shared macos
 expect_failure collision "collide on output file" \
   1 "$downloads" "$output" native-linux native-macos
+[[ $(<"$output/shared") == linux ]] ||
+  fail "a colliding artifact overwrote the first selected file"
 
 setup_case linked
 mkdir -p "$downloads/release-linux-1"
 printf 'real\n' > "$case_dir/real"
 ln -s "$case_dir/real" "$downloads/release-linux-1/archive"
 expect_failure linked "unsafe, linked, empty" \
+  1 "$downloads" "$output" release-linux
+
+setup_case flat_linked
+printf 'real\n' > "$case_dir/real"
+ln -s "$case_dir/real" "$downloads/archive"
+expect_failure flat_linked "unsafe entry" \
+  1 "$downloads" "$output" release-linux
+
+setup_case flat_empty
+: > "$downloads/archive"
+expect_failure flat_empty "unsafe or empty file" \
+  1 "$downloads" "$output" release-linux
+
+setup_case flat_unsafe_name
+flat_file 'unsafe name' one
+expect_failure flat_unsafe_name "unsafe or empty file" \
+  1 "$downloads" "$output" release-linux
+
+setup_case flat_special
+mkfifo "$downloads/archive"
+expect_failure flat_special "unsafe entry" \
   1 "$downloads" "$output" release-linux
 
 setup_case empty
