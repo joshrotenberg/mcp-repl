@@ -8,6 +8,7 @@ discover_merge="$root/scripts/discover-release-merge.sh"
 report="$root/scripts/report-release-status.sh"
 dispatch_validation="$root/scripts/dispatch-release-validation.sh"
 verify_tag="$root/scripts/verify-release-tag.sh"
+attach_release_main="$root/scripts/attach-release-main.sh"
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 release_base=cccccccccccccccccccccccccccccccccccccccc
 metadata=$(cargo metadata --locked --no-deps --format-version 1)
@@ -109,7 +110,7 @@ fi
   exit 1
 }
 # shellcheck disable=SC2016
-attach_main_line=$(grep -Fn 'git checkout -B main "$GITHUB_SHA"' "$release_plz" |
+attach_main_line=$(grep -Fn './scripts/attach-release-main.sh "$GITHUB_SHA"' "$release_plz" |
   cut -d: -f1)
 # shellcheck disable=SC2016
 release_plz_update_line=$(grep -Fn '"$RUNNER_TEMP/release-plz" update' "$release_plz" |
@@ -121,13 +122,27 @@ release_plz_update_line=$(grep -Fn '"$RUNNER_TEMP/release-plz" update' "$release
 if [[ ! "$attach_main_line" =~ ^[0-9]+$ ||
       ! "$release_plz_update_line" =~ ^[0-9]+$ ||
       "$attach_main_line" -ge "$release_plz_update_line" ||
-      $(grep -Fc 'git branch --set-upstream-to=origin/main main' "$release_plz") -ne 1 ||
-      $(grep -Fc '"$(git symbolic-ref --short HEAD)" != main' "$release_plz") -ne 1 ||
-      $(grep -Fc '"$(git rev-parse HEAD)" != "$GITHUB_SHA"' "$release_plz") -ne 2 ||
+      $(grep -Fc './scripts/attach-release-main.sh "$GITHUB_SHA"' "$release_plz") -ne 1 ||
+      ! -x "$attach_release_main" ||
       $(grep -Fc "ref: \${{ github.sha }}" "$release_plz") -ne 2 ]]; then
   echo "release-plz must attach the frozen event commit to origin/main" >&2
   exit 1
 fi
+
+attachment_repo="$work/attachment-repo"
+git clone --quiet --no-local "$root" "$attachment_repo"
+(
+  cd "$attachment_repo"
+  frozen=$(git rev-parse HEAD)
+  git checkout --quiet --detach "$frozen"
+  "$attach_release_main" "$frozen" >/dev/null
+  [[ $(git symbolic-ref --short HEAD) == main &&
+     $(git rev-parse HEAD) == "$frozen" &&
+     $(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}') == origin/main ]]
+) || {
+  echo "release-plz attachment must execute against a detached exact SHA" >&2
+  exit 1
+}
 if grep -Fq 'Swatinem/rust-cache' "$release_build"; then
   echo "final native release builds must not consume shared Actions caches" >&2
   exit 1
