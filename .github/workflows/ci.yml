@@ -256,7 +256,10 @@ jobs:
           tar xzf "$destination" -C "$tool_dir" \
             --strip-components=1 "$archive_dir/cargo-deny"
           test "$("$tool_dir/cargo-deny" --version)" = 'cargo-deny 0.20.2'
-          "$tool_dir/cargo-deny" check advisories licenses bans sources
+          "$tool_dir/cargo-deny" check \
+            -D unmatched-skip \
+            -D unnecessary-skip \
+            advisories licenses bans sources
 
   tower-mcp-main:
     name: tower-mcp main compatibility
