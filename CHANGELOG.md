@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-08-22
+
+### Bug Fixes
+
+- Arm the interrupt handler before a command starts (#135)
+- Accumulate multi-line piped commands (#148)
+- Answer `mcp-repl help` with help, and name what could not be spawned (#157)
+- Refuse an elicitation answer the field's enum rules out (#162)
+- Name tool/built-in collisions in the connect banner (closes #163) (#165)
+- Give a bare invocation more than one command to go on (#183)
+- Retry a request that never reached the server (#189)
+- Rebuild HTTP client after unsent handshake (#194)
+- Harden release validation and publication (#204)
+
+### Documentation
+
+- Make -h a beginner's view and keep the detail in --help (#151)
+- Write down the shell model and what it decides (#166)
+- Lead with the one-shot client, not only the REPL (#172)
+- A commented example config, parsed by a test so it cannot drift (#186)
+
+### Features
+
+- For, to run one command per element of a captured list (#158)
+- Bind, sticky parameter values across calls (closes #161) (#168)
+- Complete elicitation answers from the field schema (closes #160) (#167)
+- Publish a container image alongside the binaries (#173)
+- A demo tool that answers with structured content (#185)
+- Let the demo change a resource, so subscribing shows something (#187)
+- Let the demo change its surface while you are connected (#190)
+- Support loglevel filtering on final MCP and expand demo coverage (#193)
+
+### Miscellaneous Tasks
+
+- Test the release guards instead of only linting them (#129)
+
+### Refactor
+
+- Give a built-in one record instead of two parallel tables (#134)
+- Move sanitize out of style, into its own module (#156)
+
+### Testing
+
+- Stabilize interactive final-task e2e (#149)
+- Pin that the core does not reach for presentation (#174)
+
+
+
 ## [0.3.0] - 2026-08-09
 
 ### Bug Fixes
