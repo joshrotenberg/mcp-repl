@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Exercise recovery across every registry/tag/draft publication boundary.
+# Exercise registry recovery and final-boundary tag publication.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 reconcile="$root/scripts/reconcile-source-release.sh"
+publish_tag="$root/scripts/publish-release-tag.sh"
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+source_epoch=1700000001
 metadata=$(cargo metadata --locked --no-deps --format-version 1)
 version=$(jq -er '.packages[] | select(.name == "mcp-repl") | .version' <<<"$metadata")
 tag="v$version"
@@ -41,31 +43,250 @@ if ! awk -v prefix="## [$version] - " '
 fi
 
 # The published-retry path must prove that the already-public release is the
-# complete binary release that downstream recovery expects, not just a valid
-# release object. Seed every manifest-derived archive and self-bound checksum
-# produced by the native publication workflow.
+# complete supply-chain release that downstream recovery expects, not just a
+# valid release object. Seed the exact manifest-derived durable asset set and
+# build its canonical release record with the production helper.
 public_assets="$work/published-assets"
-mkdir -p "$public_assets"
+fixture_native="$work/published-native"
+fixture_container="$work/published-container"
+mkdir -p "$public_assets" "$fixture_native" "$fixture_container"
+
+sha256_file() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+write_spdx() {
+  local path=$1 name=$2 digest=$3
+  jq -nS \
+    --arg name "$name" \
+    --arg version "$version" \
+    --arg digest "$digest" \
+    --arg evident_comment "evident-by: indicates the package's existence is evident by the given file" \
+    --arg namespace "https://github.com/test/project/releases/download/$tag/$name.spdx.json#$sha-$digest" '{
+    spdxVersion: "SPDX-2.3",
+    SPDXID: "SPDXRef-DOCUMENT",
+    dataLicense: "CC0-1.0",
+    name: $name,
+    documentNamespace: $namespace,
+    creationInfo: {
+      created: "2023-11-14T22:13:21Z",
+      creators: ["Tool: source-release-test"]
+    },
+    packages: [
+      {
+        SPDXID: "SPDXRef-DocumentRoot",
+        name: $name,
+        versionInfo: $version,
+        supplier: "NOASSERTION",
+        downloadLocation: "NOASSERTION",
+        filesAnalyzed: false,
+        checksums: [{algorithm: "SHA256", checksumValue: $digest}],
+        licenseConcluded: "NOASSERTION",
+        licenseDeclared: "NOASSERTION",
+        copyrightText: "NOASSERTION",
+        primaryPackagePurpose: "FILE"
+      },
+      {
+        SPDXID: "SPDXRef-mcp-repl",
+        name: "mcp-repl",
+        versionInfo: $version,
+        downloadLocation: "NOASSERTION",
+        externalRefs: [{
+          referenceCategory: "PACKAGE-MANAGER",
+          referenceType: "purl",
+          referenceLocator: ("pkg:cargo/mcp-repl@" + $version)
+        }]
+      },
+      {
+        SPDXID: "SPDXRef-dependency",
+        name: "dependency",
+        versionInfo: "9.8.7",
+        externalRefs: [{
+          referenceCategory: "PACKAGE-MANAGER",
+          referenceType: "purl",
+          referenceLocator: "pkg:cargo/dependency@9.8.7"
+        }]
+      }
+    ],
+    files: [{SPDXID: "SPDXRef-File-mcp-repl", fileName: "mcp-repl"}],
+    relationships: [
+      {
+        spdxElementId: "SPDXRef-DOCUMENT",
+        relationshipType: "DESCRIBES",
+        relatedSpdxElement: "SPDXRef-DocumentRoot"
+      },
+      {
+        spdxElementId: "SPDXRef-DocumentRoot",
+        relationshipType: "CONTAINS",
+        relatedSpdxElement: "SPDXRef-mcp-repl"
+      },
+      {
+        spdxElementId: "SPDXRef-dependency",
+        relationshipType: "DEPENDENCY_OF",
+        relatedSpdxElement: "SPDXRef-mcp-repl"
+      },
+      {
+        spdxElementId: "SPDXRef-mcp-repl",
+        relationshipType: "OTHER",
+        comment: $evident_comment,
+        relatedSpdxElement: "SPDXRef-File-mcp-repl"
+      }
+    ]
+  }' > "$path"
+}
+
+write_bundle() {
+  local path=$1 subject_name=$2 subject_sha256=$3 predicate_type=$4
+  local predicate='{"fixture":true}'
+  if [[ $# -eq 5 ]]; then
+    predicate=$(jq -c . "$5")
+  fi
+  jq -nS \
+    --arg subject_name "$subject_name" \
+    --arg subject_sha256 "$subject_sha256" \
+    --arg predicate_type "$predicate_type" \
+    --argjson predicate "$predicate" '
+    {
+      _type: "https://in-toto.io/Statement/v1",
+      subject: [{name: $subject_name, digest: {sha256: $subject_sha256}}],
+      predicateType: $predicate_type,
+      predicate: $predicate
+    } as $statement |
+    {
+    mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+    verificationMaterial: {fixture: true},
+    dsseEnvelope: {
+      payloadType: "application/vnd.in-toto+json",
+      payload: ($statement | tojson | @base64),
+      signatures: [{sig: "fixture-signature"}]
+    }
+  }' > "$path"
+}
+
 for row in "${target_rows[@]}"; do
   IFS=$'\t' read -r target extension _binary <<<"$row"
   archive_name="mcp-repl-${tag}-${target}.${extension}"
-  printf 'archive for %s\n' "$target" > "$public_assets/$archive_name"
-  if command -v sha256sum > /dev/null 2>&1; then
-    checksum=$(sha256sum "$public_assets/$archive_name" | awk '{print $1}')
-  else
-    checksum=$(shasum -a 256 "$public_assets/$archive_name" | awk '{print $1}')
-  fi
+  printf 'archive for %s\n' "$target" > "$fixture_native/$archive_name"
+  checksum=$(sha256_file "$fixture_native/$archive_name")
   printf '%s  %s\n' "$checksum" "$archive_name" \
-    > "$public_assets/$archive_name.sha256"
+    > "$fixture_native/$archive_name.sha256"
+  write_spdx "$fixture_native/$archive_name.spdx.json" "$archive_name" "$checksum"
+  write_bundle \
+    "$fixture_native/$archive_name.provenance.sigstore.json" \
+    "$archive_name" "$checksum" "https://slsa.dev/provenance/v1"
+  write_bundle \
+    "$fixture_native/$archive_name.sbom.sigstore.json" \
+    "$archive_name" "$checksum" "https://spdx.dev/Document/v2.3" \
+    "$fixture_native/$archive_name.spdx.json"
 done
+
+platforms_file="$work/published-platforms.jsonl"
+: > "$platforms_file"
+platform_index=0
+while IFS= read -r platform; do
+  platform_index=$((platform_index + 1))
+  if [[ "$platform_index" -eq 1 ]]; then
+    runnable_digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    build_digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  else
+    runnable_digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    build_digest=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  fi
+  platform_file=${platform//\//-}.json
+  jq -nS \
+    --arg tag "$tag" \
+    --arg source_sha "$sha" \
+    --argjson source_epoch "$source_epoch" \
+    --arg platform "$platform" \
+    --arg runnable_digest "$runnable_digest" \
+    --arg build_digest "$build_digest" '{
+      schema_version: 1,
+      package: "mcp-repl",
+      tag: $tag,
+      source_sha: $source_sha,
+      source_epoch: $source_epoch,
+      image: "ghcr.io/test/project",
+      platform: $platform,
+      runnable_digest: $runnable_digest,
+      build_digest: $build_digest,
+      buildkit: {provenance: true, sbom: true}
+    }' > "$fixture_container/$platform_file"
+  jq -cn \
+    --arg platform "$platform" \
+    --arg runnable_digest "$runnable_digest" \
+    --arg build_digest "$build_digest" '{
+      platform: $platform,
+      runnable_digest: $runnable_digest,
+      build_digest: $build_digest
+    }' >> "$platforms_file"
+done < <("$root/scripts/release-targets.sh" container-platforms)
+platforms=$(jq -cs 'sort_by(.platform)' "$platforms_file")
+manifest_digest=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+jq -nS \
+  --arg tag "$tag" \
+  --arg source_sha "$sha" \
+  --argjson source_epoch "$source_epoch" \
+  --arg manifest_digest "$manifest_digest" \
+  --argjson platforms "$platforms" '{
+    schema_version: 1,
+    package: "mcp-repl",
+    tag: $tag,
+    source_sha: $source_sha,
+    source_epoch: $source_epoch,
+    image: "ghcr.io/test/project",
+    staging_ref: ("ghcr.io/test/project:sha-" + $source_sha),
+    manifest_digest: $manifest_digest,
+    platforms: $platforms
+  }' > "$fixture_container/image-manifest.json"
+
+container_base="$fixture_container/mcp-repl-$tag-container"
+"$root/scripts/build-container-sbom.sh" \
+  "$fixture_container/image-manifest.json" \
+  "$container_base.spdx.json" > /dev/null
+write_bundle \
+  "$container_base.provenance.sigstore.json" \
+  "ghcr.io/test/project" "${manifest_digest#sha256:}" \
+  "https://slsa.dev/provenance/v1"
+write_bundle \
+  "$container_base.sbom.sigstore.json" \
+  "ghcr.io/test/project" "${manifest_digest#sha256:}" \
+  "https://spdx.dev/Document/v2.3" \
+  "$container_base.spdx.json"
+"$root/scripts/build-release-record.sh" \
+  "$tag" "$sha" "$source_epoch" \
+  "$fixture_native" "$fixture_container" \
+  "$public_assets/mcp-repl-$tag-release.json" > /dev/null
+cp "$fixture_native"/* "$public_assets/"
+cp "$container_base.spdx.json" \
+  "$container_base.provenance.sigstore.json" \
+  "$container_base.sbom.sigstore.json" \
+  "$public_assets/"
+expected_public_assets=$("$root/scripts/release-targets.sh" \
+  expected-release-assets "$tag" | LC_ALL=C sort)
+actual_public_assets=$(find "$public_assets" -mindepth 1 -maxdepth 1 \
+  -exec basename {} \; | LC_ALL=C sort)
+[[ "$actual_public_assets" == "$expected_public_assets" ]] || {
+  echo "Published fixture does not contain the exact release asset set" >&2
+  exit 1
+}
 
 cat > "$work/bin/git" <<'STUB'
 #!/bin/sh
 set -eu
-if [ "${1:-} ${2:-}" = "rev-parse HEAD" ]; then
-  printf '%s\n' "${TEST_SOURCE_SHA:?}"
-  exit 0
-fi
+case "$*" in
+  "rev-parse HEAD" | "-C ${TEST_ROOT:?} rev-parse --verify HEAD")
+    printf '%s\n' "${TEST_SOURCE_SHA:?}"
+    exit 0
+    ;;
+  "-C ${TEST_ROOT:?} show -s --format=%ct HEAD")
+    printf '%s\n' "${TEST_SOURCE_EPOCH:?}"
+    exit 0
+    ;;
+esac
 echo "unexpected git call: $*" >&2
 exit 1
 STUB
@@ -436,7 +657,7 @@ assert_result() {
 }
 
 check_reconcile() {
-  local name=$1 mode=$2 outcome=$3 want_status=$4 want_text=$5 want_tag_writes=$6 want_release=$7
+  local name=$1 mode=$2 outcome=$3 want_status=$4 want_text=$5
   local output status
   : > "$log"
   rm -f "$work/state/tag-created" "$work/state/release-created" "$work/release-notes.md"
@@ -448,6 +669,8 @@ check_reconcile() {
     SOURCE_RELEASE_MAX_ATTEMPTS=1 \
     SOURCE_RELEASE_RETRY_DELAY_SECONDS=0 \
     TEST_SOURCE_SHA="$sha" \
+    TEST_SOURCE_EPOCH="$source_epoch" \
+    TEST_ROOT="$root" \
     TEST_VERSION="$version" \
     TEST_TAG="$tag" \
     TEST_TARGET_DIR="$work/target" \
@@ -458,6 +681,37 @@ check_reconcile() {
     TEST_PUBLIC_ASSETS="$public_assets" \
     TEST_LOG="$log" \
     "$reconcile" "$sha" "$outcome" 2>&1)
+  status=$?
+  set -e
+  if ! assert_result "$name" "$status" "$want_status" "$output" "$want_text"; then
+    return 0
+  fi
+  if [[ -s "$log" ]]; then
+    echo "FAIL $name: registry reconciliation reached a GitHub mutation" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+check_tag() {
+  local name=$1 mode=$2 want_status=$3 want_text=$4 want_tag_writes=$5
+  local output status
+  : > "$log"
+  rm -f "$work/state/tag-created"
+  set +e
+  output=$(PATH="$work/bin:$PATH" \
+    GH_MODE="$mode" \
+    GH_TOKEN=token \
+    GH_REPO=test/project \
+    TEST_SOURCE_SHA="$sha" \
+    TEST_ROOT="$root" \
+    TEST_VERSION="$version" \
+    TEST_TAG="$tag" \
+    TEST_TARGET_DIR="$work/target" \
+    TEST_STATE_DIR="$work/state" \
+    TEST_EXPECTED_NOTES="$expected_notes" \
+    TEST_PUBLIC_ASSETS="$public_assets" \
+    TEST_LOG="$log" \
+    "$publish_tag" "$tag" "$sha" 2>&1)
   status=$?
   set -e
   if ! assert_result "$name" "$status" "$want_status" "$output" "$want_text"; then
@@ -483,57 +737,36 @@ check_reconcile() {
         failures=$((failures + 1))
       fi
       ;;
-    *)
-      echo "FAIL $name: invalid expected tag-write state $want_tag_writes" >&2
-      failures=$((failures + 1))
-      ;;
   esac
-
-  if [[ "$want_release" == true ]] && ! grep -Fq 'release-create' "$log"; then
-    echo "FAIL $name: expected release creation" >&2
-    failures=$((failures + 1))
-  elif [[ "$want_release" == false ]] && grep -Fq 'release-create' "$log"; then
-    echo "FAIL $name: unexpected release creation" >&2
-    failures=$((failures + 1))
-  fi
 }
 
-check_reconcile "crate publication stages a tag and draft" valid success 0 "ready for native assets" both true
-check_reconcile "an exact existing tag and draft are verified without mutation" existing_draft success 0 "ready for native assets" none false
-check_reconcile "a crate-only action failure is recovered" valid failure 0 "Recovered the safe external state" both true
-check_reconcile "an absent registry version is refused" registry_missing failure 1 "is not on crates.io" none false
-check_reconcile "a registry outage is preserved" registry_api_error failure 1 "Could not verify" none false
-check_reconcile "a registry network failure is preserved" registry_network_error failure 1 "Could not verify" none false
-check_reconcile "a package from the wrong commit is refused" wrong_vcs_sha success 1 "VCS metadata" none false
-check_reconcile "a dirty source package is refused" dirty_vcs success 1 "VCS metadata" none false
-check_reconcile "malformed registry metadata is refused" registry_bad_metadata success 1 "invalid or yanked" none false
-check_reconcile "a yanked registry version is refused" registry_yanked success 1 "invalid or yanked" none false
-check_reconcile "a mismatched registry package is refused" registry_bad_checksum success 1 "does not match" none false
-check_reconcile "a tag-list failure is preserved" tag_list_failure success 1 "Could not list" none false
-check_reconcile "malformed tag data is refused" malformed_tags success 1 "malformed tag-ref" none false
-check_reconcile "multiple exact tags are refused" multiple_tags success 1 "multiple exact refs" none false
-check_reconcile "a tag-object failure is preserved" tag_object_create_failure success 1 "Could not create annotated" object false
-check_reconcile "a malformed tag object is refused" malformed_tag_object success 1 "noncanonical annotated tag" object false
-check_reconcile "a valid-looking tag object for the wrong source is refused before the ref" wrong_created_tag_object success 1 "noncanonical annotated tag" object false
-check_reconcile "a tag-create failure is preserved" tag_create_failure success 1 "Could not create release tag" both false
-check_reconcile "a tag verification API failure is preserved" tag_verify_api_failure success 1 "Could not read release tag" both false
-check_reconcile "a lightweight existing tag is refused" lightweight_tag success 1 "is not one annotated tag object" none false
-check_reconcile "a noncanonical annotated tag is refused" wrong_tag_message success 1 "does not match the trusted source and message" none false
-check_reconcile "a moved existing tag is refused" moved_tag success 1 "Release tag $tag moved" none false
-check_reconcile "a release-list failure is preserved" release_list_failure success 1 "Could not list GitHub releases" both false
-check_reconcile "a release-create failure is preserved" release_create_failure success 1 "Could not create draft" both true
-check_reconcile "multiple matching releases are refused" multiple_releases success 1 "multiple releases" none false
-check_reconcile "malformed release data is refused" malformed_releases success 1 "malformed release data" none false
-check_reconcile "a conflicting draft is refused" bad_draft success 1 "unexpected title or notes" none false
-check_reconcile "a foreign draft is refused" foreign_draft success 1 "trusted draft boundary" none false
-check_reconcile "an exact immutable public release recovers a repeated publish" existing_public failure 0 "ready for downstream recovery" none false
-check_reconcile "a mutable public release is refused" mutable_public success 1 "trusted published boundary" none false
-check_reconcile "a public release with the wrong title is refused" wrong_public success 1 "unexpected title or notes" none false
-check_reconcile "a foreign public release is refused" foreign_public success 1 "trusted published boundary" none false
-check_reconcile "an incomplete public release is refused" incomplete_public success 1 "not the exact expected" none false
+check_reconcile "crate publication verifies without GitHub mutation" valid success 0 "Verified crates.io"
+check_reconcile "a crate-only action failure is recovered" valid failure 0 "Recovered the exact registry state"
+check_reconcile "an absent registry version is refused" registry_missing failure 1 "is not on crates.io"
+check_reconcile "a registry outage is preserved" registry_api_error failure 1 "Could not verify"
+check_reconcile "a registry network failure is preserved" registry_network_error failure 1 "Could not verify"
+check_reconcile "a package from the wrong commit is refused" wrong_vcs_sha success 1 "VCS metadata"
+check_reconcile "a dirty source package is refused" dirty_vcs success 1 "VCS metadata"
+check_reconcile "malformed registry metadata is refused" registry_bad_metadata success 1 "invalid or yanked"
+check_reconcile "a yanked registry version is refused" registry_yanked success 1 "invalid or yanked"
+check_reconcile "a mismatched registry package is refused" registry_bad_checksum success 1 "does not match"
+
+check_tag "a final boundary creates the canonical tag" valid 0 "still resolves" both
+check_tag "an exact existing tag is verified without mutation" existing_draft 0 "still resolves" none
+check_tag "a tag-list failure is preserved" tag_list_failure 1 "Could not list" none
+check_tag "malformed tag data is refused" malformed_tags 1 "malformed tag-ref" none
+check_tag "multiple exact tags are refused" multiple_tags 1 "multiple exact refs" none
+check_tag "a tag-object failure is preserved" tag_object_create_failure 1 "Could not create annotated" object
+check_tag "a malformed tag object is refused" malformed_tag_object 1 "noncanonical annotated tag" object
+check_tag "a tag object for the wrong source is refused before the ref" wrong_created_tag_object 1 "noncanonical annotated tag" object
+check_tag "a tag-create failure is preserved" tag_create_failure 1 "Could not create release tag" both
+check_tag "a tag verification API failure is preserved" tag_verify_api_failure 1 "Could not read release tag" both
+check_tag "a lightweight existing tag is refused" lightweight_tag 1 "is not one annotated tag object" none
+check_tag "a noncanonical annotated tag is refused" wrong_tag_message 1 "does not match the trusted source and message" none
+check_tag "a moved existing tag is refused" moved_tag 1 "Release tag $tag moved" none
 
 if [[ "$failures" -ne 0 ]]; then
   echo "$failures source release check(s) failed" >&2
   exit 1
 fi
-echo "all source release reconciliation checks passed"
+echo "all source release and final tag checks passed"

@@ -1,3 +1,5 @@
 /target
+__pycache__/
+*.py[cod]
 # VHS scratch recordings; the committed assets are the Screenshot stills.
 target/vhs-scratch-*.gif

@@ -1,4 +1,5 @@
 name: CI
+run-name: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.validation_claim || format('CI {0}', github.ref_name) }}
 
 on:
   push:
@@ -8,20 +9,8 @@ on:
   schedule:
     # Daily compatibility lane against tower-mcp git main.
     - cron: "17 6 * * *"
-  workflow_dispatch:
-  workflow_call:
-    inputs:
-      release_ref:
-        description: Exact release-PR commit to validate
-        required: true
-        type: string
-    outputs:
-      gate_result:
-        description: Explicit result from the aggregate release gate
-        value: ${{ jobs.release-gate.outputs.gate_result }}
-      validated_ref:
-        description: Exact release commit covered by the gate
-        value: ${{ jobs.release-gate.outputs.validated_ref }}
+  repository_dispatch:
+    types: [release_validation]
 
 permissions:
   contents: read
@@ -31,20 +20,250 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  source:
+    name: Resolve exact CI source
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      release_validation: ${{ steps.source.outputs.release_validation }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      base_sha: ${{ steps.source.outputs.base_sha }}
+      validation_claim: ${{ steps.source.outputs.validation_claim }}
+    steps:
+      # repository_dispatch always resolves this checkout and all local reusable
+      # workflow code from the default branch. The candidate is selected only
+      # after the trusted control plane has authenticated its immutable identity.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Authenticate the requested release candidate
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != repository_dispatch ]]; then
+            {
+              echo 'release_validation=false'
+              echo "source_sha=$GITHUB_SHA"
+              echo "base_sha=$GITHUB_SHA"
+              echo 'validation_claim='
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "Repository dispatch did not resolve trusted main: $GITHUB_REF" >&2
+            exit 1
+          fi
+          if ! payload=$(jq -ce '
+            .client_payload |
+            select(type == "object") |
+            select((keys | sort) == ([
+              "base_sha", "head_branch", "head_sha", "parent_run_attempt",
+              "parent_run_id", "pr_number", "schema_version",
+              "validation_claim"
+            ] | sort)) |
+            select(.schema_version == 1) |
+            select((.parent_run_id | type) == "number" and
+              .parent_run_id > 0 and
+              .parent_run_id == (.parent_run_id | floor)) |
+            select((.parent_run_attempt | type) == "number" and
+              .parent_run_attempt > 0 and
+              .parent_run_attempt == (.parent_run_attempt | floor)) |
+            select((.pr_number | type) == "number" and
+              .pr_number > 0 and .pr_number == (.pr_number | floor)) |
+            select((.base_sha | type) == "string") |
+            select((.head_branch | type) == "string") |
+            select((.head_sha | type) == "string") |
+            select((.validation_claim | type) == "string")
+          ' "$GITHUB_EVENT_PATH"); then
+            echo 'Release validation dispatch payload is malformed' >&2
+            exit 1
+          fi
+          base_sha=$(jq -r .base_sha <<<"$payload")
+          head_sha=$(jq -r .head_sha <<<"$payload")
+          head_branch=$(jq -r .head_branch <<<"$payload")
+          claim=$(jq -r .validation_claim <<<"$payload")
+          parent_run_id=$(jq -r .parent_run_id <<<"$payload")
+          parent_run_attempt=$(jq -r .parent_run_attempt <<<"$payload")
+          pr_number=$(jq -r .pr_number <<<"$payload")
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ||
+                ! "$head_sha" =~ ^[0-9a-f]{40}$ ||
+                "$GITHUB_SHA" != "$base_sha" ||
+                ! "$head_branch" =~ ^release-plz-[A-Za-z0-9._/-]+$ ||
+                "$head_branch" == *..* || "$head_branch" == *//* ||
+                "$claim" != "release-validation-${parent_run_id}-${parent_run_attempt}-${head_sha}" ]] ||
+            ! git check-ref-format --branch "$head_branch" > /dev/null 2>&1; then
+            echo 'Release validation dispatch identity is invalid' >&2
+            exit 1
+          fi
+
+          parent_url="${GITHUB_SERVER_URL%/}/${GITHUB_REPOSITORY}/actions/runs/${parent_run_id}"
+          if ! parent=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${parent_run_id}/attempts/${parent_run_attempt}") ||
+            ! jq -e \
+              --argjson run_id "$parent_run_id" \
+              --argjson run_attempt "$parent_run_attempt" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg base_sha "$base_sha" \
+              --arg parent_url "$parent_url" '
+                type == "object" and
+                .id == $run_id and
+                .run_attempt == $run_attempt and
+                .event == "push" and
+                (.status == "queued" or .status == "in_progress" or
+                  (.status == "completed" and .conclusion == "success")) and
+                .head_branch == "main" and
+                .head_sha == $base_sha and
+                .path == ".github/workflows/release-plz.yml" and
+                .html_url == $parent_url and
+                (.repository.full_name // "") == $repository and
+                (.head_repository.full_name // "") == $repository
+              ' <<<"$parent" > /dev/null; then
+            echo 'Release validation dispatch has no trusted parent attempt' >&2
+            exit 1
+          fi
+          if ! current_parent=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${parent_run_id}") ||
+            ! jq -e \
+              --argjson run_id "$parent_run_id" \
+              --argjson run_attempt "$parent_run_attempt" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg base_sha "$base_sha" \
+              --arg parent_url "$parent_url" '
+                type == "object" and .id == $run_id and
+                .run_attempt == $run_attempt and
+                .event == "push" and
+                (.status == "queued" or .status == "in_progress" or
+                  (.status == "completed" and .conclusion == "success")) and
+                .head_branch == "main" and .head_sha == $base_sha and
+                .path == ".github/workflows/release-plz.yml" and
+                .html_url == $parent_url and
+                (.repository.full_name // "") == $repository and
+                (.head_repository.full_name // "") == $repository
+              ' <<<"$current_parent" > /dev/null; then
+            echo 'A newer Release-plz attempt superseded this dispatch' >&2
+            exit 1
+          fi
+
+          verify_candidate() {
+            local pull branch_ref
+            pull=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}") ||
+              return 1
+            jq -e \
+              --argjson pr_number "$pr_number" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg base_sha "$base_sha" \
+              --arg head_branch "$head_branch" \
+              --arg head_sha "$head_sha" '
+                type == "object" and .number == $pr_number and
+                .state == "open" and .base.ref == "main" and
+                (.base.sha // "") == $base_sha and
+                (.head.ref // "") == $head_branch and
+                (.head.sha // "") == $head_sha and
+                (.head.repo.full_name // "") == $repository and
+                (.user.login // "") == "github-actions[bot]" and
+                (.user.type // "") == "Bot"
+              ' <<<"$pull" > /dev/null || return 1
+            branch_ref=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/${head_branch}") ||
+              return 1
+            jq -e \
+              --arg expected_ref "refs/heads/$head_branch" \
+              --arg head_sha "$head_sha" '
+                type == "object" and .ref == $expected_ref and
+                .object.type == "commit" and .object.sha == $head_sha
+              ' <<<"$branch_ref" > /dev/null || return 1
+            ./scripts/verify-release-pr-files.sh \
+              "$GITHUB_REPOSITORY" "$pr_number" > /dev/null || return 1
+          }
+          if ! verify_candidate; then
+            echo 'Release candidate changed across its trusted identity' >&2
+            exit 1
+          fi
+
+          identity_dir="$RUNNER_TEMP/release-identity"
+          identity_name="release-identity-${parent_run_id}-${parent_run_attempt}-${head_sha}"
+          mkdir "$identity_dir"
+          if ! gh run download "$parent_run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$identity_name" \
+            --dir "$identity_dir"; then
+            echo 'Could not download the release identity artifact' >&2
+            exit 1
+          fi
+          actual_entries=$(find "$identity_dir" -mindepth 1 -maxdepth 1 \
+            -exec basename {} \; | LC_ALL=C sort)
+          if [[ "$actual_entries" != release-identity.json ||
+                ! -f "$identity_dir/release-identity.json" ||
+                -L "$identity_dir/release-identity.json" ]] ||
+            ! jq -e \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --argjson parent_run_id "$parent_run_id" \
+              --argjson parent_run_attempt "$parent_run_attempt" \
+              --arg base_sha "$base_sha" \
+              --argjson pr_number "$pr_number" \
+              --arg head_branch "$head_branch" \
+              --arg head_sha "$head_sha" '
+                type == "object" and
+                (keys | sort) == ([
+                  "base_sha", "head_branch", "head_sha", "parent_run_attempt",
+                  "parent_run_id", "pr_number", "repository", "schema_version"
+                ] | sort) and
+                .schema_version == 1 and .repository == $repository and
+                .parent_run_id == $parent_run_id and
+                .parent_run_attempt == $parent_run_attempt and
+                .base_sha == $base_sha and .pr_number == $pr_number and
+                .head_branch == $head_branch and .head_sha == $head_sha
+              ' "$identity_dir/release-identity.json" > /dev/null; then
+            echo 'Release identity artifact does not bind this dispatch' >&2
+            exit 1
+          fi
+          if ! verify_candidate; then
+            echo 'Release candidate moved after identity verification' >&2
+            exit 1
+          fi
+
+          {
+            echo 'release_validation=true'
+            echo "source_sha=$head_sha"
+            echo "base_sha=$base_sha"
+            echo "validation_claim=$claim"
+          } >> "$GITHUB_OUTPUT"
+
   quality:
     name: Quality
     if: github.event_name != 'schedule'
+    needs: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated release source
+        if: needs.source.outputs.release_validation == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: needs.source.outputs.release_validation != 'true'
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
@@ -61,44 +280,109 @@ jobs:
   package:
     name: Package
     if: github.event_name != 'schedule'
+    needs: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated release source
+        if: needs.source.outputs.release_validation == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: needs.source.outputs.release_validation != 'true'
       - name: Verify publishable package
         run: ./scripts/test-source-package.sh
 
   release-targets:
     name: Release targets
     if: github.event_name != 'schedule'
+    needs: source
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
       msrv: ${{ steps.targets.outputs.msrv }}
+      source_date_epoch: ${{ steps.targets.outputs.source_date_epoch }}
+      source_sha: ${{ steps.targets.outputs.source_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated release source
+        if: needs.source.outputs.release_validation == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Validate and export exact-MSRV targets
         id: targets
         shell: bash
+        env:
+          EXPECTED_SOURCE: ${{ needs.source.outputs.source_sha }}
+          RELEASE_VALIDATION: ${{ needs.source.outputs.release_validation }}
+          VALIDATION_CLAIM: ${{ needs.source.outputs.validation_claim }}
         run: |
           set -euo pipefail
+          if [[ ! "$EXPECTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release rehearsal source must be a lowercase 40-character commit" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_VALIDATION" == true ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != repository_dispatch ||
+                  "$GITHUB_REF" != refs/heads/main ||
+                  ! "$VALIDATION_CLAIM" =~ ^release-validation-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}$ ||
+                  "${VALIDATION_CLAIM##*-}" != "$EXPECTED_SOURCE" ]]; then
+              echo "Invalid release validation dispatch identity" >&2
+              exit 1
+            fi
+          elif [[ -n "$VALIDATION_CLAIM" ]]; then
+            echo "A validation claim is only valid for release validation" >&2
+            exit 1
+          fi
+          source_sha=$(git rev-parse HEAD)
+          if [[ "$source_sha" != "$EXPECTED_SOURCE" ]]; then
+            echo "Release target checkout $source_sha differs from $EXPECTED_SOURCE" >&2
+            exit 1
+          fi
           ./scripts/release-targets.sh validate
-          echo "matrix=$(./scripts/release-targets.sh msrv-matrix)" >> "$GITHUB_OUTPUT"
-          echo "msrv=$(jq -er '.rust.msrv' release-targets.json)" >> "$GITHUB_OUTPUT"
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          if [[ ! "$source_date_epoch" =~ ^[1-9][0-9]*$ ||
+                "$source_date_epoch" -lt 315532800 ||
+                "$source_date_epoch" -gt 2147483647 ]]; then
+            echo "Invalid source commit epoch: $source_date_epoch" >&2
+            exit 1
+          fi
+          {
+            echo "matrix=$(./scripts/release-targets.sh msrv-matrix)"
+            echo "msrv=$(jq -er '.rust.msrv' release-targets.json)"
+            echo "source_date_epoch=$source_date_epoch"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
 
   msrv:
     name: MSRV (${{ matrix.target }})
     if: github.event_name != 'schedule'
-    needs: release-targets
+    needs:
+      - source
+      - release-targets
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -106,13 +390,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated release source
+        if: needs.source.outputs.release_validation == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: ${{ needs.release-targets.outputs.msrv }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: needs.source.outputs.release_validation != 'true'
         with:
           key: msrv-${{ matrix.target }}
       - name: Check every target and feature at the declared MSRV
@@ -123,12 +419,24 @@ jobs:
   workflow-lint:
     name: Workflow and installer lint
     if: github.event_name != 'schedule'
+    needs: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated release source
+        if: needs.source.outputs.release_validation == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Install actionlint 1.7.12
         shell: bash
         run: |
@@ -160,10 +468,14 @@ jobs:
         # and these only run while a release is being published. This drives
         # them against a stubbed `gh`.
         run: |
-          ./scripts/test-release-guards.sh
+          ./scripts/test-publish-release.sh
           ./scripts/test-release-workflow.sh
           ./scripts/test-source-release.sh
           ./scripts/test-container-manifest.sh
+          ./scripts/test-container-sbom.sh
+          ./scripts/test-release-record.sh
+          ./scripts/test-select-run-artifacts.sh
+          ./scripts/test-normalize-release-sbom.sh
           ./scripts/test-release-targets.sh
           ./scripts/test-installer.sh
           ./scripts/test-package-release.sh
@@ -171,16 +483,29 @@ jobs:
   windows-directories:
     name: Windows directories
     if: github.event_name != 'schedule'
+    needs: source
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated release source
+        if: needs.source.outputs.release_validation == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: needs.source.outputs.release_validation != 'true'
       - name: Test native config, state, and discovery paths
         run: cargo test --lib windows_directories
 
@@ -189,20 +514,46 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository) ||
-      inputs.release_ref != ''
+      (github.event_name == 'repository_dispatch' &&
+      needs.source.outputs.release_validation == 'true')
+    needs:
+      - source
+      - release-targets
     uses: ./.github/workflows/release-build.yml
     with:
-      ref: ${{ inputs.release_ref || github.event.pull_request.head.sha || github.sha }}
       version: ci-${{ github.run_id }}-${{ github.run_attempt }}
       upload: false
+      toolchain: stable
+      source_sha: ${{ needs.source.outputs.source_sha }}
+
+  release-container:
+    name: Container release rehearsal
+    if: >-
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'repository_dispatch' &&
+      needs.source.outputs.release_validation == 'true')
+    needs:
+      - source
+      - release-targets
+    permissions:
+      contents: read
+    uses: ./.github/workflows/container-build.yml
+    with:
+      version: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      source_date_epoch: ${{ needs.release-targets.outputs.source_date_epoch }}
+      push: false
+      source_sha: ${{ needs.source.outputs.source_sha }}
 
   release-gate:
     name: Release gate
     if: >-
       always() &&
       (github.event_name == 'pull_request' ||
-      inputs.release_ref != '')
+      (github.event_name == 'repository_dispatch' &&
+      needs.source.outputs.release_validation == 'true'))
     needs:
+      - source
       - quality
       - package
       - release-targets
@@ -211,11 +562,13 @@ jobs:
       - windows-directories
       - deny
       - release-native
+      - release-container
     runs-on: ubuntu-latest
     outputs:
       gate_result: ${{ steps.gate.outputs.gate_result }}
       validated_ref: ${{ steps.gate.outputs.validated_ref }}
     env:
+      SOURCE: ${{ needs.source.result }}
       QUALITY: ${{ needs.quality.result }}
       PACKAGE: ${{ needs.package.result }}
       RELEASE_TARGETS: ${{ needs.release-targets.result }}
@@ -224,8 +577,10 @@ jobs:
       WINDOWS_DIRECTORIES: ${{ needs.windows-directories.result }}
       DEPENDENCIES: ${{ needs.deny.result }}
       NATIVE_RELEASE: ${{ needs.release-native.result }}
-      RUN_NATIVE_RELEASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || inputs.release_ref != '' }}
-      VALIDATED_REF: ${{ inputs.release_ref || github.event.pull_request.head.sha || github.sha }}
+      CONTAINER_RELEASE: ${{ needs.release-container.result }}
+      RUN_NATIVE_RELEASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'repository_dispatch' && needs.source.outputs.release_validation == 'true') }}
+      RUN_CONTAINER_RELEASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'repository_dispatch' && needs.source.outputs.release_validation == 'true') }}
+      VALIDATED_REF: ${{ needs.release-targets.outputs.source_sha }}
     steps:
       - name: Require every release prerequisite
         id: gate
@@ -233,6 +588,7 @@ jobs:
         run: |
           set -euo pipefail
           for result in \
+            "$SOURCE" \
             "$QUALITY" \
             "$PACKAGE" \
             "$RELEASE_TARGETS" \
@@ -257,6 +613,16 @@ jobs:
             exit 1
           fi
 
+          if [[ "$RUN_CONTAINER_RELEASE" == true && "$CONTAINER_RELEASE" != success ]]; then
+            echo "Container release rehearsal finished with status: $CONTAINER_RELEASE" >&2
+            exit 1
+          fi
+
+          if [[ "$RUN_CONTAINER_RELEASE" != true && "$CONTAINER_RELEASE" != skipped ]]; then
+            echo "Unexpected container release rehearsal status: $CONTAINER_RELEASE" >&2
+            exit 1
+          fi
+
           echo "gate_result=success" >> "$GITHUB_OUTPUT"
           echo "validated_ref=$VALIDATED_REF" >> "$GITHUB_OUTPUT"
 
@@ -265,12 +631,24 @@ jobs:
     # Runs on the schedule too, unlike the other default jobs: an advisory is
     # published against a dependency that did not change, so waiting for the
     # next commit to hear about it defeats the point.
+    needs: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Switch to the authenticated release source
+        if: needs.source.outputs.release_validation == 'true'
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Run checksum-pinned cargo-deny 0.20.2
         shell: bash
         run: |
@@ -304,9 +682,8 @@ jobs:
     # reproduces in this job means tower-mcp main moved, not that mcp-repl
     # regressed. The patch stops applying if main's version leaves the
     # declared semver range; that failure mode is the intended signal too.
-    if: >-
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && !startsWith(github.ref_name, 'release-plz-'))
+    if: github.event_name == 'schedule'
+    needs: source
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

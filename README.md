@@ -65,6 +65,11 @@ mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
 mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
 ```
 
+Every release also publishes deterministic SPDX inventories, signed SLSA and
+SBOM bundles, and one canonical record binding all native files to the final
+multi-platform container digest. See [Verify a downloaded release](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/releases.md#verify-a-downloaded-release)
+for checksum, signed-bundle, and container verification commands.
+
 ## One call, no prompt
 
 The prompt is one of two ways to use this. `-e` runs a command and exits:

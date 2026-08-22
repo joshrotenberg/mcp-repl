@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
 permissions: {}
 
@@ -95,7 +94,7 @@ jobs:
         if: steps.candidate.outputs.has_release == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-candidate-${{ github.sha }}
+          name: release-candidate-${{ github.run_attempt }}-${{ github.sha }}
           path: release-candidate
           if-no-files-found: error
           retention-days: 1
@@ -113,6 +112,7 @@ jobs:
       pr_number: ${{ steps.discover.outputs.pr_number }}
       head_branch: ${{ steps.discover.outputs.head_branch }}
       head_sha: ${{ steps.discover.outputs.head_sha }}
+      producer_attempt: ${{ steps.identity.outputs.producer_attempt }}
     steps:
       - name: Checkout exact main commit without a write token
         shell: bash
@@ -146,6 +146,7 @@ jobs:
           fi
           echo "current=true" >> "$GITHUB_OUTPUT"
       - name: Publish only the prepared release files
+        id: publish
         if: steps.freshness.outputs.current == 'true'
         shell: bash
         env:
@@ -161,7 +162,7 @@ jobs:
           candidate_dir="$RUNNER_TEMP/release-candidate"
           gh run download "$GITHUB_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --name "release-candidate-$GITHUB_SHA" \
+            --name "release-candidate-$GITHUB_RUN_ATTEMPT-$GITHUB_SHA" \
             --dir "$candidate_dir"
           actual_entries=$(find "$candidate_dir" -mindepth 1 -maxdepth 1 \
             -exec basename {} \; | LC_ALL=C sort)
@@ -233,6 +234,11 @@ jobs:
             exit 1
           fi
           git commit -m "chore: release mcp-repl v$RELEASE_VERSION"
+          generated_sha=$(git rev-parse HEAD)
+          if [[ ! "$generated_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Generated release commit has an invalid identity" >&2
+            exit 1
+          fi
           gh auth setup-git
           git push --force origin "HEAD:refs/heads/$branch"
 
@@ -245,13 +251,55 @@ jobs:
               --body 'Automated release candidate. Merge only after Release gate passes.' \
               --label release
           fi
+          echo "head_sha=$generated_sha" >> "$GITHUB_OUTPUT"
       - name: Discover the trusted release PR
         if: steps.freshness.outputs.current == 'true'
         id: discover
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_RELEASE_HEAD_SHA: ${{ steps.publish.outputs.head_sha }}
         run: ./scripts/discover-release-pr.sh "$GITHUB_OUTPUT"
+      - name: Record the exact generated release identity
+        if: steps.discover.outputs.head_sha != ''
+        id: identity
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.discover.outputs.pr_number }}
+          RELEASE_BRANCH: ${{ steps.discover.outputs.head_branch }}
+          RELEASE_HEAD_SHA: ${{ steps.discover.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          identity_dir="$RUNNER_TEMP/release-identity"
+          mkdir "$identity_dir"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson parent_run_id "$GITHUB_RUN_ID" \
+            --argjson parent_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg base_sha "$GITHUB_SHA" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg head_branch "$RELEASE_BRANCH" \
+            --arg head_sha "$RELEASE_HEAD_SHA" '
+              {
+                schema_version: 1,
+                repository: $repository,
+                parent_run_id: $parent_run_id,
+                parent_run_attempt: $parent_run_attempt,
+                base_sha: $base_sha,
+                pr_number: $pr_number,
+                head_branch: $head_branch,
+                head_sha: $head_sha
+              }
+            ' > "$identity_dir/release-identity.json"
+          echo "producer_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Preserve the exact generated release identity
+        if: steps.discover.outputs.head_sha != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-identity-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.discover.outputs.head_sha }}
+          path: ${{ runner.temp }}/release-identity/release-identity.json
+          if-no-files-found: error
+          retention-days: 90
 
   release-pending:
     name: Mark release validation pending
@@ -259,6 +307,7 @@ jobs:
     if: needs.release-pr.outputs.pr_number != ''
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
       statuses: write
@@ -271,12 +320,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.release-pr.outputs.pr_number }}
           HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_PRODUCER_ATTEMPT: ${{ needs.release-pr.outputs.producer_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: >-
           ./scripts/report-release-status.sh
           "$PR_NUMBER"
           "$HEAD_SHA"
           pending
+          "$RUN_URL"
           "$RUN_URL"
           "Release validation is running"
 
@@ -286,11 +337,37 @@ jobs:
       - release-pr
       - release-pending
     if: needs.release-pr.outputs.head_sha != ''
+    runs-on: ubuntu-latest
     permissions:
-      contents: read
-    uses: ./.github/workflows/ci.yml
-    with:
-      release_ref: ${{ needs.release-pr.outputs.head_sha }}
+      actions: read
+      contents: write
+      pull-requests: read
+    outputs:
+      gate_result: ${{ steps.validation.outputs.gate_result }}
+      validated_ref: ${{ steps.validation.outputs.validated_ref }}
+      run_url: ${{ steps.validation.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Dispatch and verify default-branch-controlled release CI
+        id: validation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.release-pr.outputs.pr_number }}
+          RELEASE_BRANCH: ${{ needs.release-pr.outputs.head_branch }}
+          RELEASE_HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+          VALIDATION_CLAIM: release-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.release-pr.outputs.head_sha }}
+        run: >-
+          ./scripts/dispatch-release-validation.sh
+          "$PR_NUMBER"
+          "$RELEASE_BRANCH"
+          "$RELEASE_HEAD_SHA"
+          "$VALIDATION_CLAIM"
+          "$GITHUB_OUTPUT"
 
   release-status:
     name: Report release validation
@@ -304,6 +381,7 @@ jobs:
       needs.release-pr.outputs.pr_number != ''
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
       statuses: write
@@ -317,15 +395,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.release-pr.outputs.pr_number }}
           HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+          RELEASE_PRODUCER_ATTEMPT: ${{ needs.release-pr.outputs.producer_attempt }}
           PENDING_RESULT: ${{ needs.release-pending.result }}
           VALIDATION_RESULT: ${{ needs.release-validation.result }}
           GATE_RESULT: ${{ needs.release-validation.outputs.gate_result }}
           VALIDATED_REF: ${{ needs.release-validation.outputs.validated_ref }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_URL: ${{ needs.release-validation.outputs.run_url }}
+          CLAIM_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
           set -euo pipefail
           state=failure
           description='Release validation failed'
+          target_url=$RUN_URL
+          if [[ -z "$target_url" ]]; then
+            target_url=$CLAIM_URL
+          fi
 
           if [[ "$PENDING_RESULT" != success ]]; then
             description="Pending status finished with $PENDING_RESULT"
@@ -344,7 +428,8 @@ jobs:
             "$PR_NUMBER" \
             "$HEAD_SHA" \
             "$state" \
-            "$RUN_URL" \
+            "$CLAIM_URL" \
+            "$target_url" \
             "$description"
 
           if [[ "$state" != success ]]; then

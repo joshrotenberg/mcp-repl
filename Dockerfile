@@ -1,10 +1,26 @@
-# Build the binary against the same source the release builds, so an image
-# tagged for a version contains that version rather than whatever the base
-# image happened to have. release-targets.json owns this exact MSRV; its
-# validator keeps the Docker mirror synchronized.
+# release-targets.json owns every value in this pre-FROM block. The tags make
+# the inputs legible to humans; the index digests make them immutable across
+# both supported architectures.
 ARG RUST_VERSION=1.90.0
-FROM rust:${RUST_VERSION}-slim-bookworm AS build
+ARG CARGO_AUDITABLE_VERSION=0.7.5
+ARG RUST_BASE=docker.io/library/rust:1.90.0-slim-bookworm@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9
+ARG RUNTIME_BASE=docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+
+FROM ${RUST_BASE} AS build
+ARG CARGO_AUDITABLE_VERSION
+ARG SOURCE_DATE_EPOCH
+RUN case "$SOURCE_DATE_EPOCH" in \
+      ''|*[!0-9]*) echo 'SOURCE_DATE_EPOCH must be canonical Unix seconds' >&2; exit 1 ;; \
+    esac \
+ && test "$SOURCE_DATE_EPOCH" -ge 315532800 \
+ && test "$SOURCE_DATE_EPOCH" -le 4294967295
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 WORKDIR /src
+
+RUN cargo install --locked --version "$CARGO_AUDITABLE_VERSION" cargo-auditable \
+ && cargo install --list | \
+      grep -Fx "cargo-auditable v$CARGO_AUDITABLE_VERSION:" > /dev/null \
+ && command -v cargo-auditable > /dev/null
 
 # Dependencies first, from the manifests alone, so editing sources does not
 # rebuild the dependency graph. The dummy targets exist only to give cargo
@@ -21,20 +37,22 @@ COPY examples ./examples
 # cargo skips a rebuild when mtimes look unchanged, and the dummy build just
 # wrote artifacts for these exact target names.
 RUN touch src/main.rs src/lib.rs \
- && cargo build --release --locked \
- && strip target/release/mcp-repl
+ && cargo auditable build --release --locked \
+ && strip target/release/mcp-repl \
+ && readelf -SW target/release/mcp-repl | \
+      grep -Eq '[[:space:]]\.dep-v0[[:space:]]'
 
-# ca-certificates is the only runtime dependency: --http talks TLS. Everything
-# else the REPL needs is in the binary.
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+# The pinned Rust base already carries the CA bundle needed by --http. Copying
+# that exact file removes an otherwise mutable apt index and package download
+# from the release build.
+FROM ${RUNTIME_BASE} AS runtime
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
-# An unprivileged user by default. Nothing here needs root, and a container
-# people are told to pipe untrusted server output through should not run as it.
-RUN useradd --create-home --uid 10001 mcp
-USER mcp
+# Use only deterministic numeric ownership. Creating an account with useradd
+# would write the build date into /etc/shadow and make the image vary by day.
+RUN install -d -m 0755 -o 10001 -g 10001 /home/mcp
+ENV HOME=/home/mcp
+USER 10001:10001
 WORKDIR /home/mcp
 
 COPY --from=build /src/target/release/mcp-repl /usr/local/bin/mcp-repl
