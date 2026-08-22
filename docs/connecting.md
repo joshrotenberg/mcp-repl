@@ -516,10 +516,11 @@ mcp-repl --timeout 10 --http https://example/mcp -e "search query=x"
 mcp-repl --timeout 0 -- ./my-server
 ```
 
-The deadline covers tool calls, `read`, `prompt`, `bench` calls, and surface
-fetches, on both transports, and it replaces the HTTP transport's own 30s
-limit so raising it raises the real one. A tool that legitimately runs longer
-than the deadline is better run task-augmented with a trailing `&`.
+The deadline covers the initial handshake, tool calls, `read`, `prompt`,
+`bench` calls, and surface fetches, on both transports, and it replaces the
+HTTP transport's own 30s limit so raising it raises the real one. A tool that
+legitimately runs longer than the deadline is better run task-augmented with a
+trailing `&`.
 `wait <id>` is exempt, because outliving the call is what a task is for; give
 it its own bound with `wait <id> --timeout 300`.
 

@@ -278,6 +278,7 @@ fn serve_raw_tools_only(
     failing_list: bool,
     downgrade: bool,
     strict_cursor: bool,
+    ignore_initialize: bool,
 ) -> Result<(), tower_mcp::BoxError> {
     use std::io::{BufRead, Write};
 
@@ -290,6 +291,9 @@ fn serve_raw_tools_only(
         }
         let request: serde_json::Value = serde_json::from_str(&line)?;
         let method = request["method"].as_str().unwrap_or_default();
+        if ignore_initialize && method == "initialize" {
+            continue;
+        }
         // A notification carries no id and takes no response.
         let Some(id) = request.get("id").filter(|id| !id.is_null()).cloned() else {
             continue;
@@ -402,6 +406,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             std::env::args().any(|arg| arg == "--failing-list"),
             std::env::args().any(|arg| arg == "--downgrade-protocol"),
             std::env::args().any(|arg| arg == "--strict-cursor"),
+            std::env::args().any(|arg| arg == "--ignore-initialize"),
         )?;
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
         return Ok(());
