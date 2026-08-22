@@ -54,9 +54,14 @@ else
 fi
 
 if command -v sha256sum > /dev/null; then
-  sha256sum "$archive" > "$archive.sha256"
+  digest=$(sha256sum "$archive" | awk '{print $1}')
 else
-  shasum -a 256 "$archive" > "$archive.sha256"
+  digest=$(shasum -a 256 "$archive" | awk '{print $1}')
 fi
+if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "could not compute canonical checksum for $archive" >&2
+  exit 1
+fi
+printf '%s  %s\n' "$digest" "$archive" > "$archive.sha256"
 
 printf '%s\n' "$archive"

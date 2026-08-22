@@ -1,6 +1,7 @@
 name: Release binaries
 
-# release-plz creates a draft GitHub release before dispatching this workflow.
+# Source-release reconciliation creates or verifies a draft GitHub release
+# before dispatching this workflow.
 # Every native target must build and package successfully before this workflow
 # uploads any public asset. The release is published only after all ten files
 # are present and their checksums verify, so a failed target cannot expose a
@@ -12,22 +13,70 @@ on:
         description: Existing draft release tag to build and publish
         required: true
         type: string
+      source_sha:
+        description: Release-merge commit captured before dispatch
+        required: true
+        type: string
 
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 
 concurrency:
   group: release-binaries-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify immutable release source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Match the workflow ref, tag, and package version
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/tags/$TAG" ]]; then
+            echo "Workflow ref $GITHUB_REF does not match immutable tag $TAG" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$SOURCE_SHA" ]]; then
+            echo "Dispatch resolved $GITHUB_SHA instead of expected source $SOURCE_SHA" >&2
+            exit 1
+          fi
+          checked_out_sha=$(git rev-parse HEAD)
+          if [[ "$checked_out_sha" != "$SOURCE_SHA" ]]; then
+            echo "Checkout $checked_out_sha does not match dispatch source $SOURCE_SHA" >&2
+            exit 1
+          fi
+          ./scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA"
+          version=$(cargo metadata --locked --no-deps --format-version 1 |
+            jq -er '.packages[] | select(.name == "mcp-repl") | .version')
+          if [[ "v$version" != "$TAG" ]]; then
+            echo "Cargo version $version does not match release tag $TAG" >&2
+            exit 1
+          fi
+
   build:
     name: Build and package every target
-    if: github.ref == 'refs/heads/main'
+    needs: verify
+    permissions:
+      contents: read
     uses: ./.github/workflows/release-build.yml
     with:
-      ref: ${{ inputs.tag }}
+      ref: ${{ inputs.source_sha }}
       version: ${{ inputs.tag }}
       upload: true
 
@@ -35,14 +84,20 @@ jobs:
     name: Publish complete binary release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     steps:
       # A plain checkout: this job needs scripts/publish-release.sh, and a
       # clever partial one is a new way for a release to fail at the moment
       # it is being published.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
 
       - name: Download every native package
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: release-*
           path: dist
@@ -56,7 +111,10 @@ jobs:
           # the script does not depend on where it happens to be run from.
           # Its absence is what left v0.3.0 stuck as a draft.
           GH_REPO: ${{ github.repository }}
-        run: ./scripts/publish-release.sh "${{ inputs.tag }}" dist
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          ./scripts/verify-release-tag.sh "${{ inputs.tag }}" "$SOURCE_SHA"
+          ./scripts/publish-release.sh "${{ inputs.tag }}" dist
 
   # The image ships only after the binary release has published, so a tag can
   # never exist on ghcr.io without the matching binaries on the release page.
@@ -64,6 +122,9 @@ jobs:
     name: Build container image (${{ matrix.platform }})
     needs: publish
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -76,13 +137,14 @@ jobs:
           - platform: linux/arm64
             os: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -93,7 +155,7 @@ jobs:
       # under a version tag.
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -111,7 +173,7 @@ jobs:
           mkdir -p /tmp/digests
           touch "/tmp/digests/${DIGEST#sha256:}"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: digest-${{ strategy.job-index }}
           path: /tmp/digests/*
@@ -121,38 +183,33 @@ jobs:
     name: Publish container manifest
     needs: container
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: digest-*
           path: /tmp/digests
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `latest` moves with the tag being published, matching how the release
-      # page treats the newest release.
-      - name: Create and push the manifest
-        working-directory: /tmp/digests
-        run: |
-          image=ghcr.io/${{ github.repository }}
-          version="${{ inputs.tag }}"
-          # One ref per digest file. An array rather than word splitting an
-          # unquoted substitution, which is the same thing and passes review.
-          refs=()
-          for digest in *; do
-            refs+=("$image@sha256:$digest")
-          done
-          docker buildx imagetools create \
-            -t "$image:${version#v}" \
-            -t "$image:latest" \
-            "${refs[@]}"
-
-      - name: Show what was published
-        run: docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:latest"
+      - name: Publish version manifest and reconcile latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: ./scripts/publish-container-manifest.sh "${{ inputs.tag }}" /tmp/digests

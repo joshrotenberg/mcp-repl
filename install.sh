@@ -47,12 +47,12 @@ arch="$(uname -m)"
 case "$os" in
     Linux)  os_part="unknown-linux-gnu" ;;
     Darwin) os_part="apple-darwin" ;;
-    *) die "no prebuilt binary for $os; install with \`cargo install mcp-repl\`" ;;
+    *) die "no prebuilt binary for $os; with Rust 1.90+, install with \`cargo install --locked mcp-repl\`" ;;
 esac
 case "$arch" in
     x86_64 | amd64)  arch_part="x86_64" ;;
     aarch64 | arm64) arch_part="aarch64" ;;
-    *) die "no prebuilt binary for $arch; install with \`cargo install mcp-repl\`" ;;
+    *) die "no prebuilt binary for $arch; with Rust 1.90+, install with \`cargo install --locked mcp-repl\`" ;;
 esac
 target="${arch_part}-${os_part}"
 
@@ -74,7 +74,7 @@ if [ -z "$version" ]; then
     # download failed with a nonsense name.
     case "$landed" in
         */tag/*) version="${landed##*/tag/}" ;;
-        *) die "$REPO has no published release yet; install with \`cargo install mcp-repl\`" ;;
+        *) die "$REPO has no published release yet; with Rust 1.90+, install with \`cargo install --locked mcp-repl\`" ;;
     esac
     [ -n "$version" ] || die "could not determine the latest release"
 fi

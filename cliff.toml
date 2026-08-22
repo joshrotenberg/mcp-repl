@@ -1,4 +1,4 @@
-# git-cliff configuration for tower-mcp
+# git-cliff configuration for mcp-repl
 # https://git-cliff.org/docs/configuration
 
 [changelog]
@@ -30,6 +30,12 @@ trim = true
 conventional_commits = true
 filter_unconventional = true
 split_commits = false
+# The merge title for #193 hid its user-facing feature behind CI wording.
+# Main history is immutable, so keep the generated release note truthful at
+# its source instead of hand-editing the release-plz branch after every run.
+commit_preprocessors = [
+    { pattern = 'feat: close demo coverage gaps and unblock release CI', replace = 'feat: support loglevel filtering on final MCP and expand demo coverage' },
+]
 commit_parsers = [
     { message = "^feat", group = "Features" },
     { message = "^fix", group = "Bug Fixes" },
