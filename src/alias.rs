@@ -764,9 +764,8 @@ url = "https://cratesio-mcp.fly.dev/"  # the public one
 
     #[test]
     fn a_full_round_trip_through_a_real_file() {
-        let dir = std::env::temp_dir().join(format!("mcp-repl-alias-{}", std::process::id()));
-        let path = dir.join("config.toml");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         let mut a = Aliases::new(BTreeMap::new(), BTreeMap::new(), None, Some(path.clone()));
 
         // The config file does not exist yet: defining creates it.
@@ -789,6 +788,5 @@ url = "https://cratesio-mcp.fly.dev/"  # the public one
                 .is_empty(),
             "{written}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

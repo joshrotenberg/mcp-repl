@@ -9649,8 +9649,8 @@ world",
     #[test]
     fn file_backed_history_writes_on_sync() {
         use reedline::{FileBackedHistory, History, HistoryItem};
-        let path = std::env::temp_dir().join(format!("mcp-repl-hist-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.txt");
         {
             let mut h = FileBackedHistory::with_file(10, path.clone()).unwrap();
             h.save(HistoryItem::from_command_line("echo persisted"))
@@ -9662,7 +9662,6 @@ world",
             contents.contains("echo persisted"),
             "history was not written to disk: {contents:?}"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A connected, initialized client over the in-process demo router, so
