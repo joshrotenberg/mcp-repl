@@ -19,11 +19,15 @@ from typing import Any
 
 
 SHA256_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
-IMAGE_RE = re.compile(
-    r"^(?P<registry>[A-Za-z0-9.-]+(?::[1-9][0-9]{0,4})?)/"
-    r"(?P<repository>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)$"
-)
+GHCR_REGISTRY = "ghcr.io"
+GHCR_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_BLOB_SIZE = 42 * 1024 * 1024
+MAX_MANIFEST_SIZE = 4 * 1024 * 1024
+MAX_DOCKER_CONFIG_SIZE = 1024 * 1024
+FILE_READ_CHUNK_SIZE = 64 * 1024
+# Evaluate support before tests or callers can wrap os.open. Runtime flags are still
+# checked immediately before each open so an incomplete platform fails closed.
+OPEN_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", ())
 STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 IN_TOTO_MEDIA_TYPE = "application/vnd.in-toto+json"
 ATTESTATION_ARTIFACT_TYPE = "application/vnd.docker.attestation.manifest.v1+json"
@@ -36,6 +40,8 @@ SUPPORTED_PREDICATES = {
     "https://slsa.dev/provenance/v1",
     "https://spdx.dev/Document",
 }
+MAX_ATTESTATION_LAYERS = len(SUPPORTED_PREDICATES)
+MAX_TOTAL_ATTESTATION_SIZE = MAX_ATTESTATION_LAYERS * MAX_BLOB_SIZE
 BUILDKIT_V1_BUILD_TYPE = (
     "https://github.com/moby/buildkit/blob/master/"
     "docs/attestations/slsa-definitions.md"
@@ -81,14 +87,177 @@ def is_positive_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def parse_ghcr_image(image: str) -> str:
+    """Return a validated owner/repository path, never a caller-selected host."""
+    parts = image.split("/")
+    if len(parts) != 3 or parts[0].lower() != GHCR_REGISTRY:
+        raise ValidationError("image must be an untagged GHCR GitHub repository name")
+    owner, repository = parts[1:]
+    if any(
+        component in {".", ".."} or GHCR_COMPONENT_RE.fullmatch(component) is None
+        for component in (owner, repository)
+    ):
+        raise ValidationError("image has an invalid GHCR repository path")
+    return f"{owner}/{repository}"
+
+
 def buildkit_builder_id(image: str) -> str:
-    match = IMAGE_RE.fullmatch(image)
-    if match is None or match.group("registry").lower() != "ghcr.io":
-        raise ValidationError("BuildKit provenance requires a GHCR repository")
-    repository = match.group("repository")
-    if len(repository.split("/")) != 2:
-        raise ValidationError("BuildKit provenance requires a GitHub repository image")
+    repository = parse_ghcr_image(image)
     return f"https://github.com/{repository}/.github/workflows/container-build.yml"
+
+
+def secure_open_flags(*, directory: bool = False) -> int:
+    """Build mandatory race-resistant flags or reject the platform."""
+    operations = ("open", "fstat", "read", "close")
+    if any(not callable(getattr(os, name, None)) for name in operations):
+        raise ValidationError("secure file operations are unavailable on this platform")
+    required = ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC")
+    values = [getattr(os, name, None) for name in required]
+    if any(not isinstance(value, int) for value in values):
+        raise ValidationError("secure file validation is unavailable on this platform")
+    flags = os.O_RDONLY
+    for value in values:
+        flags |= value
+    if directory:
+        directory_flag = getattr(os, "O_DIRECTORY", None)
+        if not isinstance(directory_flag, int):
+            raise ValidationError("secure directory validation is unavailable on this platform")
+        flags |= directory_flag
+    return flags
+
+
+def file_metadata(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    try:
+        return (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_mode,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+        )
+    except AttributeError as error:
+        raise ValidationError("stable file metadata is unavailable") from error
+
+
+def read_regular_fd(file_descriptor: int, label: str, size_limit: int) -> bytes:
+    """Read a pinned regular-file descriptor once, with a stable bounded snapshot."""
+    try:
+        before = os.fstat(file_descriptor)
+    except OSError as error:
+        raise ValidationError(f"could not inspect {label}") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise ValidationError(f"{label} is not a regular file")
+    if before.st_size > size_limit:
+        raise ValidationError(f"{label} exceeds its size bound")
+
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total <= size_limit:
+            chunk = os.read(
+                file_descriptor,
+                min(FILE_READ_CHUNK_SIZE, size_limit + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError as error:
+        raise ValidationError(f"could not read {label}") from error
+    if total > size_limit:
+        raise ValidationError(f"{label} exceeds its size bound")
+    try:
+        after = os.fstat(file_descriptor)
+    except OSError as error:
+        raise ValidationError(f"could not reinspect {label}") from error
+    if total != before.st_size or file_metadata(before) != file_metadata(after):
+        raise ValidationError(f"{label} changed while it was being read")
+    return b"".join(chunks)
+
+
+def read_regular_path(
+    path: os.PathLike[str] | str,
+    label: str,
+    size_limit: int,
+    *,
+    missing_ok: bool = False,
+) -> bytes | None:
+    """Open and read one path without a check/reopen race."""
+    flags = secure_open_flags()
+    try:
+        # The caller deliberately selects this local input. O_NOFOLLOW plus
+        # descriptor-pinned type, size, and stability checks below are the
+        # security boundary that CodeQL's path-taint model cannot represent.
+        # codeql[py/path-injection]
+        file_descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ValidationError(f"{label} does not exist") from None
+    except OSError as error:
+        raise ValidationError(f"could not securely open {label}") from error
+    try:
+        return read_regular_fd(file_descriptor, label, size_limit)
+    finally:
+        os.close(file_descriptor)
+
+
+def read_regular_directory_child(
+    directory: os.PathLike[str] | str,
+    child: str,
+    directory_label: str,
+    file_label: str,
+    size_limit: int,
+    *,
+    missing_directory_ok: bool = False,
+    missing_file_ok: bool = False,
+) -> bytes | None:
+    """Read a fixed child relative to a pinned, non-symlink directory."""
+    if not OPEN_SUPPORTS_DIR_FD:
+        raise ValidationError("secure directory-relative opens are unavailable")
+    if not child or child in {".", ".."} or Path(child).name != child:
+        raise ValidationError("secure file validation received an invalid child name")
+    directory_flags = secure_open_flags(directory=True)
+    try:
+        # The directory is caller-selected, but it is opened without symlink
+        # traversal and pinned before any fixed child name is resolved.
+        # codeql[py/path-injection]
+        directory_descriptor = os.open(directory, directory_flags)
+    except FileNotFoundError:
+        if missing_directory_ok:
+            return None
+        raise ValidationError(f"{directory_label} does not exist") from None
+    except OSError as error:
+        raise ValidationError(f"could not securely open {directory_label}") from error
+    try:
+        try:
+            directory_stat = os.fstat(directory_descriptor)
+        except OSError as error:
+            raise ValidationError(f"could not inspect {directory_label}") from error
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise ValidationError(f"{directory_label} is not a non-symlink directory")
+        try:
+            # child is one validated basename and directory_descriptor pins
+            # its lookup root across renames or path replacement.
+            # codeql[py/path-injection]
+            file_descriptor = os.open(
+                child,
+                secure_open_flags(),
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            if missing_file_ok:
+                return None
+            raise ValidationError(f"{file_label} does not exist") from None
+        except OSError as error:
+            raise ValidationError(f"could not securely open {file_label}") from error
+        try:
+            return read_regular_fd(file_descriptor, file_label, size_limit)
+        finally:
+            os.close(file_descriptor)
+    finally:
+        os.close(directory_descriptor)
 
 
 def string_annotations(value: Any, label: str) -> dict[str, str]:
@@ -414,26 +583,27 @@ def validate_statement(
     )
 
 
-def docker_credentials(registry: str) -> tuple[str, str] | None:
+def docker_credentials() -> tuple[str, str] | None:
     config_root = Path(os.environ.get("DOCKER_CONFIG", Path.home() / ".docker"))
-    config_path = config_root / "config.json"
-    try:
-        config_stat = config_path.lstat()
-    except FileNotFoundError:
+    config_bytes = read_regular_directory_child(
+        config_root,
+        "config.json",
+        "Docker credential directory",
+        "Docker credential config",
+        MAX_DOCKER_CONFIG_SIZE,
+        missing_directory_ok=True,
+        missing_file_ok=True,
+    )
+    if config_bytes is None:
         return None
-    if stat.S_ISLNK(config_stat.st_mode) or not stat.S_ISREG(config_stat.st_mode):
-        raise ValidationError("Docker credential config is not a regular file")
-    try:
-        config = load_json_bytes(config_path.read_bytes(), "Docker credential config")
-    except OSError as error:
-        raise ValidationError("could not read Docker credential config") from error
+    config = load_json_bytes(config_bytes, "Docker credential config")
     if not isinstance(config, dict) or not isinstance(config.get("auths", {}), dict):
         raise ValidationError("Docker credential config has invalid auths")
     candidates = (
-        registry,
-        f"https://{registry}",
-        f"https://{registry}/v1/",
-        f"https://{registry}/v2/",
+        GHCR_REGISTRY,
+        f"https://{GHCR_REGISTRY}",
+        f"https://{GHCR_REGISTRY}/v1/",
+        f"https://{GHCR_REGISTRY}/v2/",
     )
     entry: Any = None
     for candidate in candidates:
@@ -486,7 +656,7 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
-def bearer_challenge(value: str, registry: str, repository: str) -> str:
+def bearer_challenge(value: str, repository: str) -> str:
     scheme, separator, parameters = value.partition(" ")
     if separator != " " or scheme.lower() != "bearer":
         raise ValidationError("registry did not return a Bearer authentication challenge")
@@ -502,7 +672,7 @@ def bearer_challenge(value: str, registry: str, repository: str) -> str:
     realm_url = urllib.parse.urlsplit(realm)
     if (
         realm_url.scheme != "https"
-        or realm_url.netloc != registry
+        or realm_url.netloc != GHCR_REGISTRY
         or realm_url.username is not None
         or realm_url.password is not None
         or realm_url.fragment
@@ -530,6 +700,10 @@ def request_bytes(
     headers = {"Accept": "application/octet-stream", "User-Agent": "mcp-repl-release"}
     if authorization is not None:
         headers["Authorization"] = authorization
+    # Callers provide only a hardcoded ghcr.io blob URL or the same-host HTTPS
+    # token realm accepted by bearer_challenge; repository path components are
+    # structurally constrained and percent-encoded before reaching this sink.
+    # codeql[py/partial-ssrf]
     request = urllib.request.Request(url, headers=headers)
     try:
         with opener.open(request, timeout=30) as response:
@@ -555,35 +729,33 @@ def request_bytes(
 def fetch_registry_blob(
     image: str, digest: str, expected_size: int, cache: str | None
 ) -> bytes:
-    digest_hex = SHA256_RE.fullmatch(digest).group(1)
+    digest_match = SHA256_RE.fullmatch(digest)
+    if (
+        digest_match is None
+        or not is_positive_integer(expected_size)
+        or expected_size > MAX_BLOB_SIZE
+    ):
+        raise ValidationError("OCI blob descriptor is invalid")
+    digest_hex = digest_match.group(1)
+    repository = parse_ghcr_image(image)
     if cache is not None:
-        cache_path = Path(cache)
-        try:
-            cache_stat = cache_path.lstat()
-        except FileNotFoundError as error:
-            raise ValidationError("OCI blob cache does not exist") from error
-        if stat.S_ISLNK(cache_stat.st_mode) or not stat.S_ISDIR(cache_stat.st_mode):
-            raise ValidationError("OCI blob cache is not a non-symlink directory")
-        blob_path = cache_path / f"{digest_hex}.blob"
-        try:
-            blob_stat = blob_path.lstat()
-        except FileNotFoundError as error:
-            raise ValidationError(f"OCI blob cache is missing {digest}") from error
-        if stat.S_ISLNK(blob_stat.st_mode) or not stat.S_ISREG(blob_stat.st_mode):
-            raise ValidationError(f"cached OCI blob {digest} is not a regular file")
-        if blob_stat.st_size > expected_size:
-            raise ValidationError(f"cached OCI blob {digest} exceeds descriptor size")
-        try:
-            data = blob_path.read_bytes()
-        except OSError as error:
-            raise ValidationError(f"could not read cached OCI blob {digest}") from error
+        cached_label = f"cached OCI blob {digest}"
+        data = read_regular_directory_child(
+            cache,
+            f"{digest_hex}.blob",
+            "OCI blob cache",
+            cached_label,
+            expected_size,
+            missing_file_ok=True,
+        )
+        if data is None:
+            raise ValidationError(f"OCI blob cache is missing {digest}")
     else:
-        match = IMAGE_RE.fullmatch(image)
-        if match is None:
-            raise ValidationError("image must be an untagged registry/repository name")
-        registry = match.group("registry")
-        repository = match.group("repository")
-        url = f"https://{registry}/v2/{repository}/blobs/{digest}"
+        owner, name = repository.split("/", 1)
+        repository_path = "/".join(
+            urllib.parse.quote(component, safe="") for component in (owner, name)
+        )
+        url = f"https://{GHCR_REGISTRY}/v2/{repository_path}/blobs/{digest}"
         context = ssl.create_default_context()
         opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=context), SafeRedirectHandler()
@@ -596,8 +768,8 @@ def fetch_registry_blob(
                     f"registry blob request failed with HTTP {error.code}"
                 ) from error
             challenge = error.headers.get("WWW-Authenticate", "")
-            token_url = bearer_challenge(challenge, registry, repository)
-            credentials = docker_credentials(registry)
+            token_url = bearer_challenge(challenge, repository)
+            credentials = docker_credentials()
             basic = None
             if credentials is not None:
                 encoded = base64.b64encode(
@@ -647,26 +819,23 @@ def validate_manifest(
 ) -> list[str]:
     runnable_match = SHA256_RE.fullmatch(runnable)
     if (
-        IMAGE_RE.fullmatch(image) is None
-        or runnable_match is None
-        or not is_positive_integer(runnable_size)
+        runnable_match is None or not is_positive_integer(runnable_size)
     ):
         raise ValidationError("expected image or runnable descriptor is invalid")
+    parse_ghcr_image(image)
     if not PACKAGE_RE.fullmatch(expected_package) or not VERSION_RE.fullmatch(
         expected_version
     ):
         raise ValidationError("expected package identity is invalid")
     expected_builder_id = buildkit_builder_id(image)
-    try:
-        manifest_stat = manifest_path.lstat()
-    except FileNotFoundError as error:
-        raise ValidationError("attestation manifest does not exist") from error
-    if stat.S_ISLNK(manifest_stat.st_mode) or not stat.S_ISREG(manifest_stat.st_mode):
-        raise ValidationError("attestation manifest is not a regular file")
-    try:
-        manifest = load_json_bytes(manifest_path.read_bytes(), "attestation manifest")
-    except OSError as error:
-        raise ValidationError("could not read attestation manifest") from error
+    manifest_bytes = read_regular_path(
+        manifest_path,
+        "attestation manifest",
+        MAX_MANIFEST_SIZE,
+    )
+    if manifest_bytes is None:  # missing_ok is deliberately disabled above.
+        raise ValidationError("attestation manifest does not exist")
+    manifest = load_json_bytes(manifest_bytes, "attestation manifest")
     if not isinstance(manifest, dict):
         raise ValidationError("attestation manifest is not an object")
     exact_keys(
@@ -713,6 +882,8 @@ def validate_manifest(
         validate_descriptor(layer, f"attestation layer {index}")
         for index, layer in enumerate(layers)
     ]
+    if len(validated_layers) > MAX_ATTESTATION_LAYERS:
+        raise ValidationError("attestation manifest has too many layers")
     if len({layer["digest"] for layer in validated_layers}) != len(validated_layers):
         raise ValidationError("attestation manifest repeats a layer digest")
 
@@ -731,7 +902,7 @@ def validate_manifest(
     if any(layer["mediaType"] != IN_TOTO_MEDIA_TYPE for layer in validated_layers):
         raise ValidationError("attestation manifest has a non-in-toto layer")
     in_toto_layers = validated_layers
-    predicates: list[str] = []
+    layer_predicates: list[str] = []
     for layer in in_toto_layers:
         annotations = string_annotations(layer.get("annotations"), "in-toto layer")
         predicate = annotations.get("in-toto.io/predicate-type")
@@ -739,6 +910,14 @@ def validate_manifest(
             raise ValidationError("in-toto layer has no supported predicate annotation")
         if layer["size"] > MAX_BLOB_SIZE:
             raise ValidationError("in-toto layer exceeds the BuildKit attestation size bound")
+        layer_predicates.append(predicate)
+    if len(set(layer_predicates)) != len(layer_predicates):
+        raise ValidationError("attestation manifest repeats an in-toto predicate")
+    if sum(layer["size"] for layer in in_toto_layers) > MAX_TOTAL_ATTESTATION_SIZE:
+        raise ValidationError("attestation manifest exceeds its aggregate size bound")
+
+    predicates: list[str] = []
+    for layer, predicate in zip(in_toto_layers, layer_predicates, strict=True):
         blob = fetch_registry_blob(
             image, layer["digest"], layer["size"], str(blob_cache) if blob_cache else None
         )
