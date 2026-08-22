@@ -20,7 +20,11 @@ on:
         required: true
         type: boolean
 
-permissions: {}
+# The caller owns the maximum token scope for this reusable workflow. The CI
+# rehearsal passes only contents: read; release publication additionally passes
+# packages: write. The manifest job narrows that set below, while the build job
+# deliberately inherits the caller's exact set so one workflow can serve both
+# trust boundaries without granting package writes to pull requests.
 
 jobs:
   manifest:
@@ -89,9 +93,6 @@ jobs:
     name: ${{ matrix.platform }}
     needs: manifest
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.manifest.outputs.matrix) }}

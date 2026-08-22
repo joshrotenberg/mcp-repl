@@ -33,7 +33,9 @@ sbom_predicate='--predicate-type https://spdx.dev/Document/v2.3'
 }
 
 release_build="$root/.github/workflows/release-build.yml"
+container_build="$root/.github/workflows/container-build.yml"
 ci_workflow="$root/.github/workflows/ci.yml"
+release_workflow="$root/.github/workflows/release-binaries.yml"
 if grep -Fq 'github.event.pull_request.head.sha' "$ci_workflow"; then
   echo "CI must use one exact merge-or-release source for every release rehearsal" >&2
   exit 1
@@ -48,6 +50,33 @@ fi
   echo "CI release source and epoch must come from one validated checkout" >&2
   exit 1
 }
+
+# A reusable workflow cannot elevate the token granted by its caller. The
+# container build therefore inherits the caller's exact maximum: read-only in
+# CI, and contents-read/package-write only in trusted release publication. The
+# manifest job still narrows itself to contents-read explicitly.
+if grep -Eq '^permissions:' "$container_build"; then
+  echo "container workflow must inherit the caller's maximum permissions" >&2
+  exit 1
+fi
+container_build_job=$(sed -n '/^  build:/,$p' "$container_build")
+if grep -Eq '^    permissions:' <<<"$container_build_job"; then
+  echo "container build job must not unconditionally elevate caller permissions" >&2
+  exit 1
+fi
+ci_container_job=$(sed -n '/^  release-container:/,/^  release-gate:/p' "$ci_workflow")
+release_container_job=$(sed -n '/^  container:/,/^  container_manifest:/p' \
+  "$release_workflow")
+if [[ $(grep -Fc '      contents: read' <<<"$ci_container_job") -ne 1 ]] ||
+  grep -Fq '      packages: write' <<<"$ci_container_job"; then
+  echo "container rehearsal caller must remain contents-read only" >&2
+  exit 1
+fi
+if [[ $(grep -Fc '      contents: read' <<<"$release_container_job") -ne 1 ||
+      $(grep -Fc '      packages: write' <<<"$release_container_job") -ne 1 ]]; then
+  echo "container publication caller must grant its exact registry write boundary" >&2
+  exit 1
+fi
 
 touch_line=$(grep -Fn 'touch src/main.rs src/lib.rs' "$release_build" | cut -d: -f1)
 # These single-quoted patterns intentionally match literal workflow variables.
