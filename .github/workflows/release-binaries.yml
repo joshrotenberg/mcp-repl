@@ -1,12 +1,19 @@
 name: Release binaries
 
 # Source-release reconciliation verifies the exact published crate before this
-# reusable workflow runs at the frozen release-merge commit. Every native and
-# container target must complete before any version tag or GitHub release is
-# created. One final contents-write job creates or verifies the annotated tag,
-# stages the exact durable asset set, and immediately finalizes it.
+# reusable workflow runs at one frozen trusted main commit. Normally that is
+# the release merge; exceptional recovery carries an older release-merge SHA
+# only as authorization evidence. Every public source identity remains the
+# caller's github.sha. Every native and container target must complete before
+# any version tag or GitHub release is created.
 on:
   workflow_call:
+    inputs:
+      recovery_release_sha:
+        description: Authorization evidence for a failed older release merge; never a source checkout
+        required: false
+        default: ""
+        type: string
 
 permissions: {}
 
@@ -37,6 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Match the workflow ref and package version
@@ -44,6 +52,7 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ github.sha }}
+          RECOVERY_RELEASE_SHA: ${{ inputs.recovery_release_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
@@ -68,12 +77,24 @@ jobs:
             exit 1
           fi
           tag="v$version"
-          release_merge_output="$RUNNER_TEMP/release-merge-output"
-          : > "$release_merge_output"
-          ./scripts/discover-release-merge.sh "$release_merge_output"
-          if [[ $(<"$release_merge_output") != is_release_merge=true ]]; then
-            echo "Release source is not exactly one trusted release merge" >&2
-            exit 1
+          if [[ -n "$RECOVERY_RELEASE_SHA" ]]; then
+            recovery_output="$RUNNER_TEMP/recovery-output"
+            : > "$recovery_output"
+            ./scripts/verify-release-recovery.sh \
+              post-publish "$recovery_output" "$RECOVERY_RELEASE_SHA"
+            expected_recovery_output=$'is_release_merge=true\nrecovery_release_sha='"$RECOVERY_RELEASE_SHA"
+            if [[ $(<"$recovery_output") != "$expected_recovery_output" ]]; then
+              echo "Release recovery did not preserve its authorization evidence" >&2
+              exit 1
+            fi
+          else
+            release_merge_output="$RUNNER_TEMP/release-merge-output"
+            : > "$release_merge_output"
+            ./scripts/discover-release-merge.sh "$release_merge_output"
+            if [[ $(<"$release_merge_output") != is_release_merge=true ]]; then
+              echo "Release source is not exactly one trusted release merge" >&2
+              exit 1
+            fi
           fi
           ./scripts/release-targets.sh validate
           source_date_epoch=$(git show -s --format=%ct HEAD)

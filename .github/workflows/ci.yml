@@ -470,6 +470,7 @@ jobs:
         run: |
           ./scripts/test-publish-release.sh
           ./scripts/test-release-workflow.sh
+          ./scripts/test-release-recovery.sh
           ./scripts/test-source-release.sh
           ./scripts/test-container-manifest.sh
           ./scripts/test-container-sbom.sh

@@ -7,6 +7,11 @@ on:
   push:
     branches:
       - main
+  # Exceptional recovery runs current reviewed default-branch code. The
+  # request supplies only immutable evidence for one failed release attempt;
+  # it can never select a checkout or publication source.
+  repository_dispatch:
+    types: [release_publish_recovery]
 
 permissions: {}
 
@@ -32,17 +37,27 @@ jobs:
       pull-requests: read
       statuses: read
     outputs:
-      is_release_merge: ${{ steps.release-merge.outputs.is_release_merge }}
+      is_release_merge: ${{ steps.release-merge.outputs.is_release_merge == 'true' || steps.recovery.outputs.is_release_merge == 'true' }}
+      recovery_release_sha: ${{ steps.recovery.outputs.recovery_release_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Match exactly one trusted release PR
         id: release-merge
+        if: github.event_name == 'push'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/discover-release-merge.sh "$GITHUB_OUTPUT"
+      - name: Authenticate one failed source-publication recovery
+        id: recovery
+        if: github.event_name == 'repository_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/verify-release-recovery.sh pre-publish "$GITHUB_OUTPUT"
 
   verify-package:
     name: Verify package without credentials
@@ -119,6 +134,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install Rust toolchain
@@ -146,3 +162,5 @@ jobs:
       pull-requests: read
       statuses: read
     uses: ./.github/workflows/release-binaries.yml
+    with:
+      recovery_release_sha: ${{ needs.preflight.outputs.recovery_release_sha }}

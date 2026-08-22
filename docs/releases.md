@@ -84,8 +84,18 @@ binaries.
    `release-publish.yml` calls
    `release-binaries.yml` as a local reusable workflow. The call is resolved
    from the same frozen, trusted `main` `github.sha`; no workflow code is loaded
-   from a tag or candidate branch.
-8. The binary workflow accepts no workflow inputs. It inherits the caller's
+   from a tag or candidate branch. An exceptional typed recovery dispatch may
+   run newer reviewed default-branch code after a failed publication attempt.
+   Before exposing the registry credential, it authenticates the owner-sent
+   payload, exact failed run and five-job topology, original trusted release
+   merge, ancestry, and a strict changed-path allowlist that excludes every
+   package, native, container, toolchain, and release-record input. The older
+   release merge authorizes recovery but never selects source: Cargo VCS
+   metadata and every later public identity bind the recovery event's
+   `github.sha`.
+8. The binary workflow accepts only one optional recovery-authorization SHA.
+   That value is reauthenticated and is never used as a checkout, build, tag,
+   record, or attestation source. The workflow otherwise inherits the caller's
    event-bound `github.sha` and `refs/heads/main`, checks out that SHA
    everywhere, derives the semver tag from the locked Cargo metadata, and
    proves that the source is one trusted release merge and that Cargo names one
@@ -281,14 +291,33 @@ compact release record.
   limit, use **Re-run all jobs** before merging so publication receives fresh
   identity evidence.
 - If **Release publish** fails during merge preflight, credential-free package
-  verification, registry publication, or source reconciliation, use
-  **Re-run all jobs** on that existing run. This retries a registry attempt
-  that failed before upload while remaining safe if crates.io already accepted
-  it. The event stays bound to the release-merge SHA; a fresh dispatch from a
-  later `main` commit is intentionally ineligible. Reconciliation resumes a
-  crate-only partial publication only after proving the exact archive's VCS and
-  registry checksums; a yanked or mismatched crate fails closed before any tag
-  or release exists. Once the final publication boundary begins, a
+  verification, registry publication, or source reconciliation, first use
+  **Re-run all jobs** when the frozen workflow code is sound. This retries the
+  same source and remains safe if crates.io already accepted it: reconciliation
+  requires the rebuilt Cargo archive, embedded VCS SHA, and registry checksum
+  to agree exactly. A yanked or mismatched crate fails closed before any tag or
+  release exists.
+- If the frozen workflow itself is defective and the version is still absent,
+  merge a separately reviewed control-plane-only recovery fix to `main`, then
+  dispatch the exact failed evidence. For example:
+
+  ```bash
+  gh api --method POST repos/joshrotenberg/mcp-repl/dispatches \
+    -f event_type=release_publish_recovery \
+    -F 'client_payload[schema_version]=1' \
+    -f 'client_payload[release_merge_sha]=<40-character release merge SHA>' \
+    -F 'client_payload[run_id]=<failed run ID>' \
+    -F 'client_payload[run_attempt]=<failed run attempt>'
+  ```
+
+  The request is owner-only and cannot select executable code or source. The
+  recovery event's current `main` SHA—not the older release merge—becomes the
+  Cargo VCS, annotated-tag, release-record, GitHub-attestation, and GHCR source
+  identity. Any changed product/build input forces a fresh version. After
+  crates.io accepts that recovery SHA, resume later failures by rerunning failed
+  jobs in the same recovery run. A later controller commit has different Cargo
+  VCS metadata and cannot resume the accepted archive; its checksum mismatch is
+  intentionally fatal. Once the final publication boundary begins, a
   noncanonical or moved tag, conflicting draft, or mismatched canonical notes
   also fails closed.
 - A failed native target, container build, attestation, assembly, or staging
@@ -335,6 +364,7 @@ sh -n install.sh
 for script in scripts/*.sh; do bash -n "$script"; done
 ./scripts/test-publish-release.sh
 ./scripts/test-release-workflow.sh
+./scripts/test-release-recovery.sh
 ./scripts/test-source-release.sh
 ./scripts/test-container-manifest.sh
 ./scripts/test-container-sbom.sh

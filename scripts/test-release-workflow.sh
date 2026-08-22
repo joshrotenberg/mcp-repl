@@ -59,10 +59,32 @@ if grep -Fq 'release_ref' "$ci_workflow" ||
 fi
 if grep -Fq 'workflow_dispatch:' "$release_workflow" ||
   grep -Fq 'workflow_dispatch:' "$release_publish" ||
+  grep -Eq 'ref:.*(client_payload|recovery_release_sha|RECOVERY_RELEASE_SHA)' \
+    "$release_publish" "$release_workflow" ||
+  grep -Eq 'git .*fetch.*(client_payload|recovery_release_sha|RECOVERY_RELEASE_SHA)' \
+    "$release_publish" "$release_workflow" ||
+  grep -Eq '(SOURCE_SHA|source_sha|source-digest):.*(recovery_release_sha|RECOVERY_RELEASE_SHA)' \
+    "$release_publish" "$release_workflow" ||
   [[ $(grep -Fc 'workflow_call:' "$release_workflow") -ne 1 ||
      $(grep -Fc 'uses: ./.github/workflows/release-binaries.yml' \
        "$release_publish") -ne 1 ]]; then
   echo "binary publication must be called at the frozen trusted main event" >&2
+  exit 1
+fi
+# These single-quoted patterns intentionally match literal workflow syntax.
+# shellcheck disable=SC2016
+if [[ $(grep -Fc 'repository_dispatch:' "$release_publish") -ne 1 ||
+      $(grep -Fc 'types: [release_publish_recovery]' "$release_publish") -ne 1 ||
+      $(grep -Fc './scripts/verify-release-recovery.sh pre-publish "$GITHUB_OUTPUT"' \
+        "$release_publish") -ne 1 ||
+      $(grep -Fc 'recovery_release_sha: ${{ needs.preflight.outputs.recovery_release_sha }}' \
+        "$release_publish") -ne 1 ||
+      $(grep -Fc 'RECOVERY_RELEASE_SHA: ${{ inputs.recovery_release_sha }}' \
+        "$release_workflow") -ne 1 ||
+      $(grep -Fc 'SOURCE_SHA: ${{ github.sha }}' "$release_workflow") -ne 7 ||
+      $(grep -Fc 'post-publish "$recovery_output" "$RECOVERY_RELEASE_SHA"' \
+        "$release_workflow") -ne 1 ]]; then
+  echo "release recovery must carry authorization evidence without selecting release source" >&2
   exit 1
 fi
 reconcile_job=$(sed -n '/^  reconcile:/,/^  binaries:/p' "$release_publish")
@@ -1264,15 +1286,18 @@ check_discovery() {
 check_merge() {
   local name=$1 mode=$2 want_status=$3 want_text=$4 want_file_text=${5:-}
   local attempts=${6:-1}
+  local source_arg=${7:-} event_sha=${8:-$sha}
   local output status output_file="$work/merge-output"
+  local -a command=("$discover_merge" "$output_file")
+  [[ -z "$source_arg" ]] || command+=("$source_arg")
   : > "$output_file"
   rm -f "$work/run-state"
   set +e
   output=$(PATH="$work/bin:$PATH" GH_MODE="$mode" GH_LOG="$log" \
     GH_GATE=merge GH_RUN_STATE="$work/run-state" GITHUB_SERVER_URL=https://github.com \
     RELEASE_GATE_MAX_ATTEMPTS="$attempts" RELEASE_GATE_RETRY_DELAY_SECONDS=0 \
-    GITHUB_REPOSITORY=test/project GITHUB_SHA="$sha" \
-    "$discover_merge" "$output_file" 2>&1)
+    GITHUB_REPOSITORY=test/project GITHUB_SHA="$event_sha" \
+    "${command[@]}" 2>&1)
   status=$?
   set -e
   if ! assert_result "$name" "$status" "$want_status" "$output" "$want_text"; then
@@ -1433,6 +1458,8 @@ check_discovery "an invalid release-PR retry policy is refused" valid 2 \
   "Invalid release-PR discovery retry policy" "" "$sha" 0
 
 check_merge "a trusted release merge is discovered" valid 0 "exactly one trusted" "is_release_merge=true"
+check_merge "an explicit release SHA overrides only merge authorization" valid 0 \
+  "exactly one trusted" "is_release_merge=true" 1 "$sha" "$release_base"
 check_merge "an ordinary merge is a clean no-op" merge_none 0 "did not merge" "is_release_merge=false"
 check_merge "multiple release merges are refused" merge_multiple 1 "found 2"
 check_merge "release merges on multiple pages are all counted" merge_paged_multiple 1 "found 2"
