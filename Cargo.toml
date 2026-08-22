@@ -2,19 +2,27 @@
 name = "mcp-repl"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.90.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/joshrotenberg/mcp-repl"
 readme = "README.md"
 description = "Interactive MCP client REPL: connects to any MCP server and turns its tools, prompts, and resources into the command set"
 keywords = ["mcp", "repl", "cli", "client", "protocol"]
 categories = ["command-line-utilities", "development-tools"]
-# The black-box fixture server in examples/ is a test asset, and docs/ holds
-# the prose and the recordings behind the README's images. Neither belongs in
-# the published package: the recordings alone are most of a megabyte.
-# `deny.toml` configures a CI check and means nothing to a consumer of the
-# published crate.
-exclude = ["/examples", "/.github", "/docs", "/deny.toml"]
+# Keep the source package deliberately consumer-facing. Cargo adds its
+# normalized manifest and VCS metadata; everything else here is needed to
+# build the library/binary or understand the release. Repository-only E2E
+# fixtures, workflows, container assets, and release scripts are tested from
+# git and must not become broken targets in the published crate.
+include = [
+    "/src/**",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/config.example.toml",
+]
 
 # Applies to what people download, and to `cargo install`. Symbols are 4 MB
 # of a 20 MB binary and are no use without the matching source. `"debuginfo"`

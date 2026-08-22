@@ -32,6 +32,28 @@ All of these must pass before submitting a PR. The black-box tests build and
 spawn the fixture server in `examples/mcp_repl_fixture.rs`, so the first run
 compiles tower-mcp's server features as dev-dependencies.
 
+Changes that can affect publishing also need the consumer-view package gate:
+
+```bash
+./scripts/test-source-package.sh
+```
+
+It tests and installs the extracted crate with its lockfile, then executes the
+installed binary. Repository-only fixtures and release infrastructure are
+required to stay out of that source package.
+
+Release platform, workflow, or installer changes additionally need:
+
+```bash
+./scripts/release-targets.sh validate
+./scripts/test-release-targets.sh
+./scripts/test-installer.sh
+./scripts/test-package-release.sh
+```
+
+`release-targets.json` is the sole platform/MSRV inventory; do not copy a
+production target table into a workflow, publication guard, or installer.
+
 The command, routing/path, imported-config, wire-redaction, and alias
 boundaries also have a dependency-free deterministic property corpus. Run it
 on its own with:
@@ -62,13 +84,19 @@ editor behavior over a repository-wide vanity percentage.
 Adding or updating a dependency also needs:
 
 ```bash
-cargo deny check
+cargo deny check \
+  -D unmatched-skip \
+  -D unnecessary-skip \
+  advisories licenses bans sources
 ```
 
 which checks the graph against RUSTSEC advisories, the license allowlist in
-`deny.toml`, and the ban on wildcard versions and non-crates.io sources. CI
-runs it on every push and daily, since an advisory can be published against a
-dependency that has not changed. Install it with `cargo install cargo-deny`.
+`deny.toml`, the exact reviewed duplicate-version baseline, and the bans on
+wildcard versions and non-crates.io sources. New duplicate groups fail; a
+resolved or unmatched baseline entry also fails so the allowlist cannot become
+stale. CI runs it on every pull request and `main` push, and daily, since an
+advisory can be published against a dependency that has not changed. Install
+it with `cargo install cargo-deny`.
 
 ## Commit Messages
 

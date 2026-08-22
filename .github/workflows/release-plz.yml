@@ -4,100 +4,434 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
-permissions:
-  actions: write
-  contents: write
-  pull-requests: write
+permissions: {}
+
+env:
+  RELEASE_RUST: 1.97.1
 
 concurrency:
+  # This workflow only updates and validates the generated PR, so coalescing
+  # pending main pushes is safe. Keeping the whole status graph serialized
+  # also makes its read/claim/write protocol race-free.
   group: release-plz-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release-pr:
-    name: Update release PR
+  prepare-release:
+    name: Prepare release candidate without credentials
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has_release: ${{ steps.candidate.outputs.has_release }}
+      version: ${{ steps.candidate.outputs.version }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Update release PR
-        uses: release-plz/action@v0.5
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - name: Dispatch required CI on release-plz branches
-        # Bot-created pull_request runs wait for approval. The trusted
-        # release-ci-status workflow mirrors this dispatch onto the PR head.
+          toolchain: ${{ env.RELEASE_RUST }}
+      - name: Install checksum-pinned release-plz 0.3.160
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh pr list \
-            --state open \
-            --json headRefName,isCrossRepository \
-            --jq '.[] | select(.isCrossRepository == false and (.headRefName | startswith("release-plz-"))) | .headRefName' |
-            while IFS= read -r branch; do
-              echo "Dispatching required CI for $branch"
-              gh workflow run ci.yml --ref "$branch"
-            done
-
-  release:
-    name: Publish crate and stage GitHub release
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Publish release
-        uses: release-plz/action@v0.5
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - name: Dispatch binary publication for a release merge
+          archive=release-plz-x86_64-unknown-linux-gnu.tar.gz
+          url="https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.160/$archive"
+          destination="$RUNNER_TEMP/$archive"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 120 \
+            --output "$destination" "$url"
+          printf '%s  %s\n' \
+            2263c4f95eac1513da96a114a77fde20ea038742a8c8050f7514b8f93b828646 \
+            "$destination" | sha256sum --check --strict
+          tar -xzf "$destination" -C "$RUNNER_TEMP" release-plz
+          test "$("$RUNNER_TEMP/release-plz" --version)" = 'release-plz 0.3.160'
+      - name: Generate the release files without a write token
+        id: candidate
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          release_pr_count=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
-            --jq '[.[] | select(.head.ref | startswith("release-plz-"))] | length')
+          "$RUNNER_TEMP/release-plz" update
 
-          if [[ "$release_pr_count" == 0 ]]; then
-            echo "This commit did not merge a release-plz PR; nothing to publish"
+          actual=$(git status --short --untracked-files=all | LC_ALL=C sort)
+          if [[ -z "$actual" ]]; then
+            echo 'has_release=false' >> "$GITHUB_OUTPUT"
+            echo 'version=' >> "$GITHUB_OUTPUT"
+            echo 'No release candidate was generated'
             exit 0
           fi
+          expected=$' M CHANGELOG.md\n M Cargo.lock\n M Cargo.toml'
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'release-plz changed an unexpected worktree set:' >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
 
-          git fetch --force --tags
-          dispatched=false
-          while IFS= read -r tag; do
-            [[ -n "$tag" ]] || continue
-            if [[ $(gh release view "$tag" --json isDraft --jq .isDraft) == true ]]; then
-              echo "Dispatching native publication for $tag"
-              gh workflow run release-binaries.yml --ref main -f "tag=$tag"
-              dispatched=true
-            fi
-          done < <(git tag --points-at "$GITHUB_SHA")
+          version=$(cargo metadata --locked --no-deps --format-version 1 |
+            jq -er '.packages[] | select(.name == "mcp-repl") | .version')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release-plz generated invalid version $version" >&2
+            exit 1
+          fi
+          ./scripts/extract-release-notes.sh "$version" > /dev/null
 
-          if [[ "$dispatched" != true ]]; then
-            echo "Release merge produced no draft release at $GITHUB_SHA" >&2
+          mkdir release-candidate
+          cp CHANGELOG.md Cargo.lock Cargo.toml release-candidate/
+          (
+            cd release-candidate
+            sha256sum CHANGELOG.md Cargo.lock Cargo.toml > SHA256SUMS
+          )
+          echo 'has_release=true' >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Preserve the credential-free release candidate
+        if: steps.candidate.outputs.has_release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-candidate-${{ github.run_attempt }}-${{ github.sha }}
+          path: release-candidate
+          if-no-files-found: error
+          retention-days: 1
+
+  release-pr:
+    name: Update release PR
+    needs: prepare-release
+    if: needs.prepare-release.outputs.has_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    outputs:
+      pr_number: ${{ steps.discover.outputs.pr_number }}
+      head_branch: ${{ steps.discover.outputs.head_branch }}
+      head_sha: ${{ steps.discover.outputs.head_sha }}
+      producer_attempt: ${{ steps.identity.outputs.producer_attempt }}
+    steps:
+      - name: Checkout exact main commit without a write token
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Refuse to update from a stale main commit
+        id: freshness
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! live_main=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" \
+            --jq .object.sha); then
+            echo "Could not resolve the live main branch" >&2
+            exit 1
+          fi
+          if [[ ! "$live_main" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Live main returned an invalid commit: $live_main" >&2
+            exit 1
+          fi
+          if [[ "$live_main" != "$GITHUB_SHA" ]]; then
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping stale main commit $GITHUB_SHA; live main is $live_main"
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+      - name: Publish only the prepared release files
+        id: publish
+        if: steps.freshness.outputs.current == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid prepared release version: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+          candidate_dir="$RUNNER_TEMP/release-candidate"
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "release-candidate-$GITHUB_RUN_ATTEMPT-$GITHUB_SHA" \
+            --dir "$candidate_dir"
+          actual_entries=$(find "$candidate_dir" -mindepth 1 -maxdepth 1 \
+            -exec basename {} \; | LC_ALL=C sort)
+          expected_entries=$'CHANGELOG.md\nCargo.lock\nCargo.toml\nSHA256SUMS'
+          if [[ "$actual_entries" != "$expected_entries" ]]; then
+            echo 'Downloaded release candidate has an unexpected file set:' >&2
+            printf '%s\n' "$actual_entries" >&2
+            exit 1
+          fi
+          (
+            cd "$candidate_dir"
+            sha256sum --check --strict SHA256SUMS
+          )
+          cp "$candidate_dir/CHANGELOG.md" \
+            "$candidate_dir/Cargo.lock" \
+            "$candidate_dir/Cargo.toml" .
+          actual=$(git status --short --untracked-files=all | LC_ALL=C sort)
+          expected=$' M CHANGELOG.md\n M Cargo.lock\n M Cargo.toml'
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'Prepared candidate produced an unexpected worktree set:' >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
+          pull_pages=$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&per_page=100")
+          candidates=$(jq -ce --arg repository "$GITHUB_REPOSITORY" '
+            if type != "array" or any(.[]; type != "array")
+            then error("pull pages are malformed")
+            else [.[][] |
+              select(.base.ref == "main") |
+              select((.head.ref // "") | startswith("release-plz-")) |
+              select((.head.repo.full_name // "") == $repository) |
+              select((.user.login // "") == "github-actions[bot]") |
+              select((.user.type // "") == "Bot")]
+            end
+          ' <<<"$pull_pages")
+          candidate_count=$(jq -r 'length' <<<"$candidates")
+          case "$candidate_count" in
+            0)
+              branch="release-plz-mcp-repl-v$RELEASE_VERSION"
+              create_pr=true
+              ;;
+            1)
+              branch=$(jq -er '.[0].head.ref' <<<"$candidates")
+              create_pr=false
+              ;;
+            *)
+              echo "Expected at most one release PR, found $candidate_count" >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! "$branch" =~ ^release-plz-[A-Za-z0-9._/-]+$ ]]; then
+            echo "Invalid release branch: $branch" >&2
+            exit 1
+          fi
+
+          git config core.hooksPath /dev/null
+          git config commit.gpgsign false
+          git config user.name 'github-actions[bot]'
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git add -- CHANGELOG.md Cargo.lock Cargo.toml
+          staged=$(git diff --cached --name-only | LC_ALL=C sort)
+          expected_staged=$'CHANGELOG.md\nCargo.lock\nCargo.toml'
+          if [[ "$staged" != "$expected_staged" ]]; then
+            echo 'Refusing unexpected staged release files' >&2
+            exit 1
+          fi
+          git commit -m "chore: release mcp-repl v$RELEASE_VERSION"
+          generated_sha=$(git rev-parse HEAD)
+          if [[ ! "$generated_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Generated release commit has an invalid identity" >&2
+            exit 1
+          fi
+          gh auth setup-git
+          git push --force origin "HEAD:refs/heads/$branch"
+
+          if [[ "$create_pr" == true ]]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "chore: release mcp-repl v$RELEASE_VERSION" \
+              --body 'Automated release candidate. Merge only after Release gate passes.' \
+              --label release
+          fi
+          echo "head_sha=$generated_sha" >> "$GITHUB_OUTPUT"
+      - name: Discover the trusted release PR
+        if: steps.freshness.outputs.current == 'true'
+        id: discover
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_RELEASE_HEAD_SHA: ${{ steps.publish.outputs.head_sha }}
+        run: ./scripts/discover-release-pr.sh "$GITHUB_OUTPUT"
+      - name: Record the exact generated release identity
+        if: steps.discover.outputs.head_sha != ''
+        id: identity
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.discover.outputs.pr_number }}
+          RELEASE_BRANCH: ${{ steps.discover.outputs.head_branch }}
+          RELEASE_HEAD_SHA: ${{ steps.discover.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          identity_dir="$RUNNER_TEMP/release-identity"
+          mkdir "$identity_dir"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson parent_run_id "$GITHUB_RUN_ID" \
+            --argjson parent_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg base_sha "$GITHUB_SHA" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg head_branch "$RELEASE_BRANCH" \
+            --arg head_sha "$RELEASE_HEAD_SHA" '
+              {
+                schema_version: 1,
+                repository: $repository,
+                parent_run_id: $parent_run_id,
+                parent_run_attempt: $parent_run_attempt,
+                base_sha: $base_sha,
+                pr_number: $pr_number,
+                head_branch: $head_branch,
+                head_sha: $head_sha
+              }
+            ' > "$identity_dir/release-identity.json"
+          echo "producer_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Preserve the exact generated release identity
+        if: steps.discover.outputs.head_sha != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-identity-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.discover.outputs.head_sha }}
+          path: ${{ runner.temp }}/release-identity/release-identity.json
+          if-no-files-found: error
+          retention-days: 90
+
+  release-pending:
+    name: Mark release validation pending
+    needs: release-pr
+    if: needs.release-pr.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Post the pending release gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.release-pr.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+          RELEASE_PRODUCER_ATTEMPT: ${{ needs.release-pr.outputs.producer_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: >-
+          ./scripts/report-release-status.sh
+          "$PR_NUMBER"
+          "$HEAD_SHA"
+          pending
+          "$RUN_URL"
+          "$RUN_URL"
+          "Release validation is running"
+
+  release-validation:
+    name: Validate exact release candidate
+    needs:
+      - release-pr
+      - release-pending
+    if: needs.release-pr.outputs.head_sha != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    outputs:
+      gate_result: ${{ steps.validation.outputs.gate_result }}
+      validated_ref: ${{ steps.validation.outputs.validated_ref }}
+      run_url: ${{ steps.validation.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Dispatch and verify default-branch-controlled release CI
+        id: validation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.release-pr.outputs.pr_number }}
+          RELEASE_BRANCH: ${{ needs.release-pr.outputs.head_branch }}
+          RELEASE_HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+          VALIDATION_CLAIM: release-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.release-pr.outputs.head_sha }}
+        run: >-
+          ./scripts/dispatch-release-validation.sh
+          "$PR_NUMBER"
+          "$RELEASE_BRANCH"
+          "$RELEASE_HEAD_SHA"
+          "$VALIDATION_CLAIM"
+          "$GITHUB_OUTPUT"
+
+  release-status:
+    name: Report release validation
+    needs:
+      - release-pr
+      - release-pending
+      - release-validation
+    if: >-
+      always() &&
+      needs.release-pr.result == 'success' &&
+      needs.release-pr.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Post the final release gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.release-pr.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.release-pr.outputs.head_sha }}
+          RELEASE_PRODUCER_ATTEMPT: ${{ needs.release-pr.outputs.producer_attempt }}
+          PENDING_RESULT: ${{ needs.release-pending.result }}
+          VALIDATION_RESULT: ${{ needs.release-validation.result }}
+          GATE_RESULT: ${{ needs.release-validation.outputs.gate_result }}
+          VALIDATED_REF: ${{ needs.release-validation.outputs.validated_ref }}
+          RUN_URL: ${{ needs.release-validation.outputs.run_url }}
+          CLAIM_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          state=failure
+          description='Release validation failed'
+          target_url=$RUN_URL
+          if [[ -z "$target_url" ]]; then
+            target_url=$CLAIM_URL
+          fi
+
+          if [[ "$PENDING_RESULT" != success ]]; then
+            description="Pending status finished with $PENDING_RESULT"
+          elif [[ "$VALIDATION_RESULT" != success ]]; then
+            description="Release validation finished with $VALIDATION_RESULT"
+          elif [[ "$GATE_RESULT" != success ]]; then
+            description='Release validation did not report a passing gate'
+          elif [[ "$VALIDATED_REF" != "$HEAD_SHA" ]]; then
+            description='Release validation reported a different commit'
+          else
+            state=success
+            description='Release validation passed'
+          fi
+
+          ./scripts/report-release-status.sh \
+            "$PR_NUMBER" \
+            "$HEAD_SHA" \
+            "$state" \
+            "$CLAIM_URL" \
+            "$target_url" \
+            "$description"
+
+          if [[ "$state" != success ]]; then
             exit 1
           fi

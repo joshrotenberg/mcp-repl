@@ -1,12 +1,14 @@
 //! Black-box coverage for the published `mcp-repl` process boundary.
 
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -299,6 +301,7 @@ impl HttpFixture {
         Self::start_configured(fixture, temp, None, None, Some("http-switching")).await
     }
 
+    #[cfg(unix)]
     async fn start_with_bearer(fixture: &Path, temp: &TempDir, bearer: &str) -> Self {
         Self::start_configured(fixture, temp, Some(bearer), None, None).await
     }

@@ -38,12 +38,37 @@ allow = [
 ]
 
 [bans]
-# Duplicate versions are a fact of a large graph and not something this crate
-# can fix from here, so they are visible rather than fatal.
-multiple-versions = "warn"
+# New duplicate-version groups are a supply-chain expansion and fail CI. The
+# exact older sides of reviewed upstream transitions are recorded below;
+# unmatched or no-longer-necessary entries are fatal in the CI invocation so
+# dependency updates force this baseline to shrink.
+multiple-versions = "deny"
+highlight = "all"
 # A wildcard dependency makes the build unreproducible and would let a
 # breaking upload land silently.
 wildcards = "deny"
+skip = [
+    # axum/hyper-util/reqwest have not yet moved to the base64 0.23 line used
+    # directly and by tower-mcp-types.
+    { crate = "base64@0.22.1", reason = "blocked on the HTTP stack adopting base64 0.23" },
+    # secret-service and the WebSocket stack still use digest 0.10 through
+    # sha1/sha2 0.10, while tower-mcp has moved to sha2/digest 0.11.
+    { crate = "block-buffer@0.10.4", reason = "blocked on secret-service and sha1 moving to digest 0.11" },
+    { crate = "cpufeatures@0.2.17", reason = "blocked on aes, sha1, and sha2 0.10 moving to the 0.3 API" },
+    { crate = "crypto-common@0.1.7", reason = "blocked on cipher and digest 0.10 moving to crypto-common 0.2" },
+    { crate = "digest@0.10.7", reason = "blocked on secret-service and the WebSocket sha1 stack adopting digest 0.11" },
+    # Platform keyring support and rand/tungstenite are on older getrandom
+    # generations than mcp-repl, tempfile, uuid, and tower-mcp.
+    { crate = "getrandom@0.2.17", reason = "blocked on secret-service moving off getrandom 0.2" },
+    { crate = "getrandom@0.3.4", reason = "blocked on rand 0.9 and tungstenite moving to getrandom 0.4" },
+    { crate = "r-efi@5.3.0", reason = "blocked on the getrandom 0.3 dependency line" },
+    { crate = "sha2@0.10.9", reason = "blocked on secret-service moving to sha2 0.11" },
+    # The proc-macro ecosystem is midway through the syn 3 transition.
+    { crate = "syn@2.0.119", reason = "blocked on futures, zbus, tracing, and platform macro crates adopting syn 3" },
+    # reedline reaches windows-sys 0.59 through fd-lock; the rest of the graph
+    # has moved to windows-sys 0.61.
+    { crate = "windows-sys@0.59.0", reason = "blocked on fd-lock and reedline adopting windows-sys 0.61" },
+]
 
 [sources]
 # Everything comes from crates.io. A git dependency would also make the crate

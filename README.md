@@ -25,18 +25,25 @@ On macOS or Linux, install the prebuilt x86_64 or arm64 binary with:
 curl -fsSL https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/install.sh | sh
 ```
 
-It verifies the release's published checksum before unpacking, and installs
-to `~/.local/bin` unless `MCP_REPL_INSTALL_DIR` says otherwise. Reading a
-script before piping it to a shell is the better habit, and this one is
-short. On Windows, download the `x86_64-pc-windows-msvc.zip` from the
+It detects glibc 2.34+, musl, older glibc, and unknown Linux libc safely,
+verifies the release's self-naming checksum, and executes the staged binary
+before atomically replacing `~/.local/bin/mcp-repl` (or
+`MCP_REPL_INSTALL_DIR/mcp-repl`). A failed download, verification, or startup
+leaves an existing install untouched and prints the locked source-install
+fallback; this also covers a compatible prebuilt asset not yet being available
+in the selected release. Reading a script before piping it to a shell is the
+better habit. On Windows, download the
+`mcp-repl-vX.Y.Z-x86_64-pc-windows-msvc.zip` from the
 [latest release](https://github.com/joshrotenberg/mcp-repl/releases/latest),
 extract `mcp-repl.exe`, and place it on `PATH`.
 
 Or install from source on any supported platform:
 
 ```bash
-cargo install mcp-repl
+cargo install --locked mcp-repl
 ```
+
+Source installs require Rust 1.90.0 or newer.
 
 Or run it without installing anything:
 
@@ -46,7 +53,8 @@ docker run --rm -it ghcr.io/joshrotenberg/mcp-repl --demo
 
 The image suits `--http` and `--demo`; a stdio server would have to live
 inside it, and OAuth has no credential store there. See
-[docs/connecting.md](docs/connecting.md#in-a-container) for what differs.
+[the connecting guide](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/connecting.md#in-a-container)
+for what differs.
 
 Completions and a man page come from the binary itself, and ship in the
 release archives. The man page includes both startup options and the same
@@ -56,6 +64,11 @@ REPL built-in reference shown by `help <command>`:
 mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
 mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
 ```
+
+Every release also publishes deterministic SPDX inventories, signed SLSA and
+SBOM bundles, and one canonical record binding all native files to the final
+multi-platform container digest. See [Verify a downloaded release](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/releases.md#verify-a-downloaded-release)
+for checksum, signed-bundle, and container verification commands.
 
 ## One call, no prompt
 
@@ -86,7 +99,8 @@ an immediate refusal instead of hanging the caller. `--timeout` bounds
 everything else, and exit statuses are typed, so a tool error (3) is
 distinguishable from an empty result.
 
-See [docs/scripting.md](docs/scripting.md) for tasks, waiting on them, and
+See [the scripting guide](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/scripting.md)
+for tasks, waiting on them, and
 schema contracts.
 
 ## Start here
@@ -131,7 +145,8 @@ If a tool and built-in share a name, the bare spelling is rejected as
 ambiguous; `tool <name>` selects the server tool and `builtin <name>` selects
 the REPL command.
 
-See [docs/connecting.md](docs/connecting.md) for auth, OAuth, profiles, and
+See [the connecting guide](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/connecting.md)
+for auth, OAuth, profiles, and
 config imports.
 
 ## What it is good at
@@ -210,11 +225,11 @@ bounded, rather than a test inside the loop, which is not.
 
 | | |
 | --- | --- |
-| [Connecting](docs/connecting.md) | transports, bearer and OAuth auth, profiles, importing client configs, reconnecting, timeouts |
-| [The command set](docs/commands.md) | every built-in, completion, aliases, capture and filtering, subscriptions, elicitation, output rendering |
-| [Scripting](docs/scripting.md) | `--exec`, NDJSON, exit statuses, schema contracts |
-| [Debugging a server](docs/debugging.md) | wire tracing, `last`, `bench` |
-| [Release pipeline](docs/releases.md) | maintainer gates, native artifacts, failure and retry behavior |
+| [Connecting](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/connecting.md) | transports, bearer and OAuth auth, profiles, importing client configs, reconnecting, timeouts |
+| [The command set](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/commands.md) | every built-in, completion, aliases, capture and filtering, subscriptions, elicitation, output rendering |
+| [Scripting](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/scripting.md) | `--exec`, NDJSON, exit statuses, schema contracts |
+| [Debugging a server](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/debugging.md) | wire tracing, `last`, `bench` |
+| [Release pipeline](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/releases.md) | maintainer gates, native artifacts, failure and retry behavior |
 
 ## Other MCP clients
 
@@ -250,11 +265,11 @@ silently change how it talks to a server you already use.
 Bug reports and pull requests are welcome. `cargo test` runs the unit tests
 plus a black-box suite that launches the built binary against a fixture server
 over stdio and localhost HTTP, on both lifecycles. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[the contributing guide](https://github.com/joshrotenberg/mcp-repl/blob/main/CONTRIBUTING.md).
 
 The recordings above are generated with
 [vhs](https://github.com/charmbracelet/vhs) from the tapes in
-[docs/tapes](docs/tapes):
+[the recording tapes](https://github.com/joshrotenberg/mcp-repl/tree/main/docs/tapes):
 
 ```bash
 ./scripts/recordings.sh

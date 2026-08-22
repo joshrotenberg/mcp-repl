@@ -4,8 +4,12 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | Yes       |
-| < 0.2   | No        |
+| Latest published minor release line | Yes |
+| Earlier release lines | No |
+
+mcp-repl is pre-1.0 and moves quickly. Security fixes are released from the
+current line rather than backported; upgrade to the latest release before
+reporting a vulnerability that may already have been fixed.
 
 Versions before 0.2.0 were released from the
 [tower-mcp](https://github.com/joshrotenberg/tower-mcp) repository, where

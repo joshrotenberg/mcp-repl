@@ -15,14 +15,3 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(ci):"
-    ignore:
-      # The `dtolnay/rust-toolchain@1.90.0` pin in the `msrv` job of ci.yml is
-      # not a dependency to keep current: it is the assertion that the crate
-      # still builds on the `rust-version` declared in Cargo.toml. Bumping it
-      # does not update anything, it deletes the check, because the job then
-      # tests the same toolchain the other jobs already use. Every other use
-      # of this action is `@stable` and needs no bump either.
-      #
-      # Raise this pin by editing ci.yml and Cargo.toml together, in a PR that
-      # says which MSRV is being adopted and why.
-      - dependency-name: "dtolnay/rust-toolchain"

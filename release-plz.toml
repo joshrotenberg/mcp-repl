@@ -5,19 +5,14 @@
 # Use git-cliff for changelog generation
 changelog_config = "cliff.toml"
 
-# PR settings
-pr_labels = ["release"]
-pr_draft = false
-
-# Publish to crates.io
-publish = true
-# Only a merged release-plz PR may publish; ordinary main commits just update
-# the pending release PR.
+# release-plz only generates the three release files on a credential-free
+# runner. First-party workflow steps own the PR and the irreversible crates.io
+# upload after merge preflight.
+publish = false
+# Defense in depth if a release-plz release command is invoked accidentally.
 release_always = false
 
-# Git settings
-git_release_enable = true
-# Native artifacts are attached while the release is private. The binary
-# workflow publishes it only after every target has succeeded.
-git_release_draft = true
-git_tag_enable = true
+# GitHub publication is deliberately first-party. These remain disabled as a
+# fail-safe if a release-plz release command is ever invoked accidentally.
+git_release_enable = false
+git_tag_enable = false

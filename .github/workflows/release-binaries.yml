@@ -1,158 +1,1058 @@
 name: Release binaries
 
-# release-plz creates a draft GitHub release before dispatching this workflow.
-# Every native target must build and package successfully before this workflow
-# uploads any public asset. The release is published only after all ten files
-# are present and their checksums verify, so a failed target cannot expose a
-# partial binary release.
+# Source-release reconciliation verifies the exact published crate before this
+# reusable workflow runs at the frozen release-merge commit. Every native and
+# container target must complete before any version tag or GitHub release is
+# created. One final contents-write job creates or verifies the annotated tag,
+# stages the exact durable asset set, and immediately finalizes it.
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing draft release tag to build and publish
-        required: true
-        type: string
+  workflow_call:
 
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 
 concurrency:
-  group: release-binaries-${{ inputs.tag }}
+  group: release-binaries-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify immutable release source
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    outputs:
+      container_matrix: ${{ steps.source.outputs.container_matrix }}
+      native_matrix: ${{ steps.source.outputs.native_matrix }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      release_toolchain: ${{ steps.source.outputs.release_toolchain }}
+      source_date_epoch: ${{ steps.source.outputs.source_date_epoch }}
+      syft_version: ${{ steps.source.outputs.syft_version }}
+      syft_sha256: ${{ steps.source.outputs.syft_sha256 }}
+      buildkit_image: ${{ steps.source.outputs.buildkit_image }}
+      buildx_asset: ${{ steps.source.outputs.buildx_asset }}
+      buildx_sha256: ${{ steps.source.outputs.buildx_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Match the workflow ref and package version
+        id: source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "Release binaries must inherit one trusted main event" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Workflow resolved an invalid source SHA: $SOURCE_SHA" >&2
+            exit 1
+          fi
+          checked_out_sha=$(git rev-parse HEAD)
+          if [[ "$checked_out_sha" != "$SOURCE_SHA" ]]; then
+            echo "Checkout $checked_out_sha does not match release source $SOURCE_SHA" >&2
+            exit 1
+          fi
+          version=$(cargo metadata --locked --no-deps --format-version 1 |
+            jq -er '.packages[] | select(.name == "mcp-repl") | .version')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release package version: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          release_merge_output="$RUNNER_TEMP/release-merge-output"
+          : > "$release_merge_output"
+          ./scripts/discover-release-merge.sh "$release_merge_output"
+          if [[ $(<"$release_merge_output") != is_release_merge=true ]]; then
+            echo "Release source is not exactly one trusted release merge" >&2
+            exit 1
+          fi
+          ./scripts/release-targets.sh validate
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          if [[ ! "$source_date_epoch" =~ ^[1-9][0-9]*$ ||
+                "$source_date_epoch" -lt 315532800 ||
+                "$source_date_epoch" -gt 2147483647 ]]; then
+            echo "Invalid source commit epoch: $source_date_epoch" >&2
+            exit 1
+          fi
+          {
+            container_config=$(./scripts/release-targets.sh container-build)
+            container_matrix=$(./scripts/release-targets.sh container-matrix)
+            case $(uname -m) in
+              x86_64) publisher_arch=amd64 ;;
+              aarch64 | arm64) publisher_arch=arm64 ;;
+              *)
+                echo "Unsupported container publisher architecture: $(uname -m)" >&2
+                exit 1
+                ;;
+            esac
+            publisher_platform="linux/$publisher_arch"
+            publisher=$(jq -cer --arg platform "$publisher_platform" '
+              [.include[] | select(.platform == $platform)] |
+              if length == 1 then .[0]
+              else error("publisher platform is not unique")
+              end
+            ' <<<"$container_matrix")
+            echo "container_matrix=$container_matrix"
+            echo "native_matrix=$(./scripts/release-targets.sh release-matrix)"
+            echo "release_tag=$tag"
+            echo "release_toolchain=$(jq -er '.rust.release' release-targets.json)"
+            echo "source_date_epoch=$source_date_epoch"
+            echo "syft_version=$(jq -er '.container_build.syft_version' release-targets.json)"
+            echo "syft_sha256=$(jq -er '.container_build.syft_linux_amd64_sha256' release-targets.json)"
+            echo "buildkit_image=$(jq -er '.buildkit_image' <<<"$container_config")"
+            echo "buildx_asset=$(jq -er '.buildx_asset' <<<"$publisher")"
+            echo "buildx_sha256=$(jq -er '.buildx_sha256' <<<"$publisher")"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: Build and package every target
-    if: github.ref == 'refs/heads/main'
+    needs: verify
+    permissions:
+      contents: read
     uses: ./.github/workflows/release-build.yml
     with:
-      ref: ${{ inputs.tag }}
-      version: ${{ inputs.tag }}
+      version: ${{ needs.verify.outputs.release_tag }}
       upload: true
+      toolchain: ${{ needs.verify.outputs.release_toolchain }}
 
-  publish:
-    name: Publish complete binary release
-    needs: build
+  native-attest:
+    name: SBOM and attest ${{ matrix.target }}
+    needs:
+      - verify
+      - build
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.verify.outputs.native_matrix) }}
     steps:
-      # A plain checkout: this job needs scripts/publish-release.sh, and a
-      # clever partial one is a new way for a release to fail at the moment
-      # it is being published.
-      - uses: actions/checkout@v7
-
-      - name: Download every native package
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          pattern: release-*
-          path: dist
-          merge-multiple: true
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Verify and publish the complete asset set
+      - name: Download this attempt's exact native package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-${{ matrix.target }}-*
+          path: artifact-downloads
+
+      - name: Select the newest producer attempt for this target
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          mkdir dist
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads \
+            dist \
+            "release-$RELEASE_TARGET"
+
+      - name: Install checksum-pinned Syft
+        shell: bash
+        env:
+          SYFT_VERSION: ${{ needs.verify.outputs.syft_version }}
+          SYFT_SHA256: ${{ needs.verify.outputs.syft_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SYFT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
+                ! "$SYFT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid Syft release identity" >&2
+            exit 1
+          fi
+          archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          destination="$RUNNER_TEMP/$archive"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 \
+            --output "$destination" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${archive}"
+          printf '%s  %s\n' "$SYFT_SHA256" "$destination" |
+            sha256sum --check --strict
+          tool_dir="$RUNNER_TEMP/syft-bin"
+          mkdir -p "$tool_dir"
+          tar -xzf "$destination" -C "$tool_dir" syft
+          test -f "$tool_dir/syft" && test ! -L "$tool_dir/syft"
+          chmod 755 "$tool_dir/syft"
+          test "$("$tool_dir/syft" version -o json | jq -er '.version')" = "$SYFT_VERSION"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+
+      - name: Validate package identity and generate its SPDX SBOM
+        id: identity
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_EXTENSION: ${{ matrix.archive }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          archive="mcp-repl-${RELEASE_TAG}-${RELEASE_TARGET}.${RELEASE_EXTENSION}"
+          archive_path="dist/$archive"
+          checksum_path="$archive_path.sha256"
+          if [[ ! -f "$archive_path" || -L "$archive_path" ||
+                ! -f "$checksum_path" || -L "$checksum_path" ]]; then
+            echo "Native artifact is missing or linked: $archive" >&2
+            exit 1
+          fi
+          entry_count=$(find dist -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')
+          if [[ "$entry_count" != 2 ]]; then
+            echo "Native artifact download contains $entry_count files instead of two" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum --check --strict "$archive.sha256")
+          archive_digest=$(sha256sum "$archive_path" | awk '{print $1}')
+          raw_sbom="$archive_path.spdx.raw.json"
+          SYFT_CHECK_FOR_APP_UPDATE=false syft scan "$archive_path" \
+            --source-name "$archive" \
+            --source-version "${RELEASE_TAG#v}" \
+            -o "spdx-json@2.3=$raw_sbom"
+          ./scripts/normalize-release-sbom.sh \
+            "$raw_sbom" \
+            "$archive_path.spdx.json" \
+            "$archive" \
+            "$archive_digest" \
+            "$SOURCE_SHA" \
+            "$SOURCE_DATE_EPOCH" \
+            "$GITHUB_REPOSITORY" \
+            "$RELEASE_TAG"
+          rm "$raw_sbom"
+          jq -e '
+            .spdxVersion == "SPDX-2.3" and
+            (.packages | type) == "array" and
+            (.packages | length) > 1 and
+            any(.packages[]; (.name // "") == "mcp-repl")
+          ' "$archive_path.spdx.json" > /dev/null
+          {
+            echo "archive=$archive"
+            echo "archive_path=$archive_path"
+            echo "sbom_path=$archive_path.spdx.json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest native archive provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.identity.outputs.archive_path }}
+          create-storage-record: false
+
+      - name: Preserve provenance bundle under its canonical asset name
+        shell: bash
+        env:
+          ATTEST_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          DEST_BUNDLE: ${{ steps.identity.outputs.archive_path }}.provenance.sigstore.json
+        run: install -m 0644 "$ATTEST_BUNDLE" "$DEST_BUNDLE"
+
+      - name: Attest native archive SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.identity.outputs.archive_path }}
+          sbom-path: ${{ steps.identity.outputs.sbom_path }}
+          create-storage-record: false
+
+      - name: Preserve SBOM bundle under its canonical asset name
+        shell: bash
+        env:
+          ATTEST_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+          DEST_BUNDLE: ${{ steps.identity.outputs.archive_path }}.sbom.sigstore.json
+        run: install -m 0644 "$ATTEST_BUNDLE" "$DEST_BUNDLE"
+
+      - name: Verify both signed bundles offline before staging
+        shell: bash
+        env:
+          ARCHIVE_PATH: ${{ steps.identity.outputs.archive_path }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          trusted_root="$RUNNER_TEMP/trusted-root.jsonl"
+          gh attestation trusted-root > "$trusted_root"
+          common=(
+            --repo "$GITHUB_REPOSITORY"
+            --custom-trusted-root "$trusted_root"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml"
+            --source-digest "$SOURCE_SHA"
+            --source-ref "refs/heads/main"
+            --deny-self-hosted-runners
+          )
+          gh attestation verify "$ARCHIVE_PATH" \
+            --bundle "$ARCHIVE_PATH.provenance.sigstore.json" \
+            "${common[@]}" > /dev/null
+          gh attestation verify "$ARCHIVE_PATH" \
+            --bundle "$ARCHIVE_PATH.sbom.sigstore.json" \
+            --predicate-type https://spdx.dev/Document/v2.3 \
+            "${common[@]}" > /dev/null
+
+      - name: Preserve the verified native supply-chain set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-supply-${{ matrix.target }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.identity.outputs.archive_path }}
+            ${{ steps.identity.outputs.archive_path }}.sha256
+            ${{ steps.identity.outputs.archive_path }}.spdx.json
+            ${{ steps.identity.outputs.archive_path }}.provenance.sigstore.json
+            ${{ steps.identity.outputs.archive_path }}.sbom.sigstore.json
+          if-no-files-found: error
+          retention-days: 7
+
+  container:
+    name: Stage attested container platforms
+    needs:
+      - verify
+      - native-attest
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container-build.yml
+    with:
+      version: ${{ needs.verify.outputs.release_tag }}
+      source_date_epoch: ${{ needs.verify.outputs.source_date_epoch }}
+      push: true
+
+  container_manifest:
+    name: Assemble and attest the container index
+    needs:
+      - verify
+      - container
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    outputs:
+      image: ${{ steps.identity.outputs.image }}
+      manifest_digest: ${{ steps.identity.outputs.manifest_digest }}
+      staging_ref: ${{ steps.identity.outputs.staging_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download this attempt's exact platform metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: container-linux-*
+          path: artifact-downloads
+
+      - name: Select the newest producer attempt for every platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          bases=()
+          while IFS= read -r platform; do
+            bases+=("container-${platform//\//-}")
+          done < <(./scripts/release-targets.sh container-platforms)
+          mkdir container-metadata
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads \
+            container-metadata \
+            "${bases[@]}"
+
+      - name: Install checksum-pinned Buildx
+        shell: bash
+        env:
+          BUILDX_ASSET: ${{ needs.verify.outputs.buildx_asset }}
+          BUILDX_SHA256: ${{ needs.verify.outputs.buildx_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$BUILDX_ASSET" =~ ^buildx-v[0-9]+\.[0-9]+\.[0-9]+\.linux-(amd64|arm64)$ ||
+                ! "$BUILDX_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid Buildx artifact identity" >&2
+            exit 1
+          fi
+          buildx_release=${BUILDX_ASSET#buildx-}
+          buildx_version=${buildx_release%%.linux-*}
+          docker_config="$RUNNER_TEMP/docker-config"
+          plugin="$docker_config/cli-plugins/docker-buildx"
+          mkdir -p "${plugin%/*}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 \
+            --output "$plugin" \
+            "https://github.com/docker/buildx/releases/download/$buildx_version/$BUILDX_ASSET"
+          printf '%s  %s\n' "$BUILDX_SHA256" "$plugin" |
+            sha256sum --check --strict
+          chmod 755 "$plugin"
+          test -f "$plugin" && test ! -L "$plugin"
+          version_output=$(DOCKER_CONFIG="$docker_config" docker buildx version)
+          if [[ "$version_output" != "github.com/docker/buildx $buildx_version "* ]]; then
+            echo "Unexpected Buildx version: $version_output" >&2
+            exit 1
+          fi
+          printf 'DOCKER_CONFIG=%s\n' "$docker_config" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        with:
+          cache-binary: false
+          driver-opts: image=${{ needs.verify.outputs.buildkit_image }}
+
+      - name: Log in for content-addressed index and OCI attestations
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage the exact multi-platform index
+        id: identity
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir container-supply
+          ./scripts/publish-container-manifest.sh stage \
+            "$RELEASE_TAG" \
+            "$SOURCE_SHA" \
+            "$SOURCE_DATE_EPOCH" \
+            container-metadata \
+            container-supply
+          manifest=container-supply/image-manifest.json
+          ./scripts/build-container-sbom.sh \
+            "$manifest" \
+            "container-supply/mcp-repl-$RELEASE_TAG-container.spdx.json"
+          {
+            echo "image=$(jq -er '.image' "$manifest")"
+            echo "manifest_digest=$(jq -er '.manifest_digest' "$manifest")"
+            echo "staging_ref=$(jq -er '.staging_ref' "$manifest")"
+          } >> "$GITHUB_OUTPUT"
+          install -m 0644 container-metadata/*.json container-supply/
+
+      - name: Attest the final container index provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.identity.outputs.image }}
+          subject-digest: ${{ steps.identity.outputs.manifest_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Preserve the index provenance bundle
+        shell: bash
+        env:
+          ATTEST_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: >-
+          install -m 0644 "$ATTEST_BUNDLE"
+          "container-supply/mcp-repl-$RELEASE_TAG-container.provenance.sigstore.json"
+
+      - name: Attest the final container index SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.identity.outputs.image }}
+          subject-digest: ${{ steps.identity.outputs.manifest_digest }}
+          sbom-path: container-supply/mcp-repl-${{ needs.verify.outputs.release_tag }}-container.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Preserve the index SBOM bundle
+        shell: bash
+        env:
+          ATTEST_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: >-
+          install -m 0644 "$ATTEST_BUNDLE"
+          "container-supply/mcp-repl-$RELEASE_TAG-container.sbom.sigstore.json"
+
+      - name: Verify both index attestations and registry referrers
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Explicit rather than inferred from the checkout's git remote, so
-          # the script does not depend on where it happens to be run from.
-          # Its absence is what left v0.3.0 stuck as a draft.
-          GH_REPO: ${{ github.repository }}
-        run: ./scripts/publish-release.sh "${{ inputs.tag }}" dist
+          IMAGE: ${{ steps.identity.outputs.image }}
+          MANIFEST_DIGEST: ${{ steps.identity.outputs.manifest_digest }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          subject="oci://$IMAGE@$MANIFEST_DIGEST"
+          provenance="container-supply/mcp-repl-$RELEASE_TAG-container.provenance.sigstore.json"
+          sbom="container-supply/mcp-repl-$RELEASE_TAG-container.sbom.sigstore.json"
+          trusted_root="$RUNNER_TEMP/trusted-root.jsonl"
+          gh attestation trusted-root > "$trusted_root"
+          common=(
+            --repo "$GITHUB_REPOSITORY"
+            --custom-trusted-root "$trusted_root"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-binaries.yml"
+            --source-digest "$SOURCE_SHA"
+            --source-ref "refs/heads/main"
+            --deny-self-hosted-runners
+          )
+          gh attestation verify "$subject" \
+            --bundle "$provenance" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            "${common[@]}" > /dev/null
+          gh attestation verify "$subject" \
+            --bundle "$sbom" \
+            --predicate-type https://spdx.dev/Document/v2.3 \
+            "${common[@]}" > /dev/null
+          gh attestation verify "$subject" \
+            --bundle-from-oci \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            "${common[@]}" > /dev/null
+          gh attestation verify "$subject" \
+            --bundle-from-oci \
+            --predicate-type https://spdx.dev/Document/v2.3 \
+            "${common[@]}" > /dev/null
 
-  # The image ships only after the binary release has published, so a tag can
-  # never exist on ghcr.io without the matching binaries on the release page.
-  container:
-    name: Build container image (${{ matrix.platform }})
-    needs: publish
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Native runners per architecture, for the same reason the binaries
-          # use them: a Rust release build under QEMU emulation is slow enough
-          # to be its own failure mode.
-          - platform: linux/amd64
-            os: ubuntu-22.04
-          - platform: linux/arm64
-            os: ubuntu-22.04-arm
+      - name: Preserve the verified container supply-chain set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: container-supply-${{ github.run_attempt }}
+          path: container-supply
+          if-no-files-found: error
+          retention-days: 7
+
+  staging_smoke:
+    name: Anonymous prepublication container smoke
+    needs:
+      - verify
+      - container_manifest
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v4
-
-      - uses: docker/login-action@v4
+      - name: Download the exact container identity
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          pattern: container-supply-*
+          path: artifact-downloads
 
-      # Each architecture pushes by digest only. The tags are attached later,
-      # once both digests exist, so a half-published manifest is not reachable
-      # under a version tag.
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          provenance: false
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: Select the newest complete container identity
+        run: |
+          mkdir container-supply
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads \
+            container-supply \
+            container-supply
 
-      # The prefix is stripped in the shell: `${{ }}` expressions do not do
-      # parameter expansion, so doing it there silently produces a filename
-      # with the prefix still on it and the manifest step builds a bad ref.
-      - name: Preserve the digest
+      - name: Pull and smoke the staging digest without registry credentials
         shell: bash
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          PACKAGE_VERSION: ${{ needs.verify.outputs.release_tag }}
         run: |
-          mkdir -p /tmp/digests
-          touch "/tmp/digests/${DIGEST#sha256:}"
+          set -euo pipefail
+          manifest=container-supply/image-manifest.json
+          image=$(jq -er '.image' "$manifest")
+          digest=$(jq -er '.manifest_digest' "$manifest")
+          anonymous_config="$RUNNER_TEMP/anonymous-docker"
+          mkdir -p "$anonymous_config"
+          printf '{}\n' > "$anonymous_config/config.json"
+          export DOCKER_CONFIG="$anonymous_config"
+          reference="$image@$digest"
+          timeout 60 docker pull "$reference" > /dev/null
+          timeout 30 docker run --rm "$reference" --version \
+            > "$RUNNER_TEMP/container-version"
+          printf 'mcp-repl %s\n' "${PACKAGE_VERSION#v}" \
+            > "$RUNNER_TEMP/expected-container-version"
+          cmp "$RUNNER_TEMP/expected-container-version" \
+            "$RUNNER_TEMP/container-version"
+          timeout 30 docker run --rm "$reference" \
+            --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
+            > "$RUNNER_TEMP/container-demo.ndjson"
+          jq -e -s '
+            length == 1 and
+            .[0].content[0].type == "text" and
+            .[0].content[0].text == "212.00"
+          ' "$RUNNER_TEMP/container-demo.ndjson" > /dev/null
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: digest-${{ strategy.job-index }}
-          path: /tmp/digests/*
-          retention-days: 1
-
-  container-manifest:
-    name: Publish container manifest
-    needs: container
+  assemble:
+    name: Assemble the canonical release set
+    needs:
+      - verify
+      - native-attest
+      - container_manifest
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          pattern: digest-*
-          path: /tmp/digests
-          merge-multiple: true
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v4
+      - name: Download this attempt's native supply-chain sets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: native-supply-*
+          path: artifact-downloads/native
 
-      - uses: docker/login-action@v4
+      - name: Download this attempt's container supply-chain set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: container-supply-*
+          path: artifact-downloads/container
+
+      - name: Select the newest complete producer artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_bases=()
+          while IFS=$'\t' read -r target _extension _binary; do
+            native_bases+=("native-supply-$target")
+          done < <(./scripts/release-targets.sh rows)
+          mkdir -p inputs/native inputs/container
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads/native \
+            inputs/native \
+            "${native_bases[@]}"
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads/container \
+            inputs/container \
+            container-supply
+
+      - name: Build and assemble the exact release inventory
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
+        run: |
+          set -euo pipefail
+          mkdir record release
+          record="record/mcp-repl-$RELEASE_TAG-release.json"
+          ./scripts/build-release-record.sh \
+            "$RELEASE_TAG" \
+            "$SOURCE_SHA" \
+            "$SOURCE_DATE_EPOCH" \
+            inputs/native \
+            inputs/container \
+            "$record"
+          while IFS= read -r asset; do
+            candidates=()
+            for candidate in \
+              "inputs/native/$asset" \
+              "inputs/container/$asset" \
+              "$record"; do
+              if [[ -f "$candidate" && ! -L "$candidate" &&
+                    "${candidate##*/}" == "$asset" ]]; then
+                candidates+=("$candidate")
+              fi
+            done
+            if [[ ${#candidates[@]} -ne 1 ]]; then
+              echo "Expected exactly one local source for release asset $asset" >&2
+              exit 1
+            fi
+            install -m 0644 "${candidates[0]}" "release/$asset"
+          done < <(./scripts/release-targets.sh expected-release-assets "$RELEASE_TAG")
+          actual_count=$(find release -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')
+          if [[ "$actual_count" != 39 ]]; then
+            echo "Assembled $actual_count release files instead of 39" >&2
+            exit 1
+          fi
+
+      - name: Preserve the exact canonical release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-supply-${{ github.run_attempt }}
+          path: release
+          if-no-files-found: error
+          # Preserve the one-off signed bundles for exact partial-draft
+          # recovery throughout GitHub's supported workflow rerun window.
+          retention-days: 90
+
+  version_image:
+    name: Publish the immutable container version
+    needs:
+      - verify
+      - container_manifest
+      - staging_smoke
+      - assemble
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the exact container identity
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: container-supply-*
+          path: artifact-downloads
+
+      - name: Select the newest complete container identity
+        run: |
+          mkdir container-supply
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads \
+            container-supply \
+            container-supply
+
+      - name: Install checksum-pinned Buildx
+        shell: bash
+        env:
+          BUILDX_ASSET: ${{ needs.verify.outputs.buildx_asset }}
+          BUILDX_SHA256: ${{ needs.verify.outputs.buildx_sha256 }}
+        run: |
+          set -euo pipefail
+          buildx_release=${BUILDX_ASSET#buildx-}
+          buildx_version=${buildx_release%%.linux-*}
+          if [[ ! "$BUILDX_ASSET" =~ ^buildx-v[0-9]+\.[0-9]+\.[0-9]+\.linux-(amd64|arm64)$ ||
+                ! "$BUILDX_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid Buildx artifact identity" >&2
+            exit 1
+          fi
+          docker_config="$RUNNER_TEMP/docker-config"
+          plugin="$docker_config/cli-plugins/docker-buildx"
+          mkdir -p "${plugin%/*}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 \
+            --output "$plugin" \
+            "https://github.com/docker/buildx/releases/download/$buildx_version/$BUILDX_ASSET"
+          printf '%s  %s\n' "$BUILDX_SHA256" "$plugin" |
+            sha256sum --check --strict
+          chmod 755 "$plugin"
+          test -f "$plugin" && test ! -L "$plugin"
+          version_output=$(DOCKER_CONFIG="$docker_config" docker buildx version)
+          [[ "$version_output" == "github.com/docker/buildx $buildx_version "* ]]
+          printf 'DOCKER_CONFIG=%s\n' "$docker_config" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        with:
+          cache-binary: false
+          driver-opts: image=${{ needs.verify.outputs.buildkit_image }}
+
+      - name: Log in for immutable version publication
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `latest` moves with the tag being published, matching how the release
-      # page treats the newest release.
-      - name: Create and push the manifest
-        working-directory: /tmp/digests
+      - name: Publish or verify the exact version image
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_DATE_EPOCH: ${{ needs.verify.outputs.source_date_epoch }}
         run: |
-          image=ghcr.io/${{ github.repository }}
-          version="${{ inputs.tag }}"
-          # One ref per digest file. An array rather than word splitting an
-          # unquoted substitution, which is the same thing and passes review.
-          refs=()
-          for digest in *; do
-            refs+=("$image@sha256:$digest")
-          done
-          docker buildx imagetools create \
-            -t "$image:${version#v}" \
-            -t "$image:latest" \
-            "${refs[@]}"
+          set -euo pipefail
+          ./scripts/publish-container-manifest.sh \
+            version container-supply/image-manifest.json
 
-      - name: Show what was published
-        run: docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:latest"
+  publish_release:
+    name: Publish the complete immutable GitHub release
+    needs:
+      - verify
+      - version_image
+      - assemble
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the exact canonical release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-supply-*
+          path: artifact-downloads
+
+      - name: Select the newest complete release set
+        run: |
+          mkdir release
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads \
+            release \
+            release-supply
+
+      - name: Create the tag, stage the exact set, and finalize once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ./scripts/publish-release-tag.sh "$RELEASE_TAG" "$SOURCE_SHA"
+          if ./scripts/publish-release.sh stage "$RELEASE_TAG" release; then
+            ./scripts/publish-release.sh finalize "$RELEASE_TAG" release
+          elif ./scripts/publish-release.sh verify "$RELEASE_TAG" release; then
+            echo "Accepted already-published exact immutable release $RELEASE_TAG"
+          else
+            echo "Release $RELEASE_TAG is neither a resumable draft nor an exact immutable release" >&2
+            exit 1
+          fi
+
+  latest_image:
+    name: Reconcile the mutable latest container alias
+    needs:
+      - verify
+      - publish_release
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: read
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install checksum-pinned Buildx
+        shell: bash
+        env:
+          BUILDX_ASSET: ${{ needs.verify.outputs.buildx_asset }}
+          BUILDX_SHA256: ${{ needs.verify.outputs.buildx_sha256 }}
+        run: |
+          set -euo pipefail
+          buildx_release=${BUILDX_ASSET#buildx-}
+          buildx_version=${buildx_release%%.linux-*}
+          if [[ ! "$BUILDX_ASSET" =~ ^buildx-v[0-9]+\.[0-9]+\.[0-9]+\.linux-(amd64|arm64)$ ||
+                ! "$BUILDX_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid Buildx artifact identity" >&2
+            exit 1
+          fi
+          docker_config="$RUNNER_TEMP/docker-config"
+          plugin="$docker_config/cli-plugins/docker-buildx"
+          mkdir -p "${plugin%/*}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 \
+            --output "$plugin" \
+            "https://github.com/docker/buildx/releases/download/$buildx_version/$BUILDX_ASSET"
+          printf '%s  %s\n' "$BUILDX_SHA256" "$plugin" |
+            sha256sum --check --strict
+          chmod 755 "$plugin"
+          test -f "$plugin" && test ! -L "$plugin"
+          version_output=$(DOCKER_CONFIG="$docker_config" docker buildx version)
+          [[ "$version_output" == "github.com/docker/buildx $buildx_version "* ]]
+          printf 'DOCKER_CONFIG=%s\n' "$docker_config" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        with:
+          cache-binary: false
+          driver-opts: image=${{ needs.verify.outputs.buildkit_image }}
+
+      - name: Log in only for latest reconciliation
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reconcile latest to GitHub's immutable latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: ./scripts/publish-container-manifest.sh latest
+
+  public_smoke:
+    name: Anonymous public release smoke
+    needs:
+      - verify
+      - container_manifest
+      - latest_image
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the exact container identity
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: container-supply-*
+          path: artifact-downloads
+
+      - name: Select the newest complete container identity
+        run: |
+          mkdir container-supply
+          ./scripts/select-run-artifacts.sh \
+            "$GITHUB_RUN_ATTEMPT" \
+            artifact-downloads \
+            container-supply \
+            container-supply
+
+      - name: Pull and smoke public version and latest without registry credentials
+        shell: bash
+        env:
+          BUILDX_ASSET: ${{ needs.verify.outputs.buildx_asset }}
+          BUILDX_SHA256: ${{ needs.verify.outputs.buildx_sha256 }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          manifest=container-supply/image-manifest.json
+          image=$(jq -er '.image' "$manifest")
+          tag=$(jq -er '.tag' "$manifest")
+          expected_digest=$(jq -er '.manifest_digest' "$manifest")
+          anonymous_config="$RUNNER_TEMP/anonymous-docker"
+          plugin="$anonymous_config/cli-plugins/docker-buildx"
+          mkdir -p "${plugin%/*}"
+          printf '{}\n' > "$anonymous_config/config.json"
+          export DOCKER_CONFIG="$anonymous_config"
+
+          if [[ ! "$BUILDX_ASSET" =~ ^buildx-v[0-9]+\.[0-9]+\.[0-9]+\.linux-(amd64|arm64)$ ||
+                ! "$BUILDX_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid Buildx artifact identity" >&2
+            exit 1
+          fi
+          buildx_release=${BUILDX_ASSET#buildx-}
+          buildx_version=${buildx_release%%.linux-*}
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 120 \
+            --output "$plugin" \
+            "https://github.com/docker/buildx/releases/download/$buildx_version/$BUILDX_ASSET"
+          printf '%s  %s\n' "$BUILDX_SHA256" "$plugin" |
+            sha256sum --check --strict
+          chmod 755 "$plugin"
+          test -f "$plugin" && test ! -L "$plugin"
+          [[ $(docker buildx version) == "github.com/docker/buildx $buildx_version "* ]]
+
+          version_ref="$image:${tag#v}"
+          docker buildx imagetools inspect --raw "$version_ref" \
+            > "$RUNNER_TEMP/version-index.json"
+          resolved_digest="sha256:$(sha256sum "$RUNNER_TEMP/version-index.json" | awk '{print $1}')"
+          if [[ "$resolved_digest" != "$expected_digest" ]]; then
+            echo "Public version image moved from $expected_digest to $resolved_digest" >&2
+            exit 1
+          fi
+          timeout 60 docker pull "$version_ref" > /dev/null
+          timeout 30 docker run --rm "$version_ref" --version \
+            > "$RUNNER_TEMP/version-output"
+          printf 'mcp-repl %s\n' "${tag#v}" > "$RUNNER_TEMP/version-expected"
+          cmp "$RUNNER_TEMP/version-expected" "$RUNNER_TEMP/version-output"
+          timeout 30 docker run --rm "$version_ref" \
+            --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
+            > "$RUNNER_TEMP/version-demo.ndjson"
+          jq -e -s 'length == 1 and .[0].content[0].text == "212.00"' \
+            "$RUNNER_TEMP/version-demo.ndjson" > /dev/null
+
+          latest_snapshot=$(gh api "repos/$GH_REPO/releases/latest")
+          latest_identity=$(jq -cer '
+            select(type == "object") |
+            select(.id | type == "number" and . > 0 and . == floor) |
+            select(.tag_name | type == "string" and
+              test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) |
+            select(.name == .tag_name and .draft == false and
+              .prerelease == false and .immutable == true) |
+            select(.author.login == "github-actions[bot]" and .author.type == "Bot") |
+            {id, tag: .tag_name}
+          ' <<<"$latest_snapshot")
+          latest_tag=$(jq -r '.tag' <<<"$latest_identity")
+          latest_record_dir="$RUNNER_TEMP/latest-release-record"
+          mkdir "$latest_record_dir"
+          gh release download "$latest_tag" \
+            --repo "$GH_REPO" \
+            --pattern "mcp-repl-$latest_tag-release.json" \
+            --dir "$latest_record_dir"
+          latest_record="$latest_record_dir/mcp-repl-$latest_tag-release.json"
+          if [[ ! -f "$latest_record" || -L "$latest_record" || ! -s "$latest_record" ]]; then
+            echo "Immutable latest release omitted its canonical record" >&2
+            exit 1
+          fi
+          latest_record_identity=$(jq -cer \
+            --arg tag "$latest_tag" \
+            --arg image "$image" \
+            --argjson expected_platforms \
+              "$(./scripts/release-targets.sh container-platforms |
+                jq -Rsc 'split("\n") | map(select(length > 0)) | sort')" '
+            select(type == "object" and .schema_version == 1 and
+              .package == "mcp-repl" and .tag == $tag and
+              .version == ($tag | ltrimstr("v"))) |
+            select(.container.image == $image) |
+            select(.container.manifest_digest | type == "string" and
+              test("^sha256:[0-9a-f]{64}$")) |
+            select((.container.platforms | type) == "array" and
+              (.container.platforms | length) == ($expected_platforms | length)) |
+            select(all(.container.platforms[];
+              type == "object" and
+              ((keys | sort) == (["platform", "runnable_digest"] | sort)) and
+              (.platform as $platform |
+                ($expected_platforms | index($platform)) != null) and
+              (.runnable_digest | test("^sha256:[0-9a-f]{64}$")))) |
+            select([.container.platforms[].platform] == $expected_platforms) |
+            {
+              manifest_digest: .container.manifest_digest,
+              platforms: .container.platforms
+            }
+          ' "$latest_record")
+          latest_record_digest=$(jq -r '.manifest_digest' <<<"$latest_record_identity")
+          latest_record_platforms=$(jq -c '.platforms' <<<"$latest_record_identity")
+          docker buildx imagetools inspect --raw "$image:${latest_tag#v}" \
+            > "$RUNNER_TEMP/latest-version-index.json"
+          docker buildx imagetools inspect --raw "$image:latest" \
+            > "$RUNNER_TEMP/latest-index.json"
+          latest_version_digest="sha256:$(sha256sum "$RUNNER_TEMP/latest-version-index.json" | awk '{print $1}')"
+          latest_digest="sha256:$(sha256sum "$RUNNER_TEMP/latest-index.json" | awk '{print $1}')"
+          if [[ "$latest_version_digest" != "$latest_record_digest" ||
+                "$latest_digest" != "$latest_record_digest" ]]; then
+            echo "Public latest/version images differ from immutable release record $latest_tag" >&2
+            exit 1
+          fi
+          for public_index in \
+            "$RUNNER_TEMP/latest-version-index.json" \
+            "$RUNNER_TEMP/latest-index.json"; do
+            mapping=$(jq -cer -f scripts/container-runnable-mapping.jq \
+              "$public_index")
+            if [[ "$mapping" != "$latest_record_platforms" ]]; then
+              echo "Public image mapping differs from immutable release record $latest_tag" >&2
+              exit 1
+            fi
+          done
+          timeout 60 docker pull "$image:latest" > /dev/null
+          timeout 30 docker run --rm "$image:latest" --version \
+            > "$RUNNER_TEMP/latest-output"
+          printf 'mcp-repl %s\n' "${latest_tag#v}" > "$RUNNER_TEMP/latest-expected"
+          cmp "$RUNNER_TEMP/latest-expected" "$RUNNER_TEMP/latest-output"
+          timeout 30 docker run --rm "$image:latest" \
+            --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
+            > "$RUNNER_TEMP/latest-demo.ndjson"
+          jq -e -s 'length == 1 and .[0].content[0].text == "212.00"' \
+            "$RUNNER_TEMP/latest-demo.ndjson" > /dev/null
+          final_latest=$(gh api "repos/$GH_REPO/releases/latest" |
+            jq -cer '{id, tag: .tag_name}')
+          if [[ "$final_latest" != "$latest_identity" ]]; then
+            echo "GitHub's latest immutable release changed during public smoke" >&2
+            exit 1
+          fi
