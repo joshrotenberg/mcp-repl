@@ -18,7 +18,9 @@ on:
 permissions: {}
 
 concurrency:
-  group: release-binaries-${{ github.sha }}
+  # Serialize every release's mutable `latest` boundary repository-wide.
+  group: release-binaries-latest
+  queue: max
   cancel-in-progress: false
 
 jobs:

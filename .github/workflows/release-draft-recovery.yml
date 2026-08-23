@@ -12,9 +12,10 @@ on:
 permissions: {}
 
 concurrency:
-  # Share the exact historical release's lock with the normal binary
-  # publisher and any failed-job rerun for that release merge.
-  group: release-binaries-${{ github.event.client_payload.release_merge_sha }}
+  # Share the repository-wide mutable-release lock with normal publication and
+  # the latest-only recovery controller.
+  group: release-binaries-latest
+  queue: max
   cancel-in-progress: false
 
 jobs:

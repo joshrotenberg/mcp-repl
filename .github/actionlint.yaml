@@ -1,0 +1,13 @@
+# actionlint 1.7.12 predates GitHub Actions' `concurrency.queue` key. Keep this
+# ignore path-specific and pair it with exact workflow guards until actionlint
+# ships support for the live GitHub schema.
+paths:
+  .github/workflows/release-binaries.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'
+  .github/workflows/release-draft-recovery.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'
+  .github/workflows/release-latest-recovery.yml:
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"$'

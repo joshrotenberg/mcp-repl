@@ -1206,7 +1206,7 @@ setup_case() {
     "$TEST_NEXT_RUNNABLE_B"
   : > "$TEST_STATE/docker.log"
   : > "$TEST_STATE/gh.log"
-  unset DOCKER_MODE GH_MODE MISMATCH_REFERENCE
+  unset DOCKER_MODE EXPECTED_LATEST_RELEASE_ID GH_MODE MISMATCH_REFERENCE
   write_metadata
 }
 
@@ -1735,6 +1735,40 @@ if [[ $(grep -Fc "git/ref/tags/$TEST_TAG" "$TEST_STATE/gh.log") -lt 2 ]]; then
   echo "Latest publication did not re-authenticate its live annotated tag" >&2
   exit 1
 fi
+
+setup_case latest_exact_recovery
+cp "$TEST_STATE/fixtures/stage.raw" "$TEST_STATE/version.raw"
+EXPECTED_LATEST_RELEASE_ID=42
+export EXPECTED_LATEST_RELEASE_ID
+"$publish" latest > /dev/null
+test "$(sha256_path "$TEST_STATE/latest.raw")" = \
+  "$(sha256_path "$TEST_STATE/version.raw")"
+
+setup_case latest_invalid_recovery_id
+cp "$TEST_STATE/fixtures/stage.raw" "$TEST_STATE/version.raw"
+EXPECTED_LATEST_RELEASE_ID=not-an-id
+export EXPECTED_LATEST_RELEASE_ID
+expect_failure "invalid expected latest release ID" "$publish" latest
+assert_no_target "$TEST_IMAGE:latest"
+
+setup_case latest_wrong_recovery_id
+cp "$TEST_STATE/fixtures/stage.raw" "$TEST_STATE/version.raw"
+EXPECTED_LATEST_RELEASE_ID=43
+export EXPECTED_LATEST_RELEASE_ID
+expect_failure "unrelated latest release ID at recovery boundary" "$publish" latest
+assert_no_target "$TEST_IMAGE:latest"
+
+setup_case latest_exact_recovery_race
+cp "$TEST_STATE/fixtures/stage.raw" "$TEST_STATE/version.raw"
+cp "$TEST_STATE/fixtures/stage-next.raw" "$TEST_STATE/version-next.raw"
+EXPECTED_LATEST_RELEASE_ID=42
+GH_MODE=latest_race
+export EXPECTED_LATEST_RELEASE_ID GH_MODE
+expect_failure "exact recovery refuses to converge onto a newer release" \
+  "$publish" latest
+test "$(sha256_path "$TEST_STATE/latest.raw")" = \
+  "$(sha256_path "$TEST_STATE/version.raw")"
+test "$(grep -Fc -- "-t $TEST_IMAGE:latest" "$TEST_STATE/docker.log")" -eq 1
 
 setup_case latest_newer
 cp "$TEST_STATE/fixtures/stage.raw" "$TEST_STATE/version.raw"
