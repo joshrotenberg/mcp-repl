@@ -14,10 +14,24 @@ binaries.
    bot-owned branch whose name starts with `release-plz-`, creating the release
    PR when needed. It captures and validates the generated commit's full SHA
    immediately after the commit and before pushing it.
+   release-plz compares only the consumer-facing Cargo package with crates.io,
+   so repository-only controller changes are deliberately inert. If a
+   controller defect requires a fresh patch after the previous crate was
+   accepted, advance `package.metadata.mcp-repl.release-recovery-epoch` exactly
+   once in that reviewed fix PR. The package-visible epoch has no runtime
+   meaning; it makes the fixed source distinct so this same bot-owned
+   three-file flow generates the next patch and attributes it in the changelog.
+   If the need is discovered only after the fix merges, use an immediate
+   reviewed follow-up with a non-skipped conventional commit title that names
+   the recovery. Never edit the package version by hand or advance the epoch
+   for an ordinary controller change.
 2. The trusted `main` workflow discovers at most one open release PR. It
    requires the GitHub Actions bot, the same repository, base `main`, a full
    commit SHA, and exactly `CHANGELOG.md`, `Cargo.toml`, and `Cargo.lock`. The
    discovered live head must equal the generated SHA captured before the push.
+   A human-authored version or release PR cannot authorize publication: the bot
+   author, parent artifact and run, child status, and exact head and tree checks
+   reject lookalikes.
    It preserves a 90-day identity artifact that binds the repository, parent
    run ID and attempt, base SHA, PR number, release branch, and generated head
    SHA for later publication preflight.
@@ -324,6 +338,15 @@ compact release record.
   intentionally fatal. Once the final publication boundary begins, a
   noncanonical or moved tag, conflicting draft, or mismatched canonical notes
   also fails closed.
+- If crates.io already accepted the version before a later controller or binary
+  stage exposed a defect, do not run newer controller code over that accepted
+  source and do not synthesize the missing artifacts. Merge the reviewed fix,
+  advance `package.metadata.mcp-repl.release-recovery-epoch` exactly once in
+  that fix PR, and let the normal Release-plz workflow generate a bot-owned
+  fresh patch. If the need is discovered after merge, use the immediate
+  reviewed follow-up described above. The epoch is packaged and CI verifies
+  that Cargo's normalized manifest preserves it; leaving it unchanged keeps
+  ordinary controller-only commits from producing releases.
 - A failed native target, container build, attestation, assembly, or staging
   smoke after the crate is published leaves no GitHub tag or release. No
   incomplete binary/container release is public. Content-addressed platform
