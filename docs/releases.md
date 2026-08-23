@@ -201,8 +201,9 @@ binaries.
     `7b51781718975772d96006f167887adb877618e7`, tag, canonical release record,
     and container identity. An exhaustive read-only preflight authenticates
     the current reviewed default-branch controller, exact historical job and
-    release topology, all 39 remote assets, tag object, canonical record, and
-    native/container evidence. It fetches the immutable container index by
+    release topology, all 39 remote assets (including exact IDs, digests, MIME
+    types, and empty labels), tag object, canonical record, and native/container
+    evidence. It fetches the immutable container index by
     digest into a credential-free local file and verifies both attestations
     against that file, the exact release workflow, source digest and ref, and
     trusted root. A second job with the same read-only permissions repeats the

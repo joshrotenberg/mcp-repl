@@ -503,7 +503,7 @@ if ! assets=$(jq -cer --argjson expected "$expected_names" '
       (.size | type) == "number" and .size > 0 and .size == (.size | floor) and
       (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
       .state == "uploaded" and
-      .content_type == "application/octet-stream" and .label == null and
+      .content_type == "application/octet-stream" and .label == "" and
       .uploader.login == "github-actions[bot]" and .uploader.type == "Bot"
     )) |
     select(([$assets[].id] | unique | length) == 39) |
