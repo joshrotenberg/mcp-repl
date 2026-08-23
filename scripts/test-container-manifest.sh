@@ -1294,6 +1294,20 @@ run_stage > /dev/null
 test "$(jq -r '.manifest_digest' "$TEST_OUTPUT/image-manifest.json")" = \
   "$(sha256_path "$TEST_STATE/staging.raw")"
 
+# SLSA v1 treats absent, null, and empty optional fields equivalently. Exercise
+# the exact BuildKit shape that omits runDetails.byproducts through the full
+# staging path, including the rebound statement and attestation digests.
+setup_case build_omitted_slsa_byproducts
+rebind_layer_blob "$TEST_STATE/fixtures/attestation-amd64.raw" 0 \
+  'del(.predicate.runDetails.byproducts)'
+rebind_attestation "$TEST_STATE/fixtures/build-amd64.raw" 1 \
+  "$TEST_STATE/fixtures/attestation-amd64.raw"
+rebind_attestation "$TEST_STATE/fixtures/stage.raw" 1 \
+  "$TEST_STATE/fixtures/attestation-amd64.raw"
+write_metadata
+run_stage > /dev/null
+grep -Fq -- "-t $TEST_IMAGE:sha-$TEST_SOURCE_SHA" "$TEST_STATE/docker.log"
+
 # Exact platform->digest pairing and all attestation descriptor invariants are
 # required for an existing alias.
 for fixture in stage-swapped stage-no-arm-attestation \

@@ -917,6 +917,92 @@ class ValidatorTransportTests(unittest.TestCase):
                 expected_builder_id,
             )
 
+    def test_slsa_v1_accepts_optional_run_detail_forms(self) -> None:
+        expected_builder_id = VALIDATION.buildkit_builder_id(
+            "ghcr.io/test/project"
+        )
+        optional_forms = (
+            {},
+            {"metadata": None, "byproducts": None},
+            {"metadata": {}, "byproducts": []},
+            {
+                "metadata": {"invocationId": "fixture"},
+                "byproducts": [{"uri": "https://example.test/build.log"}],
+            },
+            {
+                "byproducts": [
+                    {"digest": {"sha256": "deadbeef"}},
+                    {
+                        "content": "Zml4dHVyZQ==",
+                        "annotations": {
+                            "nested": {"accepted": True},
+                            "labels": ["fixture", 1],
+                        },
+                        "x-fixture-extension": {"ignored": True},
+                    },
+                ],
+            },
+        )
+        for optional_fields in optional_forms:
+            with self.subTest(optional_fields=optional_fields):
+                predicate = {
+                    "buildDefinition": {
+                        "buildType": VALIDATION.BUILDKIT_V1_BUILD_TYPE,
+                        "externalParameters": {},
+                        "internalParameters": {},
+                        "resolvedDependencies": [],
+                    },
+                    "runDetails": {
+                        "builder": {"id": expected_builder_id},
+                        **optional_fields,
+                    },
+                }
+                VALIDATION.validate_predicate_shape(
+                    "https://slsa.dev/provenance/v1",
+                    predicate,
+                    "mcp-repl",
+                    "1.2.3",
+                    expected_builder_id,
+                )
+
+    def test_slsa_v1_rejects_malformed_optional_run_details(self) -> None:
+        expected_builder_id = VALIDATION.buildkit_builder_id(
+            "ghcr.io/test/project"
+        )
+        malformed_fields = (
+            {"metadata": []},
+            {"byproducts": {}},
+            {"byproducts": "fixture"},
+            {"byproducts": 1},
+            {"byproducts": False},
+            {"byproducts": [None]},
+            {"byproducts": [{}]},
+            {"byproducts": [{"uri": 42}]},
+            {"byproducts": [{"digest": {"sha256": 42}}]},
+        )
+        for optional_fields in malformed_fields:
+            with self.subTest(optional_fields=optional_fields):
+                predicate = {
+                    "buildDefinition": {
+                        "buildType": VALIDATION.BUILDKIT_V1_BUILD_TYPE,
+                        "externalParameters": {},
+                        "internalParameters": {},
+                        "resolvedDependencies": [],
+                    },
+                    "runDetails": {
+                        "builder": {"id": expected_builder_id},
+                        **optional_fields,
+                    },
+                }
+                with self.assertRaises(VALIDATION.ValidationError):
+                    VALIDATION.validate_predicate_shape(
+                        "https://slsa.dev/provenance/v1",
+                        predicate,
+                        "mcp-repl",
+                        "1.2.3",
+                        expected_builder_id,
+                    )
+
     def test_slsa_v02_is_rejected(self) -> None:
         expected_builder_id = VALIDATION.buildkit_builder_id(
             "ghcr.io/test/project"

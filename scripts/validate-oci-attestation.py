@@ -467,6 +467,43 @@ def validate_spdx_graph(
         raise ValidationError("SPDX release package has no dependency relationships")
 
 
+def is_slsa_resource_descriptor(value: Any) -> bool:
+    """Return whether a non-empty SLSA ResourceDescriptor is well typed."""
+    if not isinstance(value, dict):
+        return False
+
+    for field in ("name", "uri", "downloadLocation", "mediaType", "content"):
+        field_value = value.get(field)
+        if field_value is not None and not isinstance(field_value, str):
+            return False
+
+    digest = value.get("digest")
+    if digest is not None and (
+        not isinstance(digest, dict)
+        or any(
+            not isinstance(algorithm, str)
+            or not algorithm
+            or not isinstance(digest_value, str)
+            or not digest_value
+            for algorithm, digest_value in digest.items()
+        )
+    ):
+        return False
+    annotations = value.get("annotations")
+    if annotations is not None and not isinstance(annotations, dict):
+        return False
+
+    return bool(value.get("uri") or digest or value.get("content"))
+
+
+def is_optional_slsa_byproducts(value: Any) -> bool:
+    """Accept absent/null/empty byproducts or a typed descriptor array."""
+    return value is None or (
+        isinstance(value, list)
+        and all(is_slsa_resource_descriptor(byproduct) for byproduct in value)
+    )
+
+
 def validate_predicate_shape(
     predicate_type: str,
     predicate: Any,
@@ -549,6 +586,12 @@ def validate_predicate_shape(
     elif predicate_type == "https://slsa.dev/provenance/v1":
         build_definition = predicate.get("buildDefinition")
         run_details = predicate.get("runDetails")
+        metadata = (
+            run_details.get("metadata") if isinstance(run_details, dict) else None
+        )
+        byproducts = (
+            run_details.get("byproducts") if isinstance(run_details, dict) else None
+        )
         if (
             not isinstance(build_definition, dict)
             or not isinstance(run_details, dict)
@@ -558,8 +601,8 @@ def validate_predicate_shape(
             or not isinstance(build_definition.get("resolvedDependencies"), list)
             or not isinstance(run_details.get("builder"), dict)
             or run_details["builder"].get("id") != expected_builder_id
-            or not isinstance(run_details.get("metadata"), dict)
-            or not isinstance(run_details.get("byproducts"), list)
+            or (metadata is not None and not isinstance(metadata, dict))
+            or not is_optional_slsa_byproducts(byproducts)
         ):
             raise ValidationError("SLSA v1 predicate is incomplete")
     else:
