@@ -1,7 +1,7 @@
 # The front-page recording: the server's surface is the command set.
 #
 # Regenerate all README media with:
-#   ./scripts/recordings.sh
+#   cargo build --release && vhs docs/tapes/hero.tape
 #
 # --no-history keeps the recording deterministic: without it reedline offers
 # fish-style hints from whatever the author happened to type before, which

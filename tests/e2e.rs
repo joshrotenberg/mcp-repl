@@ -1508,21 +1508,24 @@ async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir
     )
     .expect("write imported config");
     let selector = format!("{}:imported", imported.display());
+    let selector_literal = serde_json::to_string(&selector).expect("quote import selector");
     let exit_file = temp.path().join("in-repl-connect.exit");
     let missing = temp.path().join("missing-mcp-server");
+    let missing_literal =
+        serde_json::to_string(&missing.display().to_string()).expect("quote missing server path");
     let input = format!(
         "help connect\n\
          alias h=help connect\n\
          connect demo\n\
          saved = echo message=hello\n\
-         connect -- {}\n\
+         connect -- {missing_literal}\n\
          vars\n\
          echo message=still-connected\n\
-         connect -- {fixture_string}\n\
+         connect -- {fixture_literal}\n\
          add a=20 b=22\n\
          connect profiled\n\
          profile_add a=19 b=23\n\
-         connect {selector}\n\
+         connect {selector_literal}\n\
          add a=18 b=24\n\
          connect {http_url}\n\
          add a=17 b=25\n\
@@ -1531,7 +1534,6 @@ async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir
          h\n\
          echo message=switched\n\
          quit\n",
-        missing.display()
     );
     let mut command = repl_command();
     command
@@ -1557,7 +1559,7 @@ async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir
     );
     assert!(
         stdout.matches("42").count() >= 4,
-        "stdio, profile, import, and HTTP targets all answer:\n{stdout}"
+        "stdio, profile, import, and HTTP targets all answer:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("profile profiled"), "{stdout}");
     assert!(stdout.contains("import "), "{stdout}");
@@ -2883,11 +2885,12 @@ async fn exercise_bind(fixture: &Path, temp: &TempDir) {
     // do, so a value bound for one server cannot leak into a same-named
     // parameter on the next.
     let fixture_string = fixture.display().to_string();
+    let fixture_literal = serde_json::to_string(&fixture_string).expect("quote fixture path");
     let exit_file = temp.path().join("bind-reconnect.exit");
     let input = format!(
         "bind repeat=3\n\
          binds\n\
-         connect -- {fixture_string}\n\
+         connect -- {fixture_literal}\n\
          binds\n\
          quit\n"
     );

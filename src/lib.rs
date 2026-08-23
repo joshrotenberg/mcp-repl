@@ -4092,8 +4092,36 @@ fn program_is_runnable(program: &str) -> bool {
     if program.contains('/') || program.contains('\\') {
         return std::path::Path::new(program).is_file();
     }
+    #[cfg(windows)]
+    let executable_extensions = std::env::var_os("PATHEXT")
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let candidate = dir.join(program);
+                if candidate.is_file() {
+                    return true;
+                }
+                #[cfg(windows)]
+                {
+                    if candidate.extension().is_some() {
+                        return false;
+                    }
+                    executable_extensions.iter().any(|extension| {
+                        let mut candidate = candidate.clone().into_os_string();
+                        candidate.push(extension);
+                        std::path::Path::new(&candidate).is_file()
+                    })
+                }
+                #[cfg(not(windows))]
+                false
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -9041,11 +9069,19 @@ mod tests {
     #[test]
     fn a_program_is_runnable_by_path_or_by_name() {
         // Bare names are searched on PATH.
+        #[cfg(unix)]
         assert!(program_is_runnable("sh"));
+        #[cfg(windows)]
+        assert!(program_is_runnable("cmd"));
         assert!(!program_is_runnable("mcp-repl-definitely-not-installed"));
         // Anything with a separator is taken as a path and not searched.
         assert!(!program_is_runnable("./mcp-repl-definitely-not-here"));
+        #[cfg(unix)]
         assert!(program_is_runnable("/bin/sh"));
+        #[cfg(windows)]
+        assert!(program_is_runnable(
+            &std::env::var("COMSPEC").expect("Windows command processor")
+        ));
     }
 
     #[test]

@@ -35,24 +35,19 @@ compiles tower-mcp's server features as dev-dependencies.
 Changes that can affect publishing also need the consumer-view package gate:
 
 ```bash
-./scripts/test-source-package.sh
+cargo package --locked
 ```
 
-It tests and installs the extracted crate with its lockfile, then executes the
-installed binary. Repository-only fixtures and release infrastructure are
-required to stay out of that source package.
+Repository-only fixtures and release infrastructure must stay out of that
+source package.
 
-Release platform, workflow, or installer changes additionally need:
+Release configuration changes additionally need cargo-dist's plan check:
 
 ```bash
-./scripts/release-targets.sh validate
-./scripts/test-release-targets.sh
-./scripts/test-installer.sh
-./scripts/test-package-release.sh
+cargo dist plan
 ```
 
-`release-targets.json` is the sole platform/MSRV inventory; do not copy a
-production target table into a workflow, publication guard, or installer.
+The release targets and artifact settings live in `dist-workspace.toml`.
 
 The command, routing/path, imported-config, wire-redaction, and alias
 boundaries also have a dependency-free deterministic property corpus. Run it
@@ -72,12 +67,12 @@ Install `cargo-llvm-cov`, then generate the navigable report with:
 
 ```bash
 cargo install cargo-llvm-cov
-./scripts/coverage.sh
+cargo llvm-cov --all-features --workspace --html
 ```
 
 The report starts at `target/llvm-cov/html/index.html`. For a compact baseline
 without opening or generating a browser report, run
-`./scripts/coverage.sh --summary-only`. Coverage is a map to untested branches,
+`cargo llvm-cov --all-features --workspace --summary-only`. Coverage is a map to untested branches,
 not a merge threshold: prioritize security boundaries, state restoration, and
 editor behavior over a repository-wide vanity percentage.
 
@@ -104,14 +99,11 @@ Use conventional-commit prefixes (`feat:`, `fix:`, `docs:`, `test:`,
 `chore:`). release-plz generates the changelog and picks the next version from
 them.
 
-Maintainers should follow the gated, all-target release process in
-[docs/releases.md](docs/releases.md). A release PR is not safe to merge until
-its `Release gate` check succeeds.
+Maintainers should follow the release process in [docs/releases.md](docs/releases.md).
 
 ## Relationship to tower-mcp
 
 mcp-repl is built on [tower-mcp](https://github.com/joshrotenberg/tower-mcp)
-and was developed in that workspace until version 0.2.0. CI tests against the
-released framework by default; a scheduled job tests against tower-mcp git
-main. Protocol-level bugs usually belong in the tower-mcp issue tracker,
-REPL-level behavior belongs here.
+and was developed in that workspace until version 0.2.0. Protocol-level bugs
+usually belong in the tower-mcp issue tracker; REPL-level behavior belongs
+here.

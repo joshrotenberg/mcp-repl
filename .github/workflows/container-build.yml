@@ -1,391 +1,85 @@
-name: Container release build
+name: Container
 
 on:
+  pull_request:
+    branches: [main]
   workflow_call:
     inputs:
-      version:
-        description: Version label used for smoke verification
-        required: true
-        type: string
-      source_date_epoch:
-        description: Trusted source commit timestamp
-        required: true
-        type: string
-      push:
-        description: Push content-addressed platform images and metadata
-        required: true
-        type: boolean
-      source_sha:
-        description: Authenticated candidate SHA; empty uses the caller event SHA
+      tag:
+        description: Release tag to publish
         required: false
         default: ""
         type: string
+      push:
+        description: Push the image to GHCR
+        required: false
+        default: false
+        type: boolean
 
-# The caller owns the maximum token scope for this reusable workflow. The CI
-# rehearsal passes only contents: read; release publication additionally passes
-# packages: write. The manifest job narrows that set below, while the build job
-# deliberately inherits the caller's exact set so one workflow can serve both
-# trust boundaries without granting package writes to pull requests.
+permissions:
+  contents: read
 
 jobs:
-  manifest:
-    name: Validate container build inputs
+  verify:
+    name: Verify image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          load: true
+          tags: mcp-repl:ci
+          provenance: false
+          sbom: false
+      - name: Smoke test image
+        run: docker run --rm mcp-repl:ci --version
+
+  publish:
+    name: Publish image
+    if: inputs.push
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    outputs:
-      matrix: ${{ steps.config.outputs.matrix }}
-      buildkit_image: ${{ steps.config.outputs.buildkit_image }}
-      sbom_generator: ${{ steps.config.outputs.sbom_generator }}
-      compatibility_version: ${{ steps.config.outputs.compatibility_version }}
-      package_version: ${{ steps.config.outputs.package_version }}
+      packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Switch to the authenticated candidate source
-        if: inputs.source_sha != '' && inputs.source_sha != github.sha
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
-          git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-
-      - name: Bind source, epoch, version, and immutable tools
-        id: config
-        shell: bash
-        env:
-          EXPECTED_REF: ${{ inputs.source_sha || github.sha }}
-          EXPECTED_EPOCH: ${{ inputs.source_date_epoch }}
-          ARCHIVE_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$EXPECTED_REF" =~ ^[0-9a-f]{40}$ ||
-                ! "$EXPECTED_EPOCH" =~ ^[1-9][0-9]*$ ||
-                "$EXPECTED_EPOCH" -lt 315532800 ||
-                "$EXPECTED_EPOCH" -gt 2147483647 ]]; then
-            echo "Invalid container source identity" >&2
-            exit 1
-          fi
-          if [[ ! "$ARCHIVE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ &&
-                ! "$ARCHIVE_VERSION" =~ ^ci-(0|[1-9][0-9]*)-(0|[1-9][0-9]*)$ ]]; then
-            echo "Invalid container release version: $ARCHIVE_VERSION" >&2
-            exit 1
-          fi
-          actual_ref=$(git rev-parse HEAD)
-          actual_epoch=$(git show -s --format=%ct HEAD)
-          if [[ "$actual_ref" != "$EXPECTED_REF" ||
-                "$actual_epoch" != "$EXPECTED_EPOCH" ]]; then
-            echo "Container checkout does not match its trusted source identity" >&2
-            exit 1
-          fi
-          ./scripts/release-targets.sh validate
-          package_version=$(cargo metadata --locked --no-deps --format-version 1 |
-            jq -er '.packages[] | select(.name == "mcp-repl") | .version')
-          if [[ "$ARCHIVE_VERSION" == v* &&
-                "$ARCHIVE_VERSION" != "v$package_version" ]]; then
-            echo "Container tag $ARCHIVE_VERSION does not match package $package_version" >&2
-            exit 1
-          fi
-          config=$(./scripts/release-targets.sh container-build)
-          {
-            echo "matrix=$(./scripts/release-targets.sh container-matrix)"
-            echo "buildkit_image=$(jq -er '.buildkit_image' <<<"$config")"
-            echo "sbom_generator=$(jq -er '.sbom_generator' <<<"$config")"
-            echo "compatibility_version=$(jq -er '.exporter_compatibility_version' <<<"$config")"
-            echo "package_version=$package_version"
-          } >> "$GITHUB_OUTPUT"
-
-  build:
-    name: ${{ matrix.platform }}
-    needs: manifest
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.manifest.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Switch to the authenticated candidate source
-        if: inputs.source_sha != '' && inputs.source_sha != github.sha
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$SOURCE_SHA"
-          git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-
-      - name: Install checksum-pinned Buildx
-        shell: bash
-        env:
-          BUILDX_ASSET: ${{ matrix.buildx_asset }}
-          BUILDX_SHA256: ${{ matrix.buildx_sha256 }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$BUILDX_ASSET" =~ ^buildx-v[0-9]+\.[0-9]+\.[0-9]+\.linux-(amd64|arm64)$ ||
-                ! "$BUILDX_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Invalid Buildx artifact identity" >&2
-            exit 1
-          fi
-          buildx_release=${BUILDX_ASSET#buildx-}
-          buildx_version=${buildx_release%%.linux-*}
-          docker_config="$RUNNER_TEMP/docker-config"
-          plugin="$docker_config/cli-plugins/docker-buildx"
-          mkdir -p "${plugin%/*}"
-          curl --fail --location --proto '=https' --tlsv1.2 \
-            --connect-timeout 10 --max-time 120 \
-            --output "$plugin" \
-            "https://github.com/docker/buildx/releases/download/$buildx_version/${BUILDX_ASSET}"
-          printf '%s  %s\n' "$BUILDX_SHA256" "$plugin" |
-            sha256sum --check --strict
-          chmod 755 "$plugin"
-          test -f "$plugin" && test ! -L "$plugin"
-          version_output=$(DOCKER_CONFIG="$docker_config" docker buildx version)
-          if [[ "$version_output" != "github.com/docker/buildx $buildx_version "* ]]; then
-            echo "Unexpected Buildx version: $version_output" >&2
-            exit 1
-          fi
-          printf 'DOCKER_CONFIG=%s\n' "$docker_config" >> "$GITHUB_ENV"
-
-      # The action sees the already-installed plugin and therefore does not
-      # download another Buildx binary. Its only daemon input is the pinned
-      # multi-architecture BuildKit image from the release manifest.
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-        with:
-          cache-binary: false
-          driver-opts: image=${{ needs.manifest.outputs.buildkit_image }}
-
-      - name: Log in only for content-addressed release staging
-        if: inputs.push
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Rehearse the exact Dockerfile without pushing
-        if: ${{ !inputs.push }}
-        id: rehearsal
+      - name: Set image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=raw,value=latest
+      - name: Build and push image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
-          platforms: ${{ matrix.platform }}
-          tags: local/mcp-repl:${{ inputs.version }}-${{ matrix.platform_slug }}
-          build-args: SOURCE_DATE_EPOCH=${{ inputs.source_date_epoch }}
-          provenance: false
-          sbom: false
-          outputs: type=docker,rewrite-timestamp=true,compatibility-version=${{ needs.manifest.outputs.compatibility_version }}
-
-      - name: Smoke the credential-free rehearsal image
-        if: ${{ !inputs.push }}
-        shell: bash
-        env:
-          LOCAL_IMAGE: local/mcp-repl:${{ inputs.version }}-${{ matrix.platform_slug }}
-          PACKAGE_VERSION: ${{ needs.manifest.outputs.package_version }}
-        run: |
-          set -euo pipefail
-          version_output="$RUNNER_TEMP/container-version"
-          expected_output="$RUNNER_TEMP/expected-container-version"
-          timeout 30 docker run --rm "$LOCAL_IMAGE" --version > "$version_output"
-          printf 'mcp-repl %s\n' "$PACKAGE_VERSION" > "$expected_output"
-          cmp "$expected_output" "$version_output"
-          timeout 30 docker run --rm "$LOCAL_IMAGE" \
-            --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
-            > "$RUNNER_TEMP/container-demo.ndjson"
-          jq -e -s '
-            length == 1 and
-            .[0].content[0].type == "text" and
-            .[0].content[0].text == "212.00"
-          ' "$RUNNER_TEMP/container-demo.ndjson" > /dev/null
-
-      - name: Build and push one attested platform by digest
-        if: inputs.push
-        id: release
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          build-args: SOURCE_DATE_EPOCH=${{ inputs.source_date_epoch }}
-          provenance: mode=max,version=v1,builder-id=https://github.com/${{ github.repository }}/.github/workflows/container-build.yml
-          sbom: generator=${{ needs.manifest.outputs.sbom_generator }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true,oci-mediatypes=true,compression=gzip,compression-level=9,force-compression=true,compatibility-version=${{ needs.manifest.outputs.compatibility_version }}
-
-      - name: Verify, smoke, and record the pushed platform
-        if: inputs.push
-        shell: bash
-        env:
-          BUILD_DIGEST: ${{ steps.release.outputs.digest }}
-          EXPECTED_PLATFORM: ${{ matrix.platform }}
-          PLATFORM_SLUG: ${{ matrix.platform_slug }}
-          PACKAGE_VERSION: ${{ needs.manifest.outputs.package_version }}
-          RELEASE_TAG: ${{ inputs.version }}
-          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
-          SOURCE_DATE_EPOCH: ${{ inputs.source_date_epoch }}
-        run: |
-          set -euo pipefail
-          image_repository=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          image="ghcr.io/$image_repository"
-          if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "Buildx returned an invalid platform digest: $BUILD_DIGEST" >&2
-            exit 1
-          fi
-          raw_index_file="$RUNNER_TEMP/platform-index.json"
-          docker buildx imagetools inspect --raw \
-            "$image@$BUILD_DIGEST" > "$raw_index_file"
-          if [[ ! -s "$raw_index_file" || -L "$raw_index_file" ]]; then
-            echo "Registry returned an empty or linked platform index" >&2
-            exit 1
-          fi
-          raw_index_digest="sha256:$(sha256sum "$raw_index_file" | awk '{print $1}')"
-          formatted_index_digest=$(docker buildx imagetools inspect \
-            --format '{{json .Manifest.Digest}}' "$image@$BUILD_DIGEST" |
-            jq -er 'select(type == "string" and test("^sha256:[0-9a-f]{64}$"))')
-          if [[ "$raw_index_digest" != "$BUILD_DIGEST" ||
-                "$formatted_index_digest" != "$BUILD_DIGEST" ]]; then
-            echo "Raw platform index does not match Buildx digest $BUILD_DIGEST" >&2
-            exit 1
-          fi
-          raw_index=$(<"$raw_index_file")
-          runnable=$(jq -cer --arg platform "$EXPECTED_PLATFORM" '
-            def sha256: type == "string" and test("^sha256:[0-9a-f]{64}$");
-            def attestation:
-              ((.annotations["vnd.docker.reference.type"] // "") ==
-                "attestation-manifest");
-            def string_annotations:
-              ((.annotations? // {}) | type) == "object" and
-              all((.annotations? // {})[]; type == "string");
-            select(type == "object" and .schemaVersion == 2 and
-              .mediaType == "application/vnd.oci.image.index.v1+json") |
-            select((keys - [
-              "schemaVersion", "mediaType", "manifests", "annotations"
-            ]) | length == 0) |
-            select(string_annotations) |
-            select((.manifests | type) == "array") |
-            [.manifests[] | select(attestation | not)] |
-            select(length == 1) | .[0] |
-            select(type == "object" and
-              .mediaType == "application/vnd.oci.image.manifest.v1+json" and
-              (.digest | sha256) and
-              (.size | type) == "number" and .size > 0 and
-              .size == (.size | floor) and
-              ((.platform | keys | sort) == (["architecture", "os"] | sort)) and
-              (.platform.os + "/" + .platform.architecture) == $platform and
-              string_annotations) |
-            {digest, size}
-          ' <<<"$raw_index")
-          runnable_digest=$(jq -er '.digest' <<<"$runnable")
-          runnable_size=$(jq -er '.size' <<<"$runnable")
-
-          attestation_rows=$(jq -cer --arg runnable "$runnable_digest" '
-            def sha256: type == "string" and test("^sha256:[0-9a-f]{64}$");
-            def attestation:
-              ((.annotations["vnd.docker.reference.type"] // "") ==
-                "attestation-manifest");
-            [.manifests[] | select(attestation)] as $attestations |
-            select(($attestations | length) > 0) |
-            select(($attestations | length) ==
-              ([$attestations[].digest] | unique | length)) |
-            select((.manifests | length) == (($attestations | length) + 1)) |
-            select(all($attestations[];
-              type == "object" and
-              .mediaType == "application/vnd.oci.image.manifest.v1+json" and
-              ((.platform | keys | sort) == (["architecture", "os"] | sort)) and
-              .platform.os == "unknown" and
-              .platform.architecture == "unknown" and
-              .annotations["vnd.docker.reference.digest"] == $runnable and
-              (.digest | sha256) and
-              (.size | type) == "number" and .size > 0 and
-              .size == (.size | floor))) |
-            $attestations[] | [.digest, (.size | tostring)] | @tsv
-          ' <<<"$raw_index")
-          has_provenance=false
-          has_sbom=false
-          while IFS=$'\t' read -r attestation_digest attestation_size; do
-            attestation_raw="$RUNNER_TEMP/${attestation_digest#sha256:}.manifest.json"
-            docker buildx imagetools inspect --raw \
-              "$image@$attestation_digest" > "$attestation_raw"
-            raw_digest="sha256:$(sha256sum "$attestation_raw" | awk '{print $1}')"
-            formatted_digest=$(docker buildx imagetools inspect \
-              --format '{{json .Manifest.Digest}}' "$image@$attestation_digest" |
-              jq -er 'select(type == "string" and test("^sha256:[0-9a-f]{64}$"))')
-            raw_size=$(wc -c < "$attestation_raw" | tr -d '[:space:]')
-            if [[ "$raw_digest" != "$attestation_digest" ||
-                  "$formatted_digest" != "$attestation_digest" ||
-                  "$raw_size" != "$attestation_size" ]]; then
-              echo "Attestation descriptor does not match immutable registry bytes" >&2
-              exit 1
-            fi
-            predicates=$(python3 ./scripts/validate-oci-attestation.py \
-              "$image" "$attestation_raw" "$runnable_digest" "$runnable_size" \
-              mcp-repl "$PACKAGE_VERSION")
-            while IFS= read -r predicate; do
-              case "$predicate" in
-                https://slsa.dev/provenance/v1)
-                  has_provenance=true
-                  ;;
-                https://spdx.dev/Document)
-                  has_sbom=true
-                  ;;
-              esac
-            done <<<"$predicates"
-          done <<<"$attestation_rows"
-          if [[ "$has_provenance" != true || "$has_sbom" != true ]]; then
-            echo "Platform is missing BuildKit SLSA or SPDX evidence" >&2
-            exit 1
-          fi
-
-          docker pull "$image@$runnable_digest" > /dev/null
-          version_output="$RUNNER_TEMP/container-version"
-          expected_output="$RUNNER_TEMP/expected-container-version"
-          timeout 30 docker run --rm "$image@$runnable_digest" --version > "$version_output"
-          printf 'mcp-repl %s\n' "$PACKAGE_VERSION" > "$expected_output"
-          cmp "$expected_output" "$version_output"
-          timeout 30 docker run --rm "$image@$runnable_digest" \
-            --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
-            > "$RUNNER_TEMP/container-demo.ndjson"
-          jq -e -s 'length == 1 and .[0].content[0].text == "212.00"' \
-            "$RUNNER_TEMP/container-demo.ndjson" > /dev/null
-
-          metadata_dir="$RUNNER_TEMP/container-metadata"
-          mkdir -p "$metadata_dir"
-          jq -nS \
-            --arg package mcp-repl \
-            --arg tag "$RELEASE_TAG" \
-            --arg source_sha "$SOURCE_SHA" \
-            --argjson source_epoch "$SOURCE_DATE_EPOCH" \
-            --arg image "$image" \
-            --arg platform "$EXPECTED_PLATFORM" \
-            --arg build_digest "$BUILD_DIGEST" \
-            --arg runnable_digest "$runnable_digest" '
-              {
-                schema_version: 1,
-                package: $package,
-                tag: $tag,
-                source_sha: $source_sha,
-                source_epoch: $source_epoch,
-                image: $image,
-                platform: $platform,
-                build_digest: $build_digest,
-                runnable_digest: $runnable_digest,
-                buildkit: {provenance: true, sbom: true}
-              }
-            ' > "$metadata_dir/$PLATFORM_SLUG.json"
-
-      - name: Preserve strict platform metadata
-        if: inputs.push
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: container-${{ matrix.platform_slug }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/container-metadata/${{ matrix.platform_slug }}.json
-          if-no-files-found: error
-          retention-days: 7
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
