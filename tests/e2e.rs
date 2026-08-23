@@ -2885,11 +2885,12 @@ async fn exercise_bind(fixture: &Path, temp: &TempDir) {
     // do, so a value bound for one server cannot leak into a same-named
     // parameter on the next.
     let fixture_string = fixture.display().to_string();
+    let fixture_literal = serde_json::to_string(&fixture_string).expect("quote fixture path");
     let exit_file = temp.path().join("bind-reconnect.exit");
     let input = format!(
         "bind repeat=3\n\
          binds\n\
-         connect -- {fixture_string}\n\
+         connect -- {fixture_literal}\n\
          binds\n\
          quit\n"
     );
