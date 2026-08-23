@@ -836,6 +836,13 @@ case "${1:-}" in
         [ "${14}" = --source-digest ] && source_sha=${15}
         [ "${16}" = --source-ref ] && source_ref=${17}
         [ "${18}" = --deny-self-hosted-runners ]
+        case "$bundle" in
+          *.json | *.jsonl) ;;
+          *)
+            echo "bundle file extension not supported, must be json or jsonl" >&2
+            exit 1
+            ;;
+        esac
         [ -f "$trusted_root" ] && [ -s "$trusted_root" ]
         [ "$source_ref" = refs/heads/main ]
         tag=

@@ -811,7 +811,7 @@ download_record_bound_asset() {
   local assets=$1
   local identity=$2
   local label=$3
-  local name expected_size expected_sha256 asset asset_id path
+  local name expected_size expected_sha256 asset asset_id asset_dir path
   local actual_size actual_digest
 
   name=$(jq -r '.name' <<<"$identity")
@@ -833,7 +833,8 @@ download_record_bound_asset() {
     die "$label does not exactly match immutable release asset metadata"
   fi
   asset_id=$(jq -r '.id' <<<"$asset")
-  path=$(mktemp "$work/release-asset.XXXXXX")
+  asset_dir=$(mktemp -d "$work/release-asset.XXXXXX")
+  path="$asset_dir/bundle.json"
   if ! gh api "repos/$repository/releases/assets/$asset_id" \
       -H 'Accept: application/octet-stream' > "$path"; then
     die "could not download $label by immutable asset ID"
