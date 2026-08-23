@@ -65,6 +65,14 @@ while IFS= read -r container_platform; do
     relative_file=${matched_file#"$root/"}
     case "$relative_file" in
       scripts/release-targets.sh | scripts/test-*.sh) continue ;;
+      .github/workflows/release-latest-recovery.yml | \
+      scripts/smoke-release-latest-recovery.sh | \
+      scripts/verify-release-latest-recovery.sh)
+        # This disposable incident controller must pin the historical v0.3.5
+        # OCI identity instead of trusting whatever the current target manifest
+        # says. Its exact literals are locked by the latest-recovery suite.
+        continue
+        ;;
     esac
     fail "$relative_file:$line_number hardcodes container platform $container_platform"
   done <<<"$matches"

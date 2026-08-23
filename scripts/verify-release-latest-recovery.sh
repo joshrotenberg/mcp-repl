@@ -167,6 +167,7 @@ while IFS= read -r -d '' path; do
     scripts/test-publish-release.sh | \
     scripts/test-release-draft-recovery.sh | \
     scripts/test-release-latest-recovery.sh | \
+    scripts/test-release-targets.sh | \
     scripts/test-release-workflow.sh | \
     scripts/verify-release-draft-recovery.sh | \
     scripts/verify-release-latest-recovery.sh | \

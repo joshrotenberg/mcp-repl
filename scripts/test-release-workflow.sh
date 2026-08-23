@@ -373,6 +373,8 @@ if [[ $(grep -Fc 'expected_release_id=375116865' \
         "$latest_recovery_verifier") -ne 1 ||
       $(grep -Fc '.github/workflows/release-binaries.yml | \' \
         "$latest_recovery_verifier") -ne 1 ||
+      $(grep -Fc 'scripts/test-release-targets.sh | \' \
+        "$latest_recovery_verifier") -ne 1 ||
       $(grep -Fc '/releases/assets/${expected_record_asset_id}' \
         "$latest_recovery_smoke") -ne 1 ||
       $(grep -Fc -- "--proto '=https' --proto-redir '=https'" \
