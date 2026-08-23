@@ -423,7 +423,7 @@ emit_failed_job() {
 
 release_json() {
   local id=$release_id release_tag=v0.3.5 name=v0.3.5 author='github-actions[bot]'
-  local draft=false immutable=true target=main body published='2026-08-23T06:59:06Z'
+  local draft=false immutable=true target=main body='' published='2026-08-23T06:59:06Z'
   case "$mode" in
     wrong_release_id) id=999 ;;
     wrong_release_tag) release_tag=v9.9.9 ;;
