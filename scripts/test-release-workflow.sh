@@ -40,6 +40,21 @@ ci_workflow="$root/.github/workflows/ci.yml"
 release_workflow="$root/.github/workflows/release-binaries.yml"
 release_plz="$root/.github/workflows/release-plz.yml"
 release_publish="$root/.github/workflows/release-publish.yml"
+release_draft_recovery="$root/.github/workflows/release-draft-recovery.yml"
+# The exceptional controller and the normal publisher for one release source
+# must share GitHub's repository-wide concurrency key. This removes avoidable
+# Actions-level mutation races around the final draft visibility change.
+# These patterns intentionally match literal workflow expressions.
+# shellcheck disable=SC2016
+if [[ $(grep -Fc 'group: release-binaries-${{ github.sha }}' \
+      "$release_workflow") -ne 1 ||
+      $(grep -Fc 'group: release-binaries-${{ github.event.client_payload.release_merge_sha }}' \
+        "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc '  cancel-in-progress: false' "$release_workflow") -ne 1 ||
+      $(grep -Fc '  cancel-in-progress: false' "$release_draft_recovery") -ne 1 ]]; then
+  echo "normal publication and exact-draft recovery must share one non-cancelling source lock" >&2
+  exit 1
+fi
 download_artifact='actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c'
 download_count=$(grep -Fc "uses: $download_artifact" "$release_workflow")
 selector_count=$(grep -Fc './scripts/select-run-artifacts.sh' "$release_workflow")
@@ -104,6 +119,54 @@ if [[ $(grep -Fc 'repository_dispatch:' "$release_publish") -ne 1 ||
       $(grep -Fc 'post-publish "$recovery_output" "$RECOVERY_RELEASE_SHA"' \
         "$release_workflow") -ne 1 ]]; then
   echo "release recovery must carry authorization evidence without selecting release source" >&2
+  exit 1
+fi
+draft_preflight=$(sed -n '/^  preflight:/,/^  resume:/p' "$release_draft_recovery")
+draft_resume=$(sed -n '/^  resume:/,$p' "$release_draft_recovery")
+draft_preflight_permissions=$(sed -n \
+  '/^    permissions:$/,/^    outputs:$/p' <<<"$draft_preflight" | sed '$d')
+draft_resume_permissions=$(sed -n \
+  '/^    permissions:$/,/^    steps:$/p' <<<"$draft_resume" | sed '$d')
+expected_draft_preflight_permissions=$'    permissions:\n      actions: read\n      contents: read\n      pull-requests: read\n      statuses: read'
+expected_draft_resume_permissions=$'    permissions:\n      actions: read\n      contents: write'
+if grep -Fq 'workflow_dispatch:' "$release_draft_recovery" ||
+  grep -Fq 'gh run rerun' "$release_draft_recovery" ||
+  grep -Fq '/rerun' "$release_draft_recovery" ||
+  grep -Fq 'publish-release-tag.sh' "$release_draft_recovery" ||
+  grep -Eq 'ref:.*(client_payload|release_merge_sha)' "$release_draft_recovery" ||
+  grep -Eq '^      (packages|attestations|id-token):' <<<"$draft_resume" ||
+  grep -Fq '      actions: write' <<<"$draft_resume" ||
+  [[ "$draft_preflight_permissions" != "$expected_draft_preflight_permissions" ||
+     "$draft_resume_permissions" != "$expected_draft_resume_permissions" ]]; then
+  echo "draft recovery must not select workflow code, create tags, rerun jobs, or gain unrelated authority" >&2
+  exit 1
+fi
+# These patterns intentionally match literal workflow expressions.
+# shellcheck disable=SC1003,SC2016
+if [[ $(grep -Fc 'permissions: {}' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'repository_dispatch:' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'types: [release_draft_recovery]' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc '      actions: read' "$release_draft_recovery") -ne 2 ||
+      $(grep -Fc '      contents: write' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc '      pull-requests: read' <<<"$draft_preflight") -ne 1 ||
+      $(grep -Fc '      statuses: read' <<<"$draft_preflight") -ne 1 ||
+      $(grep -Fc '      contents: write' <<<"$draft_resume") -ne 1 ||
+      $(grep -Fc 'ref: ${{ github.sha }}' "$release_draft_recovery") -ne 2 ||
+      $(grep -Fc './scripts/verify-release-draft-recovery.sh \' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc './scripts/verify-release-draft-recovery.sh resume "$actual"' \
+        "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'git worktree add --detach "$source_root" "$RELEASE_MERGE_SHA"' \
+        "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc '"repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip"' \
+        "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'sha256sum --check --strict' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'Resume and finalize only the authenticated draft' \
+        "$release_draft_recovery") -ne 1 ||
+      $(grep -Ec '^[[:space:]]+resume \\' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc '"$EXPECTED_RELEASE_ID"' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc '"release_id=$EXPECTED_RELEASE_ID"' \
+        "$release_draft_recovery") -ne 1 ]]; then
+  echo "draft recovery must bind exact evidence, reviewed overlays, and one existing numeric release" >&2
   exit 1
 fi
 reconcile_job=$(sed -n '/^  reconcile:/,/^  binaries:/p' "$release_publish")
