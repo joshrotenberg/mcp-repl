@@ -45,6 +45,12 @@ path = "src/lib.rs"
 name = "mcp-repl"
 path = "src/main.rs"
 
+[features]
+default = []
+# Experimental two-stage clap parser built from a connected server's surface.
+# Kept off by default until its command grammar has had real-world use.
+unstable-dynamic-cli = ["clap/string"]
+
 [dependencies]
 # `dynamic-tools` carries no dependencies of its own; it compiles the registry
 # the demo server uses to add a tool while a client is connected, which is what

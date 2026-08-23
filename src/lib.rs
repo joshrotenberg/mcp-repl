@@ -49,6 +49,8 @@ mod command;
 pub mod config;
 mod connection_auth;
 mod directories;
+#[cfg(feature = "unstable-dynamic-cli")]
+mod dynamic_cli;
 mod editor;
 mod elicit;
 mod exit_status;
@@ -158,7 +160,7 @@ EXAMPLES:
   mcp-repl .mcp.json:local               an entry from a client config
   mcp-repl --server prod                 a saved profile
 
-  mcp-repl --demo -e 'echo message=hi'   run one command and exit
+  mcp-repl --demo -e 'echo message=hi'   run REPL command syntax and exit
   mcp-repl --demo --json -e tools | jq   NDJSON for scripts
 
 Inside the REPL, `help` lists the built-ins and `help <command>` explains one."
@@ -176,7 +178,8 @@ struct Args {
     http: Option<String>,
 
     /// Serve the bundled demo router in-process (no external server needed).
-    #[arg(long, conflicts_with_all = ["http", "command", "server"])]
+    #[arg(long, conflicts_with_all = ["http", "server"])]
+    #[cfg_attr(not(feature = "unstable-dynamic-cli"), arg(conflicts_with = "command"))]
     demo: bool,
 
     /// Connect using a saved profile name, or an imported config entry.
@@ -4287,7 +4290,24 @@ pub fn run_cli() {
     }
 }
 
-async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()> {
+/// Reserve an explicit target's positional tail for the experimental
+/// surface-driven CLI. The default build deliberately leaves startup parsing
+/// untouched.
+#[cfg(feature = "unstable-dynamic-cli")]
+fn take_generated_argv(args: &mut Args, imported_target: bool) -> Vec<String> {
+    if args.demo || args.server.is_some() || (args.http.is_some() && !imported_target) {
+        std::mem::take(&mut args.command)
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(not(feature = "unstable-dynamic-cli"))]
+fn take_generated_argv(_args: &mut Args, _imported_target: bool) -> Vec<String> {
+    Vec::new()
+}
+
+async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()> {
     // Server profiles are read up front: both --list-servers and profile
     // resolution need them before anything connects.
     let config_file = config::config_path(args.config.as_deref()).map(|(path, _)| path);
@@ -4336,18 +4356,35 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
     if args.scan {
         std::process::exit(print_scan().code());
     }
+    // Resolve imports before borrowing the positional tail: `--http URL
+    // path.json:entry` is an existing way to retarget an imported HTTP entry
+    // while retaining its auth, so that lone selector is part of the target,
+    // not a generated command.
+    let imported = resolve_import(&args);
+    // An explicit connection selector makes the positional tail unambiguous:
+    // it cannot be a stdio child command, so reserve it for a second clap
+    // pass after the surface fetch. A raw positional target stays untouched
+    // because there is no reliable boundary between its process arguments and
+    // a tool invocation; --exec remains available for that case.
+    let dynamic_argv = take_generated_argv(&mut args, imported.is_some());
+    if !dynamic_argv.is_empty() && !args.exec.is_empty() {
+        exit_with_error(
+            ExitStatus::Usage,
+            "a generated command cannot be combined with --exec; choose one one-shot syntax",
+        );
+    }
     let schema_contracts =
         schema_contract::ContractSet::load(&args.schema_contracts, args.schema_mode)
             .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
-    let imported = resolve_import(&args);
     let profile = if imported.is_none() {
         resolve_profile(&args, &profiles, bearer_from_fd.is_some())
     } else {
         None
     };
-    // --exec runs commands and exits; suppress the banner and surface listing
-    // unless --verbose, so scripted output is only the command results.
-    let one_shot = !args.exec.is_empty();
+    // --exec and generated commands run and exit; suppress the banner
+    // and surface listing unless --verbose, so scripted output is only the
+    // command result.
+    let one_shot = !args.exec.is_empty() || !dynamic_argv.is_empty();
     // JSON stdout is a machine-readable stream. Even `--verbose` must not
     // inject a human banner into it.
     let quiet = one_shot && (!args.verbose || args.json);
@@ -4875,17 +4912,46 @@ async fn run(args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()
         )
     };
 
+    #[cfg(feature = "unstable-dynamic-cli")]
+    let dynamic_command = if dynamic_argv.is_empty() {
+        None
+    } else {
+        let parsed = {
+            let surface = surface.read().unwrap();
+            dynamic_cli::parse(&surface.tools, &surface.prompts, &dynamic_argv)
+        };
+        match parsed {
+            Ok(invocation) => Some(invocation.repl_line()),
+            Err(error) => {
+                let status = error.exit_code();
+                error.print().unwrap_or_else(|print_error| {
+                    eprintln!("failed to print generated CLI help: {print_error}")
+                });
+                match Arc::try_unwrap(session) {
+                    Ok(session) => session.shutdown().await?,
+                    Err(_) => eprintln!(
+                        "warning: generated CLI parsing failed after connecting; exiting without \
+                         the orderly shutdown"
+                    ),
+                }
+                std::process::exit(status);
+            }
+        }
+    };
+    #[cfg(not(feature = "unstable-dynamic-cli"))]
+    let dynamic_command: Option<String> = None;
+
     // Installed before the first command runs, for the reason in
     // `Interrupts`. Everything above this point is connection setup, where an
     // interrupt still ends the process outright: there is no command to
     // abandon yet.
     let mut interrupts = Interrupts::arm();
 
-    // One-shot: run each --exec command in order, then exit non-zero if any
-    // errored. No editor, no event loop.
+    // One-shot: run the generated command or each --exec command, then
+    // exit non-zero if any errored. No editor, no event loop.
     if one_shot {
         let client = session.client();
-        for cmd in &args.exec {
+        for cmd in dynamic_command.iter().chain(args.exec.iter()) {
             match run_cancellable(
                 &session,
                 &surface,
