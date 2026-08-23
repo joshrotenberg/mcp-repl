@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "development-tools"]
 # fixtures, workflows, and container assets stay out of the published crate.
 include = [
     "/src/**",
+    "/build.rs",
     "/Cargo.lock",
     "/README.md",
     "/CHANGELOG.md",
