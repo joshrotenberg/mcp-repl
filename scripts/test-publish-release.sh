@@ -242,36 +242,9 @@ emit_release() {
 
 case "${1:-} ${2:-}" in
   "api graphql")
-    if [ "${GH_MODE:-normal}" = lookup_failure ]; then
-      echo "lookup failed" >&2
-      exit 1
-    fi
-    if [ "${GH_MODE:-normal}" = graphql_malformed ]; then
-      printf '{"data":{"repository":{"release":{"databaseId":0}}}}\n'
-      exit 0
-    fi
-    if [ "${GH_MODE:-normal}" = graphql_partial_errors ]; then
-      printf '{"errors":[{"message":"partial failure"}],"data":{"repository":{"release":{"databaseId":%s,"tagName":"%s"}}}}\n' \
-        "$release_id" "$tag"
-      exit 0
-    fi
-    count=$(cat "${TEST_LOOKUP_COUNT:?}")
-    if [ "${GH_MODE:-normal}" = ghost_identity_then_absent ] &&
-       [ "$count" -eq 0 ]; then
-      printf '{"data":{"repository":{"release":{"databaseId":%s,"tagName":"%s"}}}}\n' \
-        "$release_id" "$tag"
-    elif [ "$release_state" = absent ]; then
-      printf '{"data":{"repository":{"release":null}}}\n'
-    else
-      graphql_id=$release_id
-      if [ "${GH_MODE:-normal}" = identity_change ]; then
-        [ "$count" -lt 1 ] || graphql_id=$duplicate_release_id
-      elif [ "${GH_MODE:-normal}" = transient_identity_change ]; then
-        [ "$count" -lt 1 ] || graphql_id=$duplicate_release_id
-      fi
-      printf '{"data":{"repository":{"release":{"databaseId":%s,"tagName":"%s"}}}}\n' \
-        "$graphql_id" "$tag"
-    fi
+    printf 'graph\n' >> "${TEST_LOG:?}"
+    echo "GraphQL release discovery is forbidden" >&2
+    exit 1
     ;;
 
   "api repos/$repository/releases/tags/$tag")
@@ -418,33 +391,42 @@ case "${1:-} ${2:-}" in
         count=$(cat "${TEST_LOOKUP_COUNT:?}")
         count=$((count + 1))
         printf '%s\n' "$count" > "${TEST_LOOKUP_COUNT:?}"
-        printf '[[{"id":111,"tag_name":"v0.0.1"}],['
+        unrelated_id=111
+        if [ "${GH_MODE:-normal}" = release_inventory_churn ] &&
+           [ $((count % 2)) -eq 0 ]; then
+          unrelated_id=112
+        fi
+        printf '[[{"id":%s,"tag_name":"v0.0.1"}],[' "$unrelated_id"
         visible=true
         if [ "$release_state" = absent ]; then
           visible=false
-        elif [ "${GH_MODE:-normal}" = rest_lag ] && [ "$count" -le 2 ]; then
+        elif [ "${GH_MODE:-normal}" = absent_then_found ] && [ "$count" -eq 1 ]; then
           visible=false
-        elif [ "${GH_MODE:-normal}" = transient_identity_change ] &&
-             [ "$count" -eq 1 ]; then
+        elif [ "${GH_MODE:-normal}" = found_then_absent ] && [ "$count" -ge 2 ]; then
           visible=false
         fi
         if [ "$visible" = true ]; then
           listed_id=$release_id
-          [ "${GH_MODE:-normal}" != lookup_mismatch ] ||
-            listed_id=$duplicate_release_id
           if [ "${GH_MODE:-normal}" = identity_change ] && [ "$count" -ge 2 ]; then
             listed_id=$duplicate_release_id
-          elif [ "${GH_MODE:-normal}" = transient_identity_change ] &&
-               [ "$count" -ge 2 ]; then
+          elif [ "${GH_MODE:-normal}" = replacement_before_upload ] &&
+               [ "$count" -ge 3 ]; then
+            listed_id=$duplicate_release_id
+          elif [ "${GH_MODE:-normal}" = replacement_before_patch ] &&
+               [ "$count" -ge 5 ]; then
             listed_id=$duplicate_release_id
           fi
           printf '{"id":%s,"tag_name":"%s"}' "$listed_id" "$tag"
           if [ "${GH_MODE:-normal}" = duplicate_release ] ||
              { [ "${GH_MODE:-normal}" = duplicate_after_one ] && [ "$count" -ge 2 ]; } ||
+             { [ "${GH_MODE:-normal}" = duplicate_before_upload ] && [ "$count" -ge 3 ]; } ||
+             { [ "${GH_MODE:-normal}" = duplicate_before_patch ] && [ "$count" -ge 5 ]; } ||
              [ "${GH_MODE:-normal}" = create_duplicate_response_loss ]; then
             printf ',{"id":%s,"tag_name":"%s"}' "$duplicate_release_id" "$tag"
           elif [ "${GH_MODE:-normal}" = duplicate_paginated_id ]; then
             printf ',{"id":%s,"tag_name":"%s"}' "$listed_id" "$tag"
+          elif [ "${GH_MODE:-normal}" = duplicate_global_release_id ]; then
+            printf ',{"id":%s,"tag_name":"v9.9.9"}' "$listed_id"
           fi
         fi
         printf ']]\n'
@@ -706,6 +688,16 @@ check "stage uploads an empty existing draft without publishing" stage 0 \
 
 seed_dist
 reset_remote draft
+check "a duplicate appearing at the upload boundary prevents mutation" stage 1 \
+  "multiple GitHub releases use tag" none duplicate_before_upload
+
+seed_dist
+reset_remote draft
+check "a replacement appearing at the upload boundary prevents mutation" stage 1 \
+  "was replaced: expected 4242, found 4343" none replacement_before_upload
+
+seed_dist
+reset_remote draft
 check "stage detects a tag moved while assets are uploaded" stage 1 \
   "live annotated release tag" upload tag_move_after_upload
 
@@ -739,21 +731,6 @@ check "stage reconciles a malformed committed upload response" stage 0 \
 
 seed_dist
 reset_remote draft
-check "an ambiguous release lookup cannot create or upload" stage 1 \
-  "could not determine whether GitHub release" none lookup_failure
-
-seed_dist
-reset_remote draft
-check "malformed GraphQL identity cannot create or upload" stage 1 \
-  "malformed release identity data" none graphql_malformed
-
-seed_dist
-reset_remote draft
-check "partial GraphQL errors cannot create or upload" stage 1 \
-  "malformed release lookup data" none graphql_partial_errors
-
-seed_dist
-reset_remote draft
 check "a failed paginated release listing cannot create or upload" stage 1 \
   "could not list GitHub releases" none release_list_failure
 
@@ -769,9 +746,25 @@ check "malformed objects in release pages cannot create or upload" stage 1 \
 
 seed_dist
 reset_remote draft
-copy_exact_remote
-check "GraphQL discovery waits for lagging REST-list visibility" stage 0 \
-  "Staged exact draft" none rest_lag
+check "globally duplicate release identities are malformed" stage 1 \
+  "malformed paginated release data" none duplicate_global_release_id
+
+seed_dist
+reset_remote draft
+check "the complete release inventory must converge" stage 1 \
+  "did not converge" none release_inventory_churn
+
+seed_dist
+reset_remote draft
+check "absence followed by one stable identity converges safely" stage 0 \
+  "Staged exact draft" upload absent_then_found
+
+seed_dist
+reset_remote draft
+check "an observed identity can never become safe absence" stage 1 \
+  "did not converge" none found_then_absent
+[[ "$(<"$state")" == draft ]] ||
+  fail "found-then-absent lookup changed release visibility"
 
 seed_dist
 reset_remote draft
@@ -787,23 +780,6 @@ seed_dist
 reset_remote draft
 check "duplicate paginated identities are rejected as malformed" stage 1 \
   "malformed paginated release data" none duplicate_paginated_id
-
-seed_dist
-reset_remote draft
-check "GraphQL and REST identity disagreement prevents staging" stage 1 \
-  "release lookups disagree" none lookup_mismatch
-
-seed_dist
-reset_remote absent
-check "a one-sided identity can never become safe absence" stage 1 \
-  "did not converge" none ghost_identity_then_absent
-[[ "$(<"$state")" == absent ]] ||
-  fail "one-sided identity lookup created a replacement release"
-
-seed_dist
-reset_remote draft
-check "a one-sided release identity cannot converge to a replacement" stage 1 \
-  "changed during lookup" none transient_identity_change
 
 seed_dist
 reset_remote draft
@@ -874,6 +850,22 @@ copy_exact_remote
 check "finalize publishes only after exact remote verification" finalize 0 \
   "Finalized exact immutable" patch
 [[ "$(<"$state")" == published ]] || fail "finalize did not publish the release"
+
+seed_dist
+reset_remote draft
+copy_exact_remote
+check "a duplicate appearing at the PATCH boundary prevents publication" finalize 1 \
+  "multiple GitHub releases use tag" none duplicate_before_patch
+[[ "$(<"$state")" == draft ]] ||
+  fail "duplicate-at-PATCH guard changed release visibility"
+
+seed_dist
+reset_remote draft
+copy_exact_remote
+check "a replacement appearing at the PATCH boundary prevents publication" finalize 1 \
+  "was replaced: expected 4242, found 4343" none replacement_before_patch
+[[ "$(<"$state")" == draft ]] ||
+  fail "replacement-at-PATCH guard changed release visibility"
 
 seed_dist
 reset_remote draft

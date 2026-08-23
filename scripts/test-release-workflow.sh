@@ -41,6 +41,8 @@ release_workflow="$root/.github/workflows/release-binaries.yml"
 release_plz="$root/.github/workflows/release-plz.yml"
 release_publish="$root/.github/workflows/release-publish.yml"
 release_draft_recovery="$root/.github/workflows/release-draft-recovery.yml"
+draft_recovery_verifier="$root/scripts/verify-release-draft-recovery.sh"
+release_publisher="$root/scripts/publish-release.sh"
 # The exceptional controller and the normal publisher for one release source
 # must share GitHub's repository-wide concurrency key. This removes avoidable
 # Actions-level mutation races around the final draft visibility change.
@@ -136,6 +138,9 @@ if grep -Fq 'workflow_dispatch:' "$release_draft_recovery" ||
   grep -Eq 'ref:.*(client_payload|release_merge_sha)' "$release_draft_recovery" ||
   grep -Eq '^      (packages|attestations|id-token):' <<<"$draft_resume" ||
   grep -Fq '      actions: write' <<<"$draft_resume" ||
+  grep -Fq '      release_id:' <<<"$draft_preflight" ||
+  grep -Fq 'api graphql' "$draft_recovery_verifier" "$release_publisher" ||
+  grep -Fq '/releases/tags/' "$draft_recovery_verifier" "$release_publisher" ||
   [[ "$draft_preflight_permissions" != "$expected_draft_preflight_permissions" ||
      "$draft_resume_permissions" != "$expected_draft_resume_permissions" ]]; then
   echo "draft recovery must not select workflow code, create tags, rerun jobs, or gain unrelated authority" >&2
@@ -155,6 +160,11 @@ if [[ $(grep -Fc 'permissions: {}' "$release_draft_recovery") -ne 1 ||
       $(grep -Fc './scripts/verify-release-draft-recovery.sh \' "$release_draft_recovery") -ne 1 ||
       $(grep -Fc './scripts/verify-release-draft-recovery.sh resume "$actual"' \
         "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'id: reauth' "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'EXPECTED_RELEASE_ID: ${{ github.event.client_payload.release_id }}' \
+        "$release_draft_recovery") -ne 1 ||
+      $(grep -Fc 'cat "$actual" >> "$GITHUB_OUTPUT"' \
+        "$release_draft_recovery") -ne 1 ||
       $(grep -Fc 'git worktree add --detach "$source_root" "$RELEASE_MERGE_SHA"' \
         "$release_draft_recovery") -ne 1 ||
       $(grep -Fc '"repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip"' \
@@ -166,7 +176,23 @@ if [[ $(grep -Fc 'permissions: {}' "$release_draft_recovery") -ne 1 ||
       $(grep -Fc '"$EXPECTED_RELEASE_ID"' "$release_draft_recovery") -ne 1 ||
       $(grep -Fc '"release_id=$EXPECTED_RELEASE_ID"' \
         "$release_draft_recovery") -ne 1 ]]; then
-  echo "draft recovery must bind exact evidence, reviewed overlays, and one existing numeric release" >&2
+  echo "draft recovery must authenticate the selected numeric release only at its write boundary" >&2
+  exit 1
+fi
+draft_reauth_line=$(grep -nF \
+  "./scripts/verify-release-draft-recovery.sh resume \"\$actual\"" \
+  "$release_draft_recovery" | cut -d: -f1)
+draft_download_line=$(grep -nF \
+  "\"repos/\$GITHUB_REPOSITORY/actions/artifacts/\$ARTIFACT_ID/zip\"" \
+  "$release_draft_recovery" | cut -d: -f1)
+draft_publish_line=$(grep -nF \
+  "\"\$RECOVERY_SOURCE_ROOT/scripts/publish-release.sh\"" \
+  "$release_draft_recovery" | cut -d: -f1)
+if [[ -z "$draft_reauth_line" || -z "$draft_download_line" ||
+      -z "$draft_publish_line" ||
+      "$draft_reauth_line" -ge "$draft_download_line" ||
+      "$draft_download_line" -ge "$draft_publish_line" ]]; then
+  echo "draft authentication must precede artifact access and every release mutation" >&2
   exit 1
 fi
 reconcile_job=$(sed -n '/^  reconcile:/,/^  binaries:/p' "$release_publish")

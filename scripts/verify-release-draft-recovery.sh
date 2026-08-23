@@ -45,12 +45,19 @@ if ! request=$(jq -cer \
     .client_payload as $payload |
     select(($payload | type) == "object") |
     select(($payload | keys) == [
+      "release_id",
       "release_merge_sha",
       "run_attempt",
       "run_id",
       "schema_version"
     ]) |
-    select($payload.schema_version == 1) |
+    select($payload.schema_version == 2) |
+    select(
+      ($payload.release_id | type) == "number" and
+      $payload.release_id == ($payload.release_id | floor) and
+      $payload.release_id >= 1 and
+      $payload.release_id <= 9007199254740991
+    ) |
     select(
       ($payload.release_merge_sha | type) == "string" and
       ($payload.release_merge_sha | test("^[0-9a-f]{40}$"))
@@ -71,6 +78,7 @@ if ! request=$(jq -cer \
   exit 1
 fi
 
+requested_release_id=$(jq -r '.release_id' <<<"$request")
 release_merge_sha=$(jq -r '.release_merge_sha' <<<"$request")
 run_id=$(jq -r '.run_id' <<<"$request")
 run_attempt=$(jq -r '.run_attempt' <<<"$request")
@@ -332,122 +340,120 @@ if ! "$root/scripts/extract-release-notes.sh" "$version" > "$expected_notes_file
   exit 1
 fi
 
-owner=${repository%%/*}
-repository_name=${repository#*/}
-# GitHub's release-by-tag REST endpoint hides private drafts. GraphQL can find
-# one, but its singular field alone cannot prove that two same-tag drafts do
-# not exist. Bind it to exactly one match across the complete authenticated
-# REST release listing before trusting the numeric identity.
-# These dollar-prefixed names belong to GraphQL, not the shell.
-# shellcheck disable=SC2016
-release_query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){databaseId tagName}}}'
-if ! graph_release=$(gh api graphql \
-  -f "query=$release_query" \
-  -F "owner=$owner" \
-  -F "name=$repository_name" \
-  -F "tag=$release_tag"); then
-  echo "Could not discover the GraphQL identity for GitHub release $release_tag" >&2
-  exit 1
-fi
-if ! graph_release_id=$(jq -er \
-  --arg tag "$release_tag" '
-    select(type == "object") |
-    select((has("errors") | not) or .errors == null or .errors == []) |
-    .data.repository.release |
-    select(type == "object" and .tagName == $tag) |
-    .databaseId |
-    select(type == "number" and . > 0 and floor == .)
-  ' <<<"$graph_release"); then
-  echo "GitHub returned an invalid GraphQL recovery release identity" >&2
-  exit 1
-fi
-if ! release_pages=$(gh api --paginate --slurp \
-  "repos/${repository}/releases?per_page=100"); then
-  echo "Could not enumerate GitHub releases while binding $release_tag" >&2
-  exit 1
-fi
-if ! release_id=$(jq -er \
-  --arg tag "$release_tag" \
-  --argjson graph_id "$graph_release_id" '
-    select(
-      type == "array" and
-      all(.[];
-        type == "array" and
-        all(.[];
-          type == "object" and
-          (.id | type) == "number" and .id > 0 and
-          .id == (.id | floor) and
-          (.tag_name | type) == "string"))
-    ) |
-    [ .[][] | select(.tag_name == $tag) ] |
-    select(length == 1) | .[0].id |
-    select(type == "number" and . > 0 and floor == . and . == $graph_id)
-  ' <<<"$release_pages"); then
-  echo "GraphQL and the complete REST release list do not bind one exact $release_tag identity" >&2
-  exit 1
-fi
-if ! release=$(gh api "repos/${repository}/releases/${release_id}"); then
-  echo "Could not read exact GitHub release $release_tag (id $release_id)" >&2
-  exit 1
-fi
-if ! jq -e \
-  --arg tag "$release_tag" \
-  --argjson release_id "$release_id" '
-    select(type == "object") |
-    select(.id == $release_id and .tag_name == $tag and .name == $tag) |
-    select(.target_commitish == "main" and .prerelease == false) |
-    select(.author.login == "github-actions[bot]" and .author.type == "Bot") |
-    select(
-      (.draft == true and .immutable == false and .published_at == null) or
-      (.draft == false and .immutable == true and
-        (.published_at | type) == "string" and (.published_at | length) > 0)
-    )
-  ' <<<"$release" > /dev/null; then
-  echo "GitHub release $release_tag is not the trusted resumable draft or immutable release" >&2
-  exit 1
-fi
-if ! jq -jer '(.body // "") | select(type == "string")' \
-  <<<"$release" > "$release_body_file" ||
-   ! cmp -s "$release_body_file" "$expected_notes_file"; then
-  echo "GitHub release $release_tag does not contain the exact canonical notes" >&2
-  exit 1
-fi
-
-if ! asset_pages=$(gh api --paginate --slurp \
-  "repos/${repository}/releases/${release_id}/assets?per_page=100"); then
-  echo "Could not list assets on GitHub release $release_tag" >&2
-  exit 1
-fi
-expected_names=$("$release_targets" \
-  expected-release-assets "$release_tag" | jq -Rsc 'split("\n")[:-1] | sort')
-if ! jq -e \
-  --argjson expected "$expected_names" \
-  --argjson published "$(jq -r '.draft == false' <<<"$release")" '
-    select(type == "array" and all(.[]; type == "array")) |
-    [ .[][] ] as $assets |
-    select(($assets | length) <= ($expected | length)) |
-    select(all($assets[];
-      (.id | type) == "number" and .id > 0 and .id == (.id | floor) and
-      (.name | type) == "string" and
-      (.size | type) == "number" and .size > 0 and .size == (.size | floor) and
-      .state == "uploaded"
-    )) |
-    ([$assets[].id] | sort) as $ids |
-    select(($ids | unique | length) == ($ids | length)) |
-    ([$assets[].name] | sort) as $actual |
-    select(($actual | unique | length) == ($actual | length)) |
-    select((($actual - $expected) | length) == 0) |
-    select(($published | not) or $actual == $expected)
-  ' <<<"$asset_pages" > /dev/null; then
-  echo "GitHub release $release_tag has an unsafe or noncanonical asset inventory" >&2
-  exit 1
-fi
-
 if ! GH_REPO="$repository" \
   "$root/scripts/verify-release-tag.sh" \
     "$release_tag" "$release_merge_sha" > /dev/null; then
   echo "GitHub release tag $release_tag does not bind the recovered source" >&2
   exit 1
+fi
+
+# GitHub deliberately hides private drafts from read-only credentials. The
+# owner-selected numeric ID is inert in preflight: only immutable failed-run,
+# artifact, source, and tag evidence is authenticated there. The write-scoped
+# phase must reauthenticate two identical complete push-visible release-list
+# snapshots, the exact ID, metadata, notes, and asset subset before the first
+# mutation can run.
+if [[ "$phase" == resume ]]; then
+  stable_release_snapshot=
+  for observation in 1 2; do
+    if ! release_pages=$(gh api --paginate --slurp \
+      "repos/${repository}/releases?per_page=100"); then
+      echo "Could not enumerate push-visible GitHub releases while binding $release_tag" >&2
+      exit 1
+    fi
+    if ! release_snapshot=$(jq -ce '
+      if type != "array" or any(.[]; type != "array") or
+         any(.[][];
+           type != "object" or
+           (.id | type) != "number" or .id <= 0 or
+           .id != (.id | floor) or
+           (.tag_name | type) != "string")
+      then error("malformed release pages")
+      else
+        [.[][] | {id, tag_name}] | sort_by(.id, .tag_name) |
+        if ([.[].id] | unique | length) != length
+        then error("duplicate release identity")
+        else .
+        end
+      end
+    ' <<<"$release_pages"); then
+      echo "GitHub returned malformed push-visible release data while binding $release_tag" >&2
+      exit 1
+    fi
+    if [[ -n "$stable_release_snapshot" &&
+          "$release_snapshot" != "$stable_release_snapshot" ]]; then
+      echo "Complete push-visible release inventory changed while binding $release_tag" >&2
+      exit 1
+    fi
+    stable_release_snapshot=$release_snapshot
+    [[ "$observation" -eq 2 ]] || sleep 1
+  done
+  if ! release_id=$(jq -er \
+    --arg tag "$release_tag" \
+    --argjson expected_id "$requested_release_id" '
+      [ .[] | select(.tag_name == $tag) ] |
+      select(length == 1) | .[0].id |
+      select(type == "number" and . > 0 and floor == . and . == $expected_id)
+    ' <<<"$stable_release_snapshot"); then
+    echo "Complete push-visible REST release list does not bind exact $release_tag id $requested_release_id" >&2
+    exit 1
+  fi
+  if ! release=$(gh api "repos/${repository}/releases/${release_id}"); then
+    echo "Could not read exact GitHub release $release_tag (id $release_id)" >&2
+    exit 1
+  fi
+  if ! jq -e \
+    --arg tag "$release_tag" \
+    --argjson release_id "$release_id" '
+      select(type == "object") |
+      select(.id == $release_id and .tag_name == $tag and .name == $tag) |
+      select(.target_commitish == "main" and .prerelease == false) |
+      select(.author.login == "github-actions[bot]" and .author.type == "Bot") |
+      select(
+        (.draft == true and .immutable == false and .published_at == null) or
+        (.draft == false and .immutable == true and
+          (.published_at | type) == "string" and (.published_at | length) > 0)
+      )
+    ' <<<"$release" > /dev/null; then
+    echo "GitHub release $release_tag is not the trusted resumable draft or immutable release" >&2
+    exit 1
+  fi
+  if ! jq -jer '(.body // "") | select(type == "string")' \
+    <<<"$release" > "$release_body_file" ||
+     ! cmp -s "$release_body_file" "$expected_notes_file"; then
+    echo "GitHub release $release_tag does not contain the exact canonical notes" >&2
+    exit 1
+  fi
+
+  if ! asset_pages=$(gh api --paginate --slurp \
+    "repos/${repository}/releases/${release_id}/assets?per_page=100"); then
+    echo "Could not list assets on GitHub release $release_tag" >&2
+    exit 1
+  fi
+  expected_names=$("$release_targets" \
+    expected-release-assets "$release_tag" | jq -Rsc 'split("\n")[:-1] | sort')
+  if ! jq -e \
+    --argjson expected "$expected_names" \
+    --argjson published "$(jq -r '.draft == false' <<<"$release")" '
+      select(type == "array" and all(.[]; type == "array")) |
+      [ .[][] ] as $assets |
+      select(($assets | length) <= ($expected | length)) |
+      select(all($assets[];
+        (.id | type) == "number" and .id > 0 and .id == (.id | floor) and
+        (.name | type) == "string" and
+        (.size | type) == "number" and .size > 0 and .size == (.size | floor) and
+        .state == "uploaded"
+      )) |
+      ([$assets[].id] | sort) as $ids |
+      select(($ids | unique | length) == ($ids | length)) |
+      ([$assets[].name] | sort) as $actual |
+      select(($actual | unique | length) == ($actual | length)) |
+      select((($actual - $expected) | length) == 0) |
+      select(($published | not) or $actual == $expected)
+    ' <<<"$asset_pages" > /dev/null; then
+    echo "GitHub release $release_tag has an unsafe or noncanonical asset inventory" >&2
+    exit 1
+  fi
 fi
 
 {
@@ -456,7 +462,13 @@ fi
   echo "run_attempt=$run_attempt"
   echo "artifact_id=$artifact_id"
   echo "artifact_digest=$artifact_digest"
-  echo "release_id=$release_id"
+  if [[ "$phase" == resume ]]; then
+    echo "release_id=$release_id"
+  fi
   echo "release_tag=$release_tag"
 } >> "$output_file"
-echo "Authenticated exact draft recovery for $release_tag from run $run_id attempt $run_attempt"
+if [[ "$phase" == preflight ]]; then
+  echo "Authenticated immutable failed-release evidence for $release_tag from run $run_id attempt $run_attempt"
+else
+  echo "Authenticated exact draft recovery for $release_tag from run $run_id attempt $run_attempt"
+fi

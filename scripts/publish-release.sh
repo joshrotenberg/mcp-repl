@@ -535,51 +535,17 @@ verify_remote_release() {
   verify_live_release_tag
 }
 
-graphql_release_id=
 located_release_id=
-read_graphql_release_id() {
-  local owner=${repository%%/*} name=${repository#*/} response
-  graphql_release_id=
-  # These dollar-prefixed names are GraphQL variables, not shell parameters.
-  # shellcheck disable=SC2016
-  local query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){databaseId tagName}}}'
-  if ! response=$(gh api graphql \
-    -f "query=$query" \
-    -F "owner=$owner" \
-    -F "name=$name" \
-    -F "tag=$tag"); then
-    fail "could not determine whether GitHub release $tag exists"
-  fi
-  if ! jq -e '
-    type == "object" and
-    ((has("errors") | not) or .errors == null or .errors == []) and
-    (.data.repository | type) == "object"
-  ' <<<"$response" > /dev/null; then
-    fail "GitHub returned malformed release lookup data for $tag"
-  fi
-  if jq -e '.data.repository.release == null' <<<"$response" > /dev/null; then
-    return 0
-  fi
-  if ! graphql_release_id=$(jq -er \
-    --arg tag "$tag" '
-      .data.repository.release |
-      select(type == "object" and .tagName == $tag) |
-      .databaseId |
-      select(type == "number" and . > 0 and floor == .)
-    ' <<<"$response"); then
-    fail "GitHub returned malformed release identity data for $tag"
-  fi
-}
-
 rest_release_ids=
 rest_release_count=0
+rest_release_snapshot=
 read_rest_release_ids() {
   local pages
   if ! pages=$(gh api --paginate --slurp \
     "repos/${repository}/releases?per_page=100"); then
     fail "could not list GitHub releases while locating $tag"
   fi
-  if ! rest_release_ids=$(jq -ce --arg tag "$tag" '
+  if ! rest_release_snapshot=$(jq -ce '
     if type != "array" or any(.[]; type != "array") or
        any(.[][];
          type != "object" or
@@ -588,122 +554,89 @@ read_rest_release_ids() {
          (.tag_name | type) != "string")
     then error("malformed release pages")
     else
-      [.[][] | select(.tag_name == $tag) | .id] as $ids |
-      if (($ids | unique | length) != ($ids | length))
+      [.[][] | {id, tag_name}] | sort_by(.id, .tag_name) |
+      if ([.[].id] | unique | length) != length
       then error("duplicate paginated release identity")
-      else ($ids | sort)
+      else .
       end
     end
   ' <<<"$pages"); then
     fail "GitHub returned malformed paginated release data for $tag"
   fi
+  rest_release_ids=$(jq -c --arg tag "$tag" \
+    '[.[] | select(.tag_name == $tag) | .id]' <<<"$rest_release_snapshot")
   rest_release_count=$(jq 'length' <<<"$rest_release_ids")
 }
 
-observed_release_state=
-observed_release_id=
-observe_release_identity() {
-  local rest_id=
-  observed_release_state=
-  observed_release_id=
-  read_graphql_release_id
-  read_rest_release_ids
-  if [[ "$rest_release_count" -gt 1 ]]; then
-    fail "multiple GitHub releases use tag $tag"
-  fi
-  if [[ "$rest_release_count" -eq 1 ]]; then
-    rest_id=$(jq -r '.[0]' <<<"$rest_release_ids")
-  fi
-  if [[ -n "$graphql_release_id" && -n "$rest_id" &&
-        "$graphql_release_id" != "$rest_id" ]]; then
-    fail "GitHub release lookups disagree on the identity for $tag"
-  fi
-  if [[ -n "$graphql_release_id" && -n "$rest_id" ]]; then
-    observed_release_state=found
-    observed_release_id=$graphql_release_id
-  elif [[ -z "$graphql_release_id" && -z "$rest_id" ]]; then
-    observed_release_state=absent
-  else
-    observed_release_state=transient
-    observed_release_id=${graphql_release_id:-$rest_id}
-  fi
-}
-
 locate_release() {
-  local attempt absent_seen=false found_seen=false candidate_id='' seen_id=''
+  local attempt candidate_id='' candidate_snapshot='' candidate_state=''
+  local observed_id='' observed_state='' seen_id=''
   located_release_id=
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    observe_release_identity
-    if [[ -n "$observed_release_id" ]]; then
-      if [[ -n "$seen_id" && "$seen_id" != "$observed_release_id" ]]; then
+    read_rest_release_ids
+    if [[ "$rest_release_count" -gt 1 ]]; then
+      fail "multiple GitHub releases use tag $tag"
+    fi
+    observed_id=
+    if [[ "$rest_release_count" -eq 1 ]]; then
+      observed_id=$(jq -r '.[0]' <<<"$rest_release_ids")
+      if [[ -n "$seen_id" && "$seen_id" != "$observed_id" ]]; then
         fail "GitHub release identity for $tag changed during lookup"
       fi
-      seen_id=$observed_release_id
+      seen_id=$observed_id
+      observed_state=found
+    else
+      observed_state=absent
     fi
-    case "$observed_release_state" in
-      found)
-        if [[ "$found_seen" == true ]]; then
-          if [[ "$candidate_id" != "$observed_release_id" ]]; then
-            fail "GitHub release identity for $tag changed between stable observations"
-          fi
-          located_release_id=$observed_release_id
-          return 0
+    if [[ "$candidate_state" == "$observed_state" &&
+          "$candidate_snapshot" == "$rest_release_snapshot" ]]; then
+      if [[ "$observed_state" == found ]]; then
+        if [[ "$candidate_id" != "$observed_id" ]]; then
+          fail "GitHub release identity for $tag changed between stable observations"
         fi
-        candidate_id=$observed_release_id
-        found_seen=true
-        absent_seen=false
-        ;;
-      absent)
-        if [[ -n "$seen_id" ]]; then
-          # Once either authenticated API exposes an identity, temporary
-          # absence can never authorize creation of a replacement release.
-          absent_seen=false
-          found_seen=false
-          candidate_id=
-        elif [[ "$absent_seen" == true ]]; then
-          return 1
-        else
-          absent_seen=true
-          found_seen=false
-          candidate_id=
-        fi
-        ;;
-      transient)
-        absent_seen=false
-        found_seen=false
-        candidate_id=
-        ;;
-      *) fail "internal release lookup state is invalid" ;;
-    esac
+        located_release_id=$observed_id
+        return 0
+      fi
+      if [[ -z "$seen_id" ]]; then
+        return 1
+      fi
+    fi
+    candidate_state=$observed_state
+    candidate_snapshot=$rest_release_snapshot
+    candidate_id=$observed_id
     [[ "$attempt" -eq 10 ]] || sleep 1
   done
   fail "GitHub release identity for $tag did not converge"
 }
 
 wait_for_release_presence() {
-  local attempt candidate_id='' found_seen=false seen_id=''
+  local attempt candidate_id='' candidate_snapshot='' observed_id='' seen_id=''
   located_release_id=
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    observe_release_identity
-    if [[ -n "$observed_release_id" ]]; then
-      if [[ -n "$seen_id" && "$seen_id" != "$observed_release_id" ]]; then
+    read_rest_release_ids
+    if [[ "$rest_release_count" -gt 1 ]]; then
+      fail "multiple GitHub releases use tag $tag"
+    fi
+    observed_id=
+    if [[ "$rest_release_count" -eq 1 ]]; then
+      observed_id=$(jq -r '.[0]' <<<"$rest_release_ids")
+      if [[ -n "$seen_id" && "$seen_id" != "$observed_id" ]]; then
         fail "GitHub release identity for $tag changed while it became visible"
       fi
-      seen_id=$observed_release_id
-    fi
-    if [[ "$observed_release_state" == found ]]; then
-      if [[ "$found_seen" == true ]]; then
-        if [[ "$candidate_id" != "$observed_release_id" ]]; then
+      seen_id=$observed_id
+      if [[ -n "$candidate_id" &&
+            "$candidate_snapshot" == "$rest_release_snapshot" ]]; then
+        if [[ "$candidate_id" != "$observed_id" ]]; then
           fail "GitHub release identity for $tag changed between stable observations"
         fi
-        located_release_id=$observed_release_id
+        located_release_id=$observed_id
         return 0
       fi
-      candidate_id=$observed_release_id
-      found_seen=true
+      candidate_id=$observed_id
+      candidate_snapshot=$rest_release_snapshot
     else
       candidate_id=
-      found_seen=false
+      candidate_snapshot=
     fi
     [[ "$attempt" -eq 10 ]] || sleep 1
   done
@@ -811,6 +744,13 @@ stage_exact_draft() {
     fi
   done
   if [[ "$missing_count" -gt 0 ]]; then
+    # Rebind the exact tag identity across two full release-list snapshots at
+    # the mutation boundary. A duplicate or replacement appearing after the
+    # initial lookup must fail before this invocation uploads any bytes.
+    require_unique_release_id "$release_id"
+    "$verify_release" "$tag" draft "$release_id" > /dev/null ||
+      fail "GitHub release $tag changed immediately before asset upload"
+    verify_live_release_tag
     for name in "${missing_assets[@]}"; do
       upload_missing_asset "$release_id" "$name"
     done

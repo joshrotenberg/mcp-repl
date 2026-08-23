@@ -123,6 +123,12 @@ case "$*" in
 esac
 STUB
 
+cat > "$work/bin/sleep" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" -eq 1 && "$1" == 1 ]]
+STUB
+
 cat > "$work/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -202,18 +208,8 @@ emit_job() {
 case "$*" in
   "api graphql "*)
     printf 'graph\n' >> "${TEST_LOG:?}"
-    [[ "$mode" != release_view_failure ]] || exit 1
-    view_id=$release_id
-    view_tag=$tag
-    [[ "$mode" != wrong_release_id ]] || view_id=999
-    [[ "$mode" != wrong_release_tag ]] || view_tag=v9.9.9
-    if [[ "$mode" == partial_graphql_errors ]]; then
-      jq -cn --arg tag "$view_tag" --argjson id "$view_id" \
-        '{data:{repository:{release:{databaseId:$id,tagName:$tag}}},errors:[{message:"partial failure"}]}'
-    else
-      jq -cn --arg tag "$view_tag" --argjson id "$view_id" \
-        '{data:{repository:{release:{databaseId:$id,tagName:$tag}}}}'
-    fi
+    echo "GraphQL release discovery is forbidden" >&2
+    exit 1
     ;;
   "api repos/$repository/actions/runs/$run_id/attempts/$run_attempt")
     printf 'run\n' >> "${TEST_LOG:?}"
@@ -314,18 +310,35 @@ case "$*" in
   "api --paginate --slurp repos/$repository/releases?per_page=100")
     printf 'release-list\n' >> "${TEST_LOG:?}"
     [[ "$mode" != release_list_failure ]] || exit 1
-    first=$(jq -cn --arg tag "$tag" --argjson id "$release_id" \
+    list_tag=$tag
+    [[ "$mode" != wrong_release_tag ]] || list_tag=v9.9.9
+    first=$(jq -cn --arg tag "$list_tag" --argjson id "$release_id" \
       '{id:$id,tag_name:$tag}')
+    unrelated_id=111
+    if [[ "$mode" == unstable_release_inventory &&
+          $(grep -c '^release-list$' "${TEST_LOG:?}") -ge 2 ]]; then
+      unrelated_id=112
+    fi
+    unrelated=$(jq -cn --argjson id "$unrelated_id" \
+      '{id:$id,tag_name:"v0.1.0"}')
     if [[ "$mode" == duplicate_release ]]; then
       second=$(jq -cn --arg tag "$tag" '{id:999,tag_name:$tag}')
-      jq -cn --argjson first "$first" --argjson second "$second" \
-        '[[$first,$second]]'
+      jq -cn --argjson unrelated "$unrelated" --argjson first "$first" \
+        --argjson second "$second" '[[$unrelated],[$first,$second]]'
+    elif [[ "$mode" == duplicate_global_release_id ]]; then
+      duplicate=$(jq -cn --argjson id "$release_id" \
+        '{id:$id,tag_name:"v0.2.0"}')
+      jq -cn --argjson unrelated "$unrelated" --argjson duplicate "$duplicate" \
+        --argjson first "$first" '[[$unrelated,$duplicate],[$first]]'
     elif [[ "$mode" == malformed_release_page_entry ]]; then
-      jq -cn --argjson first "$first" '[[$first,"malformed"]]'
+      jq -cn --argjson unrelated "$unrelated" --argjson first "$first" \
+        '[[$unrelated],[$first,"malformed"]]'
     elif [[ "$mode" == malformed_release_object ]]; then
-      jq -cn --argjson first "$first" '[[$first,{id:999}]]'
+      jq -cn --argjson unrelated "$unrelated" --argjson first "$first" \
+        '[[$unrelated,{id:999}],[$first]]'
     else
-      jq -cn --argjson first "$first" '[[$first]]'
+      jq -cn --argjson unrelated "$unrelated" --argjson first "$first" \
+        '[[$unrelated],[$first]]'
     fi
     ;;
   "api repos/$repository/releases/$release_id")
@@ -390,11 +403,13 @@ chmod +x \
   "$fixture_root/scripts/release-targets.sh" \
   "$fixture_root/scripts/verify-release-tag.sh" \
   "$work/bin/git" \
-  "$work/bin/gh"
+  "$work/bin/gh" \
+  "$work/bin/sleep"
 
 write_event() {
   local mode=$1 action=release_draft_recovery event_repository=$repository
-  local default_branch=main sender=joshrotenberg schema=1 extra=
+  local default_branch=main sender=joshrotenberg schema=2 extra=
+  local payload_release_id=$release_id release_id_field
   local payload_release=$release_merge_sha payload_run_id=$run_id
   local payload_attempt=$run_attempt
   case "$mode" in
@@ -402,15 +417,26 @@ write_event() {
     wrong_event_repository) event_repository=other/project ;;
     wrong_default_branch) default_branch=develop ;;
     wrong_sender) sender=octocat ;;
-    wrong_schema) schema=2 ;;
+    wrong_schema) schema=1 ;;
+    wrong_release_id) payload_release_id=999 ;;
+    string_release_id) payload_release_id="\"$release_id\"" ;;
+    zero_release_id) payload_release_id=0 ;;
+    fractional_release_id) payload_release_id=1.5 ;;
+    oversized_release_id) payload_release_id=9007199254740992 ;;
+    missing_release_id) payload_release_id= ;;
     malformed_release_sha) payload_release=short ;;
     string_run_id) payload_run_id="\"$run_id\"" ;;
     string_run_attempt) payload_attempt="\"$run_attempt\"" ;;
     extra_payload) extra=',"source_sha":"dddddddddddddddddddddddddddddddddddddddd"' ;;
   esac
-  printf '{"action":"%s","repository":{"full_name":"%s","default_branch":"%s"},"sender":{"login":"%s","type":"User"},"client_payload":{"schema_version":%s,"release_merge_sha":"%s","run_id":%s,"run_attempt":%s%s}}\n' \
+  release_id_field=
+  if [[ -n "$payload_release_id" ]]; then
+    release_id_field="\"release_id\":${payload_release_id},"
+  fi
+  printf '{"action":"%s","repository":{"full_name":"%s","default_branch":"%s"},"sender":{"login":"%s","type":"User"},"client_payload":{"schema_version":%s,%s"release_merge_sha":"%s","run_id":%s,"run_attempt":%s%s}}\n' \
     "$action" "$event_repository" "$default_branch" "$sender" "$schema" \
-    "$payload_release" "$payload_run_id" "$payload_attempt" "$extra" > "$event_file"
+    "$release_id_field" "$payload_release" "$payload_run_id" \
+    "$payload_attempt" "$extra" > "$event_file"
 }
 
 failures=0
@@ -453,9 +479,27 @@ check() {
     return
   fi
   if [[ "$want_status" == 0 ]]; then
-    expected=$'release_merge_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrun_id=32617933653\nrun_attempt=1\nartifact_id=9487682171\nartifact_digest=sha256:1da9c92608be1cf39557b6f10bdccebd0ce8bd901b8343950f6a19219cd1cb46\nrelease_id=375116865\nrelease_tag=v0.3.5'
+    expected=$'release_merge_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nrun_id=32617933653\nrun_attempt=1\nartifact_id=9487682171\nartifact_digest=sha256:1da9c92608be1cf39557b6f10bdccebd0ce8bd901b8343950f6a19219cd1cb46'
+    if [[ "$phase" == resume ]]; then
+      expected+=$'\nrelease_id=375116865'
+    fi
+    expected+=$'\nrelease_tag=v0.3.5'
     if [[ $(<"$output_file") != "$expected" ]]; then
       printf 'FAIL %s: trusted outputs differ\n%s\n' "$name" "$(<"$output_file")" >&2
+      failures=$((failures + 1))
+    fi
+    if [[ "$phase" == preflight ]] &&
+       grep -Eq '^(graph|release-list|release|assets)$' "$log"; then
+      printf 'FAIL %s: read-only preflight attempted private release discovery\n%s\n' \
+        "$name" "$(<"$log")" >&2
+      failures=$((failures + 1))
+    elif [[ "$phase" == resume ]] &&
+      { [[ $(grep -c '^release-list$' "$log") -ne 2 ]] ||
+        [[ $(grep -c '^release$' "$log") -ne 1 ]] ||
+        [[ $(grep -c '^assets$' "$log") -ne 1 ]] ||
+        grep -q '^graph$' "$log"; }; then
+      printf 'FAIL %s: resume did not perform exact REST-only release authentication\n%s\n' \
+        "$name" "$(<"$log")" >&2
       failures=$((failures + 1))
     fi
   elif [[ -s "$output_file" ]]; then
@@ -465,8 +509,9 @@ check() {
   printf 'ok   %s\n' "$name"
 }
 
-check "exact failed evidence authorizes draft recovery" valid preflight 0 "Authenticated exact draft recovery"
-check "write-scoped reauthentication repeats live evidence without PR reads" valid resume 0 "Authenticated exact draft recovery"
+check "read-only preflight authenticates only immutable failed evidence" valid preflight 0 "Authenticated immutable failed-release evidence"
+check "private release APIs are neither needed nor called by preflight" release_list_failure preflight 0 "Authenticated immutable failed-release evidence"
+check "write-scoped reauthentication binds the exact private draft" valid resume 0 "Authenticated exact draft recovery"
 check "an already-published exact release is idempotently recoverable" valid_published resume 0 "Authenticated exact draft recovery"
 check "only repository dispatch can recover a draft" valid preflight 2 "Invalid release-draft recovery environment" push
 check "draft recovery stays on main" valid preflight 2 "Invalid release-draft recovery environment" repository_dispatch refs/heads/release
@@ -476,6 +521,11 @@ check "the event repository is exact" wrong_event_repository preflight 1 "malfor
 check "the default branch is exact" wrong_default_branch preflight 1 "malformed"
 check "the event sender is exact" wrong_sender preflight 1 "malformed"
 check "the payload schema is versioned" wrong_schema preflight 1 "malformed"
+check "the numeric release selector is required" missing_release_id preflight 1 "malformed"
+check "the release selector cannot be a string" string_release_id preflight 1 "malformed"
+check "the release selector must be positive" zero_release_id preflight 1 "malformed"
+check "the release selector must be integral" fractional_release_id preflight 1 "malformed"
+check "the release selector must remain exactly representable" oversized_release_id preflight 1 "malformed"
 check "the release merge is a full SHA" malformed_release_sha preflight 1 "malformed"
 check "the run ID remains numeric" string_run_id preflight 1 "malformed"
 check "the run attempt remains numeric" string_run_attempt preflight 1 "malformed"
@@ -503,21 +553,23 @@ check "the canonical artifact is required" missing_artifact preflight 1 "one exa
 check "an expired canonical artifact is refused" expired_artifact preflight 1 "one exact unexpired"
 check "the artifact source is exact" wrong_artifact_source preflight 1 "one exact unexpired"
 check "multiple canonical artifacts are refused" duplicate_release_artifact preflight 1 "one exact unexpired"
-check "draft discovery failures are preserved" release_view_failure preflight 1 "Could not discover"
-check "the discovered tag is exact" wrong_release_tag preflight 1 "invalid GraphQL recovery release identity"
-check "partial GraphQL errors are refused" partial_graphql_errors preflight 1 "invalid GraphQL recovery release identity"
-check "release-list failures are preserved" release_list_failure preflight 1 "Could not enumerate"
-check "malformed entries anywhere in release pages are refused" malformed_release_page_entry preflight 1 "do not bind one exact"
-check "malformed release objects are refused before tag filtering" malformed_release_object preflight 1 "do not bind one exact"
-check "GraphQL and REST release identities must agree" wrong_release_id preflight 1 "do not bind one exact"
-check "duplicate same-tag releases are refused" duplicate_release preflight 1 "do not bind one exact"
-check "release API failures are preserved" release_api_failure preflight 1 "Could not read exact"
-check "canonical notes are required byte for byte" wrong_notes preflight 1 "exact canonical notes"
-check "a foreign draft is refused" foreign_draft preflight 1 "not the trusted resumable draft"
-check "unexpected draft assets are refused" unexpected_asset preflight 1 "unsafe or noncanonical"
-check "duplicate draft asset IDs are refused" duplicate_asset_id preflight 1 "unsafe or noncanonical"
-check "a published release must already have every asset" published_incomplete preflight 1 "unsafe or noncanonical"
 check "tag verification is required" bad_tag preflight 1 "does not bind the recovered source"
+check "resume repeats failed-run authentication" wrong_run_source resume 1 "exact failed Release publish"
+check "resume repeats retained-artifact authentication" wrong_artifact_source resume 1 "one exact unexpired"
+check "release-list failures are preserved at the write boundary" release_list_failure resume 1 "Could not enumerate"
+check "the complete release inventory must remain stable" unstable_release_inventory resume 1 "inventory changed"
+check "malformed entries anywhere in release pages are refused" malformed_release_page_entry resume 1 "malformed push-visible"
+check "malformed release objects are refused before tag filtering" malformed_release_object resume 1 "malformed push-visible"
+check "globally duplicate release IDs are refused" duplicate_global_release_id resume 1 "malformed push-visible"
+check "the sole same-tag release must have the selected ID" wrong_release_id resume 1 "does not bind exact"
+check "the selected release tag is exact" wrong_release_tag resume 1 "does not bind exact"
+check "duplicate same-tag releases are refused" duplicate_release resume 1 "does not bind exact"
+check "release API failures are preserved" release_api_failure resume 1 "Could not read exact"
+check "canonical notes are required byte for byte" wrong_notes resume 1 "exact canonical notes"
+check "a foreign draft is refused" foreign_draft resume 1 "not the trusted resumable draft"
+check "unexpected draft assets are refused" unexpected_asset resume 1 "unsafe or noncanonical"
+check "duplicate draft asset IDs are refused" duplicate_asset_id resume 1 "unsafe or noncanonical"
+check "a published release must already have every asset" published_incomplete resume 1 "unsafe or noncanonical"
 
 if [[ "$failures" -ne 0 ]]; then
   printf '%s release draft recovery tests failed\n' "$failures" >&2
