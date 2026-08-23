@@ -193,36 +193,19 @@ binaries.
     bytes, mutate GHCR, or rerun the failed workflow automatically. Repository
     workflow permissions remain read-only by default; write authority exists
     only on this resume job.
-16. The one-shot `Release latest recovery` workflow covers only the v0.3.5
-    incident where immutable GitHub release ID `375116865` and its versioned
-    GHCR index were already complete, but attempt 2 of run `32617933653` failed
-    solely while reconciling the mutable `latest` alias. Its owner-sent typed
-    dispatch is hard-coded to that release ID, run and attempt, release merge
-    `7b51781718975772d96006f167887adb877618e7`, tag, canonical release record,
-    and container identity. An exhaustive read-only preflight authenticates
-    the current reviewed default-branch controller, exact historical job and
-    release topology, all 39 remote assets (including exact IDs, digests, MIME
-    types, and empty labels), tag object, canonical record, and native/container
-    evidence. It fetches the immutable container index by
-    digest into a credential-free local file and verifies both attestations
-    against that file, the exact release workflow, source digest and ref, and
-    trusted root. A second job with the same read-only permissions repeats the
-    complete verifier at the write boundary and requires byte-exact agreement
-    with every preflight output. Only after both checks does a fresh job receive
-    `packages: write`; it compares every reauthenticated output with the
-    incident's fixed identity, logs in only for the bounded write, and permits
-    `publish-container-manifest.sh latest` to converge only while GitHub's
-    immutable latest release still has exact ID `375116865`. A final
-    credential-free job downloads and hashes the public release record by
-    numeric asset ID, compares the raw version, digest, and `latest` indexes,
-    requires each anonymous pull to report the immutable index digest, and
-    executes only the three resolved local image IDs. Controller reruns are
-    refused; any retry must be a fresh repository dispatch that repeats both
-    authentication jobs. The ordinary binary
-    workflow and both narrow recovery workflows share the literal
-    `release-binaries-latest` concurrency group, with its maximum FIFO queue
-    enabled and cancellation disabled, so no repository release controller can
-    overlap this mutable boundary or displace an already-pending release.
+16. The v0.3.5 mutable-`latest` incident was recovered by current-main run
+    [32630112297](https://github.com/joshrotenberg/mcp-repl/actions/runs/32630112297)
+    after exact evidence review in [#244](https://github.com/joshrotenberg/mcp-repl/issues/244).
+    The one-shot controller authenticated immutable release ID `375116865`,
+    all 39 public assets, the annotated tag, native and container attestations,
+    and the versioned GHCR index before its bounded registry write. It reconciled
+    `latest` to index digest
+    `sha256:3a84dbf2da546714bcd8bde7f975e1c73a2463851c6eb584c4917f293986d46c`,
+    then anonymously matched the public release record digest
+    `sha256:746b2df14a1a6d3cc8779210c3f5dd5e27691853ce231cb7842fd8b704427325`.
+    The disposable controller was removed after success. Normal publication and
+    draft recovery retain the repository-wide queued `release-binaries-latest`
+    lock, with cancellation disabled, around the mutable alias boundary.
 
 The status reporter is intentionally narrow and the whole update/validation
 graph is serialized. It runs from the trusted default branch, grants only its
@@ -461,26 +444,6 @@ compact release record.
   evidence before rerunning. If any authenticated input or retained byte set is
   unavailable or conflicts, abandon this path and cut a fresh recovery-epoch
   patch instead.
-- For the already-authenticated v0.3.5 incident only, dispatch the separately
-  reviewed latest-alias recovery from current `main` with the exact payload:
-
-  ```bash
-  gh api --method POST repos/joshrotenberg/mcp-repl/dispatches \
-    -f event_type=release_latest_recovery \
-    -F 'client_payload[schema_version]=1' \
-    -F 'client_payload[release_id]=375116865' \
-    -f 'client_payload[release_merge_sha]=7b51781718975772d96006f167887adb877618e7' \
-    -F 'client_payload[run_id]=32617933653' \
-    -F 'client_payload[run_attempt]=2'
-  ```
-
-  This is not a general retry mechanism: any other payload, historical state,
-  tag object, release/asset identity, attestation, container index, or current
-  GitHub latest release fails before registry login or mutation. A successful
-  run changes only GHCR's mutable `latest` alias, then proves the fixed public
-  release record and version/digest/latest images anonymously. Remove the
-  one-shot controller after the recovery has succeeded and its evidence has
-  been retained.
 - Never manually publish the draft to work around a failed target. That would
   bypass the complete-set guarantee.
 
@@ -499,7 +462,6 @@ for script in scripts/*.sh; do bash -n "$script"; done
 ./scripts/test-release-workflow.sh
 ./scripts/test-release-recovery.sh
 ./scripts/test-release-draft-recovery.sh
-./scripts/test-release-latest-recovery.sh
 ./scripts/test-source-release.sh
 ./scripts/test-container-manifest.sh
 ./scripts/test-container-sbom.sh
@@ -516,4 +478,4 @@ CI pins actionlint 1.7.12, verifies its reviewed hardcoded checksum, and uses th
 ShellCheck version installed on GitHub's Ubuntu runner. Because actionlint
 1.7.12 predates GitHub's `concurrency.queue` schema, `.github/actionlint.yaml`
 contains only a byte-exact, path-specific exception for that diagnostic; the
-release guard suite locks both that file and the three queued workflow values.
+release guard suite locks both that file and the two queued workflow values.
