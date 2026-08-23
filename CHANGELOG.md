@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-08-23
+
+### Bug Fixes
+
+- Keep schema-declared tool strings as strings (#223)
+- Bound the initial MCP handshake (#224)
+- Honor binds in bench calls (#226)
+
+
+
 ## [0.3.1] - 2026-08-22
 
 ### Bug Fixes
