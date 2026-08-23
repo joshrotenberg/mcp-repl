@@ -472,6 +472,7 @@ jobs:
           ./scripts/test-release-workflow.sh
           ./scripts/test-release-recovery.sh
           ./scripts/test-release-draft-recovery.sh
+          ./scripts/test-release-latest-recovery.sh
           ./scripts/test-source-release.sh
           ./scripts/test-container-manifest.sh
           ./scripts/test-container-sbom.sh

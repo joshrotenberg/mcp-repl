@@ -794,6 +794,10 @@ trusted_public_snapshot() {
     ' <<<"$release"); then
     die "$label is not an immutable bot-owned canonical release"
   fi
+  if [[ -n "${EXPECTED_LATEST_RELEASE_ID:-}" ]] &&
+     [[ $(jq -r '.id' <<<"$snapshot") != "$EXPECTED_LATEST_RELEASE_ID" ]]; then
+    die "$label is not recovery's exact release ID $EXPECTED_LATEST_RELEASE_ID"
+  fi
   printf '%s\n' "$snapshot"
 }
 
@@ -1010,6 +1014,12 @@ latest_manifest() {
   local attempt before confirmed after final tag version_ref latest_ref
   local version_digest latest_digest
 
+  if [[ -n "${EXPECTED_LATEST_RELEASE_ID:-}" ]] &&
+     [[ ! "$EXPECTED_LATEST_RELEASE_ID" =~ ^[1-9][0-9]*$ ||
+        ${#EXPECTED_LATEST_RELEASE_ID} -gt 16 ]]; then
+    echo "container-manifest: expected latest release ID must be a positive integer" >&2
+    exit 2
+  fi
   latest_ref="$image:latest"
   for attempt in 1 2 3 4 5; do
     before=$(trusted_public_snapshot \
