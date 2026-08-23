@@ -23,6 +23,10 @@ remote="$work/remote"
 state="$work/release-state"
 log="$work/gh.log"
 tag_moved="$work/tag-moved"
+asset_raced="$work/asset-raced"
+lookup_count="$work/lookup-count"
+asset_lookup_count="$work/asset-lookup-count"
+upload_count="$work/upload-count"
 expected_notes="$work/expected-notes.md"
 "$root/scripts/extract-release-notes.sh" "$version" > "$expected_notes"
 
@@ -185,7 +189,10 @@ reset_remote() {
   mkdir -p "$remote"
   printf '%s\n' "$release_state" > "$state"
   : > "$log"
-  rm -f "$tag_moved"
+  printf '0\n' > "$lookup_count"
+  printf '0\n' > "$asset_lookup_count"
+  printf '0\n' > "$upload_count"
+  rm -f "$tag_moved" "$asset_raced"
 }
 
 copy_exact_remote() {
@@ -203,6 +210,7 @@ repository=test/project
 tag=${TEST_TAG:?}
 source_sha=${TEST_SOURCE_SHA:?}
 release_id=4242
+duplicate_release_id=4343
 tag_object_sha=dddddddddddddddddddddddddddddddddddddddd
 tag_source_sha=$source_sha
 if [ -e "${TEST_TAG_MOVED:?}" ]; then
@@ -211,35 +219,114 @@ if [ -e "${TEST_TAG_MOVED:?}" ]; then
 fi
 release_state=$(cat "${TEST_STATE:?}")
 
+emit_release() {
+  current_id=${1:-$release_id}
+  body=$(jq -Rs . < "${TEST_EXPECTED_NOTES:?}")
+  if [ "${GH_MODE:-normal}" = metadata_change_before_patch ]; then
+    count=$(cat "${TEST_LOOKUP_COUNT:?}")
+    if [ "$count" -ge 6 ]; then
+      body='"tampered release notes"'
+    fi
+  fi
+  if [ "$release_state" = draft ]; then
+    draft=true
+    immutable=false
+  else
+    draft=false
+    immutable=true
+    [ "${GH_MODE:-normal}" != published_mutable ] || immutable=false
+  fi
+  printf '{"id":%s,"tag_name":"%s","name":"%s","body":%s,"draft":%s,"prerelease":false,"immutable":%s,"author":{"login":"github-actions[bot]","type":"Bot"}}\n' \
+    "$current_id" "$tag" "$tag" "$body" "$draft" "$immutable"
+}
+
 case "${1:-} ${2:-}" in
   "api graphql")
     if [ "${GH_MODE:-normal}" = lookup_failure ]; then
       echo "lookup failed" >&2
       exit 1
     fi
-    if [ "$release_state" = absent ]; then
+    if [ "${GH_MODE:-normal}" = graphql_malformed ]; then
+      printf '{"data":{"repository":{"release":{"databaseId":0}}}}\n'
+      exit 0
+    fi
+    if [ "${GH_MODE:-normal}" = graphql_partial_errors ]; then
+      printf '{"errors":[{"message":"partial failure"}],"data":{"repository":{"release":{"databaseId":%s,"tagName":"%s"}}}}\n' \
+        "$release_id" "$tag"
+      exit 0
+    fi
+    count=$(cat "${TEST_LOOKUP_COUNT:?}")
+    if [ "${GH_MODE:-normal}" = ghost_identity_then_absent ] &&
+       [ "$count" -eq 0 ]; then
+      printf '{"data":{"repository":{"release":{"databaseId":%s,"tagName":"%s"}}}}\n' \
+        "$release_id" "$tag"
+    elif [ "$release_state" = absent ]; then
       printf '{"data":{"repository":{"release":null}}}\n'
     else
-      printf '{"data":{"repository":{"release":{"id":"R_test"}}}}\n'
+      graphql_id=$release_id
+      if [ "${GH_MODE:-normal}" = identity_change ]; then
+        [ "$count" -lt 1 ] || graphql_id=$duplicate_release_id
+      elif [ "${GH_MODE:-normal}" = transient_identity_change ]; then
+        [ "$count" -lt 1 ] || graphql_id=$duplicate_release_id
+      fi
+      printf '{"data":{"repository":{"release":{"databaseId":%s,"tagName":"%s"}}}}\n' \
+        "$graphql_id" "$tag"
     fi
     ;;
 
   "api repos/$repository/releases/tags/$tag")
+    # GitHub's by-tag REST endpoint exposes published releases, but returns
+    # 404 for private drafts even to an authorized repository caller.
+    [ "$release_state" = published ] || {
+      echo "release not found" >&2
+      exit 1
+    }
+    emit_release
+    ;;
+
+  "api repos/$repository/releases/$release_id")
     [ "$release_state" != absent ] || {
       echo "release not found" >&2
       exit 1
     }
-    body=$(jq -Rs . < "${TEST_EXPECTED_NOTES:?}")
-    if [ "$release_state" = draft ]; then
-      draft=true
-      immutable=false
-    else
-      draft=false
-      immutable=true
-      [ "${GH_MODE:-normal}" != published_mutable ] || immutable=false
+    if [ "${GH_MODE:-normal}" = tag_move_before_patch ]; then
+      count=$(cat "${TEST_LOOKUP_COUNT:?}")
+      if [ "$count" -ge 6 ]; then
+        : > "${TEST_TAG_MOVED:?}"
+      fi
     fi
-    printf '{"id":%s,"tag_name":"%s","name":"%s","body":%s,"draft":%s,"prerelease":false,"immutable":%s,"author":{"login":"github-actions[bot]","type":"Bot"}}\n' \
-      "$release_id" "$tag" "$tag" "$body" "$draft" "$immutable"
+    emit_release
+    ;;
+
+  "api repos/$repository/releases/$duplicate_release_id")
+    [ "$release_state" != absent ] || exit 1
+    emit_release "$duplicate_release_id"
+    ;;
+
+  "api repos/$repository/releases/assets/"*)
+    [ "${GH_MODE:-normal}" != download_failure ] || {
+      echo "download failed" >&2
+      exit 1
+    }
+    requested_id=${2##*/}
+    asset_call=$(cat "${TEST_ASSET_LOOKUP_COUNT:?}")
+    offset=0
+    if [ "${GH_MODE:-normal}" = asset_snapshot_change ] &&
+       [ "$asset_call" -ge 2 ]; then
+      offset=10000
+    fi
+    index=0
+    for asset in "${TEST_REMOTE:?}"/*; do
+      [ -e "$asset" ] || continue
+      index=$((index + 1))
+      asset_id=$((5000 + index + offset))
+      if [ "$asset_id" -eq "$requested_id" ]; then
+        cat "$asset"
+        exit 0
+      fi
+    done
+    echo "asset not found" >&2
+    exit 1
     ;;
 
   "api repos/$repository/git/ref/tags/$tag")
@@ -258,6 +345,10 @@ case "${1:-} ${2:-}" in
       exit 1
     }
     printf '%s\n' "$tag_source_sha"
+    if [ "${GH_MODE:-normal}" = asset_change_before_patch ]; then
+      count=$(cat "${TEST_LOOKUP_COUNT:?}")
+      [ "$count" -lt 6 ] || : > "${TEST_ASSET_RACED:?}"
+    fi
     ;;
 
   "api --paginate")
@@ -265,54 +356,192 @@ case "${1:-} ${2:-}" in
       echo "missing --slurp" >&2
       exit 1
     }
-    [ "${4:-}" = "repos/$repository/releases/$release_id/assets?per_page=100" ] || {
-      echo "unexpected asset URL: ${4:-}" >&2
-      exit 1
-    }
-    printf '[[ '
-    first=true
-    duplicate_done=false
-    for asset in "${TEST_REMOTE:?}"/*; do
-      [ -e "$asset" ] || continue
-      name=${asset##*/}
-      size=$(wc -c < "$asset" | tr -d '[:space:]')
-      [ "$first" = true ] || printf ','
-      first=false
-      asset_json=$(jq -cn --arg name "$name" --argjson size "$size" \
-        '{name: $name, size: $size, state: "uploaded"}')
-      printf '%s' "$asset_json"
-      if [ "${GH_MODE:-normal}" = remote_duplicate ] &&
-         [ "$duplicate_done" = false ]; then
-        printf ',%s' "$asset_json"
-        duplicate_done=true
-      fi
-    done
-    printf ']]\n'
+    endpoint=${4:-}
+    case "$endpoint" in
+      "repos/$repository/releases/$release_id/assets?per_page=100")
+        count=$(cat "${TEST_ASSET_LOOKUP_COUNT:?}")
+        count=$((count + 1))
+        printf '%s\n' "$count" > "${TEST_ASSET_LOOKUP_COUNT:?}"
+        offset=0
+        if [ "${GH_MODE:-normal}" = asset_snapshot_change ] &&
+           [ "$count" -ge 2 ]; then
+          offset=10000
+        elif [ "${GH_MODE:-normal}" = asset_change_before_patch ] &&
+             [ -e "${TEST_ASSET_RACED:?}" ]; then
+          offset=10000
+        fi
+        printf '[['
+        first=true
+        duplicate_done=false
+        index=0
+        for asset in "${TEST_REMOTE:?}"/*; do
+          [ -e "$asset" ] || continue
+          index=$((index + 1))
+          asset_id=$((5000 + index + offset))
+          name=${asset##*/}
+          size=$(wc -c < "$asset" | tr -d '[:space:]')
+          [ "$first" = true ] || printf ','
+          first=false
+          asset_json=$(jq -cn \
+            --argjson id "$asset_id" \
+            --arg name "$name" \
+            --argjson size "$size" \
+            '{id: $id, name: $name, size: $size, state: "uploaded"}')
+          printf '%s' "$asset_json"
+          if [ "${GH_MODE:-normal}" = remote_duplicate ] &&
+             [ "$duplicate_done" = false ]; then
+            duplicate_json=$(jq -cn \
+              --argjson id "$((asset_id + 20000))" \
+              --arg name "$name" \
+              --argjson size "$size" \
+              '{id: $id, name: $name, size: $size, state: "uploaded"}')
+            printf ',%s' "$duplicate_json"
+            duplicate_done=true
+          fi
+        done
+        printf ']]\n'
+        ;;
+      "repos/$repository/releases?per_page=100")
+        [ "${GH_MODE:-normal}" != release_list_failure ] || {
+          echo "release list failed" >&2
+          exit 1
+        }
+        if [ "${GH_MODE:-normal}" = release_list_malformed ]; then
+          printf '{"not":"pages"}\n'
+          exit 0
+        fi
+        if [ "${GH_MODE:-normal}" = release_list_malformed_entry ]; then
+          printf '[[{"id":111,"tag_name":"v0.0.1"},{"id":999}],[{"id":%s,"tag_name":"%s"}]]\n' \
+            "$release_id" "$tag"
+          exit 0
+        fi
+        count=$(cat "${TEST_LOOKUP_COUNT:?}")
+        count=$((count + 1))
+        printf '%s\n' "$count" > "${TEST_LOOKUP_COUNT:?}"
+        printf '[[{"id":111,"tag_name":"v0.0.1"}],['
+        visible=true
+        if [ "$release_state" = absent ]; then
+          visible=false
+        elif [ "${GH_MODE:-normal}" = rest_lag ] && [ "$count" -le 2 ]; then
+          visible=false
+        elif [ "${GH_MODE:-normal}" = transient_identity_change ] &&
+             [ "$count" -eq 1 ]; then
+          visible=false
+        fi
+        if [ "$visible" = true ]; then
+          listed_id=$release_id
+          [ "${GH_MODE:-normal}" != lookup_mismatch ] ||
+            listed_id=$duplicate_release_id
+          if [ "${GH_MODE:-normal}" = identity_change ] && [ "$count" -ge 2 ]; then
+            listed_id=$duplicate_release_id
+          elif [ "${GH_MODE:-normal}" = transient_identity_change ] &&
+               [ "$count" -ge 2 ]; then
+            listed_id=$duplicate_release_id
+          fi
+          printf '{"id":%s,"tag_name":"%s"}' "$listed_id" "$tag"
+          if [ "${GH_MODE:-normal}" = duplicate_release ] ||
+             { [ "${GH_MODE:-normal}" = duplicate_after_one ] && [ "$count" -ge 2 ]; } ||
+             [ "${GH_MODE:-normal}" = create_duplicate_response_loss ]; then
+            printf ',{"id":%s,"tag_name":"%s"}' "$duplicate_release_id" "$tag"
+          elif [ "${GH_MODE:-normal}" = duplicate_paginated_id ]; then
+            printf ',{"id":%s,"tag_name":"%s"}' "$listed_id" "$tag"
+          fi
+        fi
+        printf ']]\n'
+        ;;
+      *)
+        echo "unexpected paginated URL: $endpoint" >&2
+        exit 1
+        ;;
+    esac
     ;;
 
   "api --method")
-    [ "${3:-}" = PATCH ] || {
+    method=${3:-}
+    endpoint=${4:-}
+    if [ "$method" = PATCH ]; then
+      [ "$endpoint" = "repos/$repository/releases/$release_id" ] || {
+        echo "unexpected mutation URL" >&2
+        exit 1
+      }
+      printf 'patch %s\n' "$*" >> "${TEST_LOG:?}"
+      if [ "${GH_MODE:-normal}" = patch_failure ]; then
+        echo "patch failed before commit" >&2
+        exit 1
+      fi
+      printf '%s\n' published > "${TEST_STATE:?}"
+      if [ "${GH_MODE:-normal}" = tag_move_after_patch ]; then
+        : > "${TEST_TAG_MOVED:?}"
+      fi
+      if [ "${GH_MODE:-normal}" = patch_response_loss ]; then
+        echo "patch response lost" >&2
+        exit 1
+      fi
+      printf '{}\n'
+      exit 0
+    fi
+    [ "$method" = POST ] || {
       echo "unexpected mutation method" >&2
       exit 1
     }
-    [ "${4:-}" = "repos/$repository/releases/$release_id" ] || {
-      echo "unexpected mutation URL" >&2
+    [ "$endpoint" = "https://uploads.github.com/repos/$repository/releases/$release_id/assets" ] || {
+      echo "unexpected upload URL: $endpoint" >&2
       exit 1
     }
-    printf 'patch %s\n' "$*" >> "${TEST_LOG:?}"
-    if [ "${GH_MODE:-normal}" = patch_failure ]; then
-      echo "patch failed before commit" >&2
+    shift 4
+    name=
+    input=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -H)
+          [ "${2:-}" = 'Content-Type: application/octet-stream' ] || exit 1
+          shift 2
+          ;;
+        -f)
+          case "${2:-}" in
+            name=*) name=${2#name=} ;;
+            *) exit 1 ;;
+          esac
+          shift 2
+          ;;
+        --input)
+          input=${2:-}
+          shift 2
+          ;;
+        *)
+          echo "unexpected upload argument: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    [ -n "$name" ] && [ -f "$input" ] && [ "${input##*/}" = "$name" ] || exit 1
+    count=$(cat "${TEST_UPLOAD_COUNT:?}")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "${TEST_UPLOAD_COUNT:?}"
+    printf 'upload %s\n' "$name" >> "${TEST_LOG:?}"
+    if [ "${GH_MODE:-normal}" = upload_failure ] && [ "$count" -eq 2 ]; then
+      echo "simulated upload failure before commit" >&2
       exit 1
     fi
-    printf '%s\n' published > "${TEST_STATE:?}"
-    if [ "${GH_MODE:-normal}" = tag_move_after_patch ]; then
+    [ ! -e "${TEST_REMOTE:?}/$name" ] || {
+      echo "publisher attempted to replace an existing asset" >&2
+      exit 1
+    }
+    cp "$input" "${TEST_REMOTE:?}/$name"
+    if [ "${GH_MODE:-normal}" = tag_move_after_upload ] && [ "$count" -eq 1 ]; then
       : > "${TEST_TAG_MOVED:?}"
     fi
-    if [ "${GH_MODE:-normal}" = patch_response_loss ]; then
-      echo "patch response lost" >&2
+    if [ "${GH_MODE:-normal}" = upload_response_loss ]; then
+      echo "upload response lost" >&2
       exit 1
     fi
-    printf '{}\n'
+    size=$(wc -c < "$input" | tr -d '[:space:]')
+    if [ "${GH_MODE:-normal}" = upload_malformed_response ]; then
+      printf '{}\n'
+    else
+      printf '{"id":%s,"name":"%s","size":%s,"state":"uploaded"}\n' \
+        "$((9000 + count))" "$name" "$size"
+    fi
     ;;
 
   "release create")
@@ -321,79 +550,21 @@ case "${1:-} ${2:-}" in
       exit 1
     }
     printf 'create %s\n' "$*" >> "${TEST_LOG:?}"
+    if [ "${GH_MODE:-normal}" = create_failure ]; then
+      echo "create failed before commit" >&2
+      exit 1
+    fi
     printf '%s\n' draft > "${TEST_STATE:?}"
-    ;;
-
-  "release upload")
-    shift 2
-    [ "${1:-}" = "$tag" ] || {
-      echo "unexpected upload tag" >&2
+    if [ "${GH_MODE:-normal}" = create_response_loss ] ||
+       [ "${GH_MODE:-normal}" = create_duplicate_response_loss ]; then
+      echo "create response lost" >&2
       exit 1
-    }
-    shift
-    [ "${1:-}" = --repo ] && [ "${2:-}" = "$repository" ] || {
-      echo "unexpected upload repository" >&2
-      exit 1
-    }
-    shift 2
-    [ "$#" -gt 0 ] || {
-      echo "upload has no assets" >&2
-      exit 1
-    }
-    printf 'upload' >> "${TEST_LOG:?}"
-    for asset in "$@"; do
-      [ "$asset" != --clobber ] || {
-        echo "publisher attempted --clobber" >&2
-        exit 1
-      }
-      [ ! -e "${TEST_REMOTE:?}/${asset##*/}" ] || {
-        echo "publisher attempted to replace an existing asset" >&2
-        exit 1
-      }
-      printf ' %s' "${asset##*/}" >> "${TEST_LOG:?}"
-      cp "$asset" "${TEST_REMOTE:?}/"
-      if [ "${GH_MODE:-normal}" = upload_failure ]; then
-        printf '\n' >> "${TEST_LOG:?}"
-        echo "simulated partial upload" >&2
-        exit 1
-      fi
-    done
-    printf '\n' >> "${TEST_LOG:?}"
-    if [ "${GH_MODE:-normal}" = tag_move_after_upload ]; then
-      : > "${TEST_TAG_MOVED:?}"
     fi
     ;;
 
-  "release download")
-    shift 2
-    [ "${1:-}" = "$tag" ] || {
-      echo "unexpected download tag" >&2
-      exit 1
-    }
-    shift
-    destination=
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --repo)
-          [ "${2:-}" = "$repository" ] || exit 1
-          shift 2
-          ;;
-        --dir)
-          destination=${2:-}
-          shift 2
-          ;;
-        *)
-          echo "unexpected download argument: $1" >&2
-          exit 1
-          ;;
-      esac
-    done
-    [ -n "$destination" ] || exit 1
-    if [ "${GH_MODE:-normal}" = download_failure ]; then
-      echo "download failed" >&2
-      exit 1
-    fi
-    cp "${TEST_REMOTE:?}"/* "$destination/"
+  "release upload" | "release download" | "release view")
+    echo "tag-addressed release transfer or discovery is forbidden" >&2
+    exit 1
     ;;
 
   *)
@@ -404,11 +575,23 @@ esac
 STUB
 chmod +x "$work/bin/gh"
 
+cat > "$work/bin/sleep" <<'STUB'
+#!/bin/sh
+set -eu
+[ "$#" -eq 1 ] && [ "$1" = 1 ]
+STUB
+chmod +x "$work/bin/sleep"
+
 failures=0
 check() {
   local name=$1 operation=$2 want_status=$3 want_text=$4 mutation=$5
   local gh_mode=${6:-normal}
+  local supplied_release_id=${7:-}
+  local command_args=("$operation" "$tag" "$dist")
   local output status
+  if [[ "$operation" == resume ]]; then
+    command_args+=("${supplied_release_id:-4242}")
+  fi
   : > "$log"
   set +e
   output=$(PATH="$work/bin:$PATH" \
@@ -416,12 +599,16 @@ check() {
     TEST_SOURCE_SHA="$source_sha" \
     TEST_STATE="$state" \
     TEST_TAG_MOVED="$tag_moved" \
+    TEST_ASSET_RACED="$asset_raced" \
     TEST_REMOTE="$remote" \
     TEST_LOG="$log" \
+    TEST_LOOKUP_COUNT="$lookup_count" \
+    TEST_ASSET_LOOKUP_COUNT="$asset_lookup_count" \
+    TEST_UPLOAD_COUNT="$upload_count" \
     TEST_EXPECTED_NOTES="$expected_notes" \
     GH_MODE="$gh_mode" \
     GH_REPO=test/project \
-    "$publisher" "$operation" "$tag" "$dist" 2>&1)
+    "$publisher" "${command_args[@]}" 2>&1)
   status=$?
   set -e
   if [[ "$status" != "$want_status" ]]; then
@@ -456,6 +643,20 @@ check() {
         failures=$((failures + 1))
       fi
       ;;
+    create)
+      if ! grep -q '^create ' "$log" || grep -q '^\(upload\|patch\) ' "$log"; then
+        printf 'FAIL %s: expected create only: %s\n' "$name" "$(<"$log")" >&2
+        failures=$((failures + 1))
+      fi
+      ;;
+    upload-patch)
+      if ! grep -q '^upload ' "$log" || ! grep -q '^patch ' "$log" ||
+         grep -q '^create ' "$log"; then
+        printf 'FAIL %s: expected exact-ID upload and patch only: %s\n' \
+          "$name" "$(<"$log")" >&2
+        failures=$((failures + 1))
+      fi
+      ;;
     patch)
       if ! grep -q '^patch ' "$log" || grep -q '^\(create\|upload\) ' "$log"; then
         printf 'FAIL %s: expected visibility patch only: %s\n' "$name" "$(<"$log")" >&2
@@ -480,6 +681,25 @@ check "stage creates a missing draft and uploads the complete set" stage 0 \
 grep -q -- '--clobber' "$log" && fail "stage used --clobber"
 
 seed_dist
+reset_remote absent
+check "stage recovers a committed draft-creation response loss" stage 0 \
+  "Recovered committed draft creation" create-upload create_response_loss
+[[ "$(<"$state")" == draft ]] ||
+  fail "creation-response recovery made the release public"
+
+seed_dist
+reset_remote absent
+check "stage refuses an uncommitted draft-creation failure" stage 1 \
+  "draft creation response was lost" create create_failure
+[[ "$(<"$state")" == absent ]] ||
+  fail "uncommitted creation failure created a release"
+
+seed_dist
+reset_remote absent
+check "stage refuses duplicate drafts after a lost creation response" stage 1 \
+  "multiple GitHub releases use tag" create create_duplicate_response_loss
+
+seed_dist
 reset_remote draft
 check "stage uploads an empty existing draft without publishing" stage 0 \
   "Staged exact draft" upload
@@ -492,7 +712,7 @@ check "stage detects a tag moved while assets are uploaded" stage 1 \
 seed_dist
 reset_remote draft
 check "a failed upload leaves a private partial draft" stage 1 \
-  "could not upload the missing asset set" upload upload_failure
+  "could not upload exact asset" upload upload_failure
 [[ "$(<"$state")" == draft ]] || fail "failed stage made the release public"
 [[ $(find "$remote" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]') -eq 1 ]] ||
   fail "upload-failure fixture did not leave one partial asset"
@@ -503,8 +723,92 @@ check "a retry safely completes the matching partial draft" stage 0 \
 
 seed_dist
 reset_remote draft
+copy_exact_remote
+response_loss_asset=$("$release_targets" expected-release-assets "$tag" | sed -n '1p')
+rm "$remote/$response_loss_asset"
+check "stage reconciles a committed exact-ID upload response loss" stage 0 \
+  "Recovered committed asset upload" upload upload_response_loss
+
+seed_dist
+reset_remote draft
+copy_exact_remote
+malformed_response_asset=$("$release_targets" expected-release-assets "$tag" | sed -n '1p')
+rm "$remote/$malformed_response_asset"
+check "stage reconciles a malformed committed upload response" stage 0 \
+  "Recovered committed asset upload" upload upload_malformed_response
+
+seed_dist
+reset_remote draft
 check "an ambiguous release lookup cannot create or upload" stage 1 \
   "could not determine whether GitHub release" none lookup_failure
+
+seed_dist
+reset_remote draft
+check "malformed GraphQL identity cannot create or upload" stage 1 \
+  "malformed release identity data" none graphql_malformed
+
+seed_dist
+reset_remote draft
+check "partial GraphQL errors cannot create or upload" stage 1 \
+  "malformed release lookup data" none graphql_partial_errors
+
+seed_dist
+reset_remote draft
+check "a failed paginated release listing cannot create or upload" stage 1 \
+  "could not list GitHub releases" none release_list_failure
+
+seed_dist
+reset_remote draft
+check "malformed paginated release data cannot create or upload" stage 1 \
+  "malformed paginated release data" none release_list_malformed
+
+seed_dist
+reset_remote draft
+check "malformed objects in release pages cannot create or upload" stage 1 \
+  "malformed paginated release data" none release_list_malformed_entry
+
+seed_dist
+reset_remote draft
+copy_exact_remote
+check "GraphQL discovery waits for lagging REST-list visibility" stage 0 \
+  "Staged exact draft" none rest_lag
+
+seed_dist
+reset_remote draft
+check "duplicate releases for one tag cannot be staged" stage 1 \
+  "multiple GitHub releases use tag" none duplicate_release
+
+seed_dist
+reset_remote draft
+check "a duplicate appearing after one observation prevents staging" stage 1 \
+  "multiple GitHub releases use tag" none duplicate_after_one
+
+seed_dist
+reset_remote draft
+check "duplicate paginated identities are rejected as malformed" stage 1 \
+  "malformed paginated release data" none duplicate_paginated_id
+
+seed_dist
+reset_remote draft
+check "GraphQL and REST identity disagreement prevents staging" stage 1 \
+  "release lookups disagree" none lookup_mismatch
+
+seed_dist
+reset_remote absent
+check "a one-sided identity can never become safe absence" stage 1 \
+  "did not converge" none ghost_identity_then_absent
+[[ "$(<"$state")" == absent ]] ||
+  fail "one-sided identity lookup created a replacement release"
+
+seed_dist
+reset_remote draft
+check "a one-sided release identity cannot converge to a replacement" stage 1 \
+  "changed during lookup" none transient_identity_change
+
+seed_dist
+reset_remote draft
+check "release identity changing between observations prevents staging" stage 1 \
+  "changed during lookup" none identity_change
 
 seed_dist
 reset_remote draft
@@ -539,7 +843,7 @@ reset_remote draft
 first_remote=$("$release_targets" expected-release-assets "$tag" | sed -n '1p')
 cp "$dist/$first_remote" "$remote/"
 check "stage refuses to upload when existing asset download fails" stage 1 \
-  "could not download the exact assets" none download_failure
+  "could not download exact GitHub release asset" none download_failure
 
 seed_dist
 reset_remote draft
@@ -570,6 +874,30 @@ copy_exact_remote
 check "finalize publishes only after exact remote verification" finalize 0 \
   "Finalized exact immutable" patch
 [[ "$(<"$state")" == published ]] || fail "finalize did not publish the release"
+
+seed_dist
+reset_remote draft
+copy_exact_remote
+check "finalize rechecks exact release metadata immediately before publication" finalize 1 \
+  "changed immediately before finalization" none metadata_change_before_patch
+[[ "$(<"$state")" == draft ]] ||
+  fail "metadata-race guard changed release visibility"
+
+seed_dist
+reset_remote draft
+copy_exact_remote
+check "finalize rechecks the annotated tag immediately before publication" finalize 1 \
+  "live annotated release tag" none tag_move_before_patch
+[[ "$(<"$state")" == draft ]] ||
+  fail "tag-race guard changed release visibility"
+
+seed_dist
+reset_remote draft
+copy_exact_remote
+check "finalize rechecks assets after metadata and tag verification" finalize 1 \
+  "assets changed immediately before finalization" none asset_change_before_patch
+[[ "$(<"$state")" == draft ]] ||
+  fail "asset-race guard changed release visibility"
 
 seed_dist
 reset_remote draft
@@ -624,10 +952,41 @@ check "finalize refuses partial remote assets without publishing" finalize 1 \
 [[ "$(<"$state")" == draft ]] || fail "failed finalize changed release visibility"
 
 seed_dist
+reset_remote absent
+check "resume refuses to create a missing recovery release" resume 1 \
+  "recovery requires existing GitHub release" none
+[[ "$(<"$state")" == absent ]] || fail "resume created a missing release"
+
+seed_dist
+reset_remote draft
+check "resume stages and finalizes one existing exact draft by ID" resume 0 \
+  "Finalized exact immutable" upload-patch
+[[ "$(<"$state")" == published ]] || fail "resume did not publish the exact draft"
+[[ $(find "$remote" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]') -eq 39 ]] ||
+  fail "resume did not stage all 39 exact assets"
+
+seed_dist
+reset_remote published
+copy_exact_remote
+check "resume idempotently accepts the exact published release" resume 0 \
+  "Accepted already-finalized exact immutable" none
+
+seed_dist
+reset_remote draft
+check "resume refuses a different expected numeric release ID" resume 1 \
+  "was replaced: expected 4343, found 4242" none normal 4343
+
+seed_dist
 reset_remote published
 copy_exact_remote
 check "verify accepts an exact immutable published release" verify 0 \
   "Verified exact immutable" none
+
+seed_dist
+reset_remote published
+copy_exact_remote
+check "verify rejects an asset identity changed during its snapshot" verify 1 \
+  "assets changed while they were being verified" none asset_snapshot_change
 
 seed_dist
 reset_remote draft

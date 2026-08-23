@@ -2,14 +2,14 @@
 # Require the exact bot-authored release generated from this checkout's CHANGELOG.
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "usage: $0 <tag> <draft|published> [expected-release-id]" >&2
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 <tag> <draft|published> <expected-release-id>" >&2
   exit 2
 fi
 
 tag=$1
 release_state=$2
-expected_id=${3:-}
+expected_id=$3
 repository=${GH_REPO:-}
 case "$release_state" in
   draft)
@@ -27,19 +27,27 @@ case "$release_state" in
 esac
 if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
       ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ||
-      ( -n "$expected_id" && ! "$expected_id" =~ ^[1-9][0-9]*$ ) ]]; then
+      ! "$expected_id" =~ ^[1-9][0-9]*$ ]]; then
   echo "Invalid release verification arguments" >&2
   exit 2
 fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 version=${tag#v}
-if ! expected_notes=$("$root/scripts/extract-release-notes.sh" "$version"); then
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT INT TERM
+expected_notes_file="$work/expected-notes.md"
+release_body_file="$work/release-body.md"
+if ! "$root/scripts/extract-release-notes.sh" "$version" > "$expected_notes_file"; then
   echo "Could not derive canonical release notes for $tag" >&2
   exit 1
 fi
 
-if ! release=$(gh api "repos/${repository}/releases/tags/${tag}"); then
+# GitHub's REST release-by-tag endpoint returns 404 for private drafts and is
+# ambiguous when multiple drafts share a tag. Read the one discovered numeric
+# identity directly for every state.
+release_endpoint="repos/${repository}/releases/${expected_id}"
+if ! release=$(gh api "$release_endpoint"); then
   echo "Could not read GitHub release $tag" >&2
   exit 1
 fi
@@ -50,7 +58,7 @@ if ! release_id=$(jq -er '
   echo "GitHub release $tag returned an invalid identity" >&2
   exit 1
 fi
-if [[ -n "$expected_id" && "$release_id" != "$expected_id" ]]; then
+if [[ "$release_id" != "$expected_id" ]]; then
   echo "GitHub release $tag was replaced: expected $expected_id, found $release_id" >&2
   exit 1
 fi
@@ -59,6 +67,7 @@ if ! jq -e \
   --argjson expected_draft "$expected_draft" '
     type == "object" and
     .tag_name == $tag and
+    .name == $tag and
     .draft == $expected_draft and
     .prerelease == false and
     ($expected_draft or .immutable == true) and
@@ -69,9 +78,9 @@ if ! jq -e \
   exit 1
 fi
 
-release_name=$(jq -r '.name // ""' <<<"$release")
-release_body=$(jq -r '.body // ""' <<<"$release")
-if [[ "$release_name" != "$tag" || "$release_body" != "$expected_notes" ]]; then
+if ! jq -jer '(.body // "") | select(type == "string")' \
+  <<<"$release" > "$release_body_file" ||
+   ! cmp -s "$release_body_file" "$expected_notes_file"; then
   echo "$state_label GitHub release $tag has unexpected title or notes" >&2
   exit 1
 fi

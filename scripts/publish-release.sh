@@ -4,6 +4,7 @@
 #   scripts/publish-release.sh stage <tag> [release-directory]
 #   scripts/publish-release.sh finalize <tag> [release-directory]
 #   scripts/publish-release.sh verify <tag> [release-directory]
+#   scripts/publish-release.sh resume <tag> <release-directory> <release-id>
 #
 # A release directory is the durable, consumer-facing output of the release
 # pipeline: five files for every native target, three container evidence files,
@@ -15,15 +16,17 @@ set -euo pipefail
 usage() {
   cat >&2 <<EOF
 usage: $0 <stage|finalize|verify> <tag> [release-directory]
+       $0 resume <tag> <release-directory> <release-id>
 EOF
   exit 2
 }
 
-[[ $# -ge 2 && $# -le 3 ]] || usage
+[[ $# -ge 2 && $# -le 4 ]] || usage
 
 mode=$1
 tag=$2
 dist=${3:-dist}
+expected_release_id=${4:-}
 repository=${GH_REPO:-}
 root=$(cd "$(dirname "$0")/.." && pwd)
 release_targets="$root/scripts/release-targets.sh"
@@ -33,7 +36,12 @@ package=mcp-repl
 semver_component='(0|[1-9][0-9]*)'
 
 case "$mode" in
-  stage | finalize | verify) ;;
+  stage | finalize | verify)
+    [[ $# -le 3 ]] || usage
+    ;;
+  resume)
+    [[ $# -eq 4 && "$expected_release_id" =~ ^[1-9][0-9]*$ ]] || usage
+    ;;
   *) usage ;;
 esac
 if [[ ! "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ||
@@ -54,7 +62,7 @@ fail() {
   exit 1
 }
 
-for required_command in gh jq find sort cmp wc awk grep git; do
+for required_command in gh jq find sort cmp wc awk grep git sleep; do
   command -v "$required_command" > /dev/null 2>&1 ||
     fail "$required_command is required"
 done
@@ -415,6 +423,7 @@ verify_live_release_tag
 
 remote_assets=
 remote_count=0
+verified_remote_asset_snapshot=
 remote_names_file="$work/remote-names"
 load_remote_assets() {
   local release_id=$1 pages
@@ -435,9 +444,11 @@ load_remote_assets() {
 }
 
 require_remote_subset_inventory() {
-  local unique_count name
+  local unique_count unique_id_count name
   if ! jq -e '
     all(.[];
+      (.id | type) == "number" and .id > 0 and
+      (.id == (.id | floor)) and
       (.name | type) == "string" and
       .state == "uploaded" and
       (.size | type) == "number" and .size > 0 and
@@ -450,6 +461,10 @@ require_remote_subset_inventory() {
   unique_count=$(uniq "$remote_names_file" | wc -l | tr -d '[:space:]')
   if [[ "$unique_count" -ne "$remote_count" ]]; then
     fail "remote release contains duplicate asset names"
+  fi
+  unique_id_count=$(jq '[.[].id] | unique | length' <<<"$remote_assets")
+  if [[ "$unique_id_count" -ne "$remote_count" ]]; then
+    fail "remote release contains duplicate asset identities"
   fi
   while IFS= read -r name; do
     if ! grep -Fqx -- "$name" "$expected_names_file"; then
@@ -466,54 +481,68 @@ require_exact_remote_inventory() {
   fi
 }
 
+remote_asset_snapshot() {
+  jq -c 'sort_by(.name) | map({id, name, size, state})' <<<"$remote_assets"
+}
+
+download_remote_asset() {
+  local asset_id=$1 name=$2 expected_size=$3 destination=$4 actual_size
+  if ! gh api "repos/${repository}/releases/assets/${asset_id}" \
+    -H 'Accept: application/octet-stream' > "$destination"; then
+    fail "could not download exact GitHub release asset $name (id $asset_id)"
+  fi
+  if [[ ! -f "$destination" || -L "$destination" ]]; then
+    fail "downloaded release asset $name is not a regular file"
+  fi
+  actual_size=$(file_size "$destination")
+  if [[ "$actual_size" -ne "$expected_size" ]]; then
+    fail "downloaded release asset $name does not match its listed size"
+  fi
+}
+
 download_and_compare_remote() {
-  local label=$1 name
+  local release_id=$1 label=$2 asset_id name expected_size destination
   local remote_dir="$work/download-$label"
-  local downloaded_names="$work/download-$label-names" entry
   mkdir "$remote_dir"
-  if ! gh release download "$tag" \
-    --repo "$repository" \
-    --dir "$remote_dir"; then
-    fail "could not download the exact assets from GitHub release $tag"
-  fi
-  : > "$downloaded_names"
-  while IFS= read -r -d '' entry; do
-    name=${entry##*/}
-    if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
-          ! -f "$entry" || -L "$entry" || ! -s "$entry" ]]; then
-      fail "downloaded release contains an unsafe, linked, empty, or non-file entry: $name"
-    fi
-    printf '%s\n' "$name" >> "$downloaded_names"
-  done < <(find "$remote_dir" -mindepth 1 -maxdepth 1 -print0)
-  LC_ALL=C sort "$downloaded_names" -o "$downloaded_names"
-  if ! cmp -s "$downloaded_names" "$remote_names_file"; then
-    fail "downloaded release does not match the listed remote asset set"
-  fi
-  while IFS= read -r name; do
-    if ! cmp -s "$dist/$name" "$remote_dir/$name"; then
+  while IFS=$'\t' read -r asset_id name expected_size; do
+    destination="$remote_dir/$name"
+    download_remote_asset "$asset_id" "$name" "$expected_size" "$destination"
+    if ! cmp -s "$dist/$name" "$destination"; then
       fail "downloaded remote asset differs byte-for-byte from local $name"
     fi
-  done < "$remote_names_file"
+  done < <(jq -r 'sort_by(.name)[] | [.id, .name, .size] | @tsv' \
+    <<<"$remote_assets")
 }
 
 verify_remote_release() {
-  local release_id=$1 release_state=$2 label=$3
+  local release_id=$1 release_state=$2 label=$3 before_snapshot after_snapshot
   load_remote_assets "$release_id"
   require_exact_remote_inventory
-  download_and_compare_remote "$label"
+  before_snapshot=$(remote_asset_snapshot)
+  download_and_compare_remote "$release_id" "$label"
   "$verify_release" "$tag" "$release_state" "$release_id" > /dev/null ||
     fail "GitHub release $tag changed while its assets were being verified"
-  # Release identity and asset verification are separate GitHub reads. Close
-  # the interval by authenticating the live annotated tag again after the
-  # complete remote snapshot has been accepted.
+  require_unique_release_id "$release_id"
+  load_remote_assets "$release_id"
+  require_exact_remote_inventory
+  after_snapshot=$(remote_asset_snapshot)
+  if [[ "$after_snapshot" != "$before_snapshot" ]]; then
+    fail "GitHub release $tag assets changed while they were being verified"
+  fi
+  verified_remote_asset_snapshot=$after_snapshot
+  # Close the interval between release, asset, and tag identity reads before
+  # accepting the complete remote snapshot.
   verify_live_release_tag
 }
 
-lookup_release_presence() {
+graphql_release_id=
+located_release_id=
+read_graphql_release_id() {
   local owner=${repository%%/*} name=${repository#*/} response
-  # These dollar-prefixed names belong to GraphQL, not the shell.
+  graphql_release_id=
+  # These dollar-prefixed names are GraphQL variables, not shell parameters.
   # shellcheck disable=SC2016
-  local query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){id}}}'
+  local query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){databaseId tagName}}}'
   if ! response=$(gh api graphql \
     -f "query=$query" \
     -F "owner=$owner" \
@@ -521,27 +550,186 @@ lookup_release_presence() {
     -F "tag=$tag"); then
     fail "could not determine whether GitHub release $tag exists"
   fi
-  if ! jq -e '.data.repository | type == "object"' <<<"$response" > /dev/null; then
+  if ! jq -e '
+    type == "object" and
+    ((has("errors") | not) or .errors == null or .errors == []) and
+    (.data.repository | type) == "object"
+  ' <<<"$response" > /dev/null; then
     fail "GitHub returned malformed release lookup data for $tag"
   fi
   if jq -e '.data.repository.release == null' <<<"$response" > /dev/null; then
-    return 1
+    return 0
   fi
-  jq -e '.data.repository.release.id | type == "string" and length > 0' \
-    <<<"$response" > /dev/null ||
+  if ! graphql_release_id=$(jq -er \
+    --arg tag "$tag" '
+      .data.repository.release |
+      select(type == "object" and .tagName == $tag) |
+      .databaseId |
+      select(type == "number" and . > 0 and floor == .)
+    ' <<<"$response"); then
     fail "GitHub returned malformed release identity data for $tag"
-  return 0
+  fi
+}
+
+rest_release_ids=
+rest_release_count=0
+read_rest_release_ids() {
+  local pages
+  if ! pages=$(gh api --paginate --slurp \
+    "repos/${repository}/releases?per_page=100"); then
+    fail "could not list GitHub releases while locating $tag"
+  fi
+  if ! rest_release_ids=$(jq -ce --arg tag "$tag" '
+    if type != "array" or any(.[]; type != "array") or
+       any(.[][];
+         type != "object" or
+         (.id | type) != "number" or .id <= 0 or
+         .id != (.id | floor) or
+         (.tag_name | type) != "string")
+    then error("malformed release pages")
+    else
+      [.[][] | select(.tag_name == $tag) | .id] as $ids |
+      if (($ids | unique | length) != ($ids | length))
+      then error("duplicate paginated release identity")
+      else ($ids | sort)
+      end
+    end
+  ' <<<"$pages"); then
+    fail "GitHub returned malformed paginated release data for $tag"
+  fi
+  rest_release_count=$(jq 'length' <<<"$rest_release_ids")
+}
+
+observed_release_state=
+observed_release_id=
+observe_release_identity() {
+  local rest_id=
+  observed_release_state=
+  observed_release_id=
+  read_graphql_release_id
+  read_rest_release_ids
+  if [[ "$rest_release_count" -gt 1 ]]; then
+    fail "multiple GitHub releases use tag $tag"
+  fi
+  if [[ "$rest_release_count" -eq 1 ]]; then
+    rest_id=$(jq -r '.[0]' <<<"$rest_release_ids")
+  fi
+  if [[ -n "$graphql_release_id" && -n "$rest_id" &&
+        "$graphql_release_id" != "$rest_id" ]]; then
+    fail "GitHub release lookups disagree on the identity for $tag"
+  fi
+  if [[ -n "$graphql_release_id" && -n "$rest_id" ]]; then
+    observed_release_state=found
+    observed_release_id=$graphql_release_id
+  elif [[ -z "$graphql_release_id" && -z "$rest_id" ]]; then
+    observed_release_state=absent
+  else
+    observed_release_state=transient
+    observed_release_id=${graphql_release_id:-$rest_id}
+  fi
+}
+
+locate_release() {
+  local attempt absent_seen=false found_seen=false candidate_id='' seen_id=''
+  located_release_id=
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    observe_release_identity
+    if [[ -n "$observed_release_id" ]]; then
+      if [[ -n "$seen_id" && "$seen_id" != "$observed_release_id" ]]; then
+        fail "GitHub release identity for $tag changed during lookup"
+      fi
+      seen_id=$observed_release_id
+    fi
+    case "$observed_release_state" in
+      found)
+        if [[ "$found_seen" == true ]]; then
+          if [[ "$candidate_id" != "$observed_release_id" ]]; then
+            fail "GitHub release identity for $tag changed between stable observations"
+          fi
+          located_release_id=$observed_release_id
+          return 0
+        fi
+        candidate_id=$observed_release_id
+        found_seen=true
+        absent_seen=false
+        ;;
+      absent)
+        if [[ -n "$seen_id" ]]; then
+          # Once either authenticated API exposes an identity, temporary
+          # absence can never authorize creation of a replacement release.
+          absent_seen=false
+          found_seen=false
+          candidate_id=
+        elif [[ "$absent_seen" == true ]]; then
+          return 1
+        else
+          absent_seen=true
+          found_seen=false
+          candidate_id=
+        fi
+        ;;
+      transient)
+        absent_seen=false
+        found_seen=false
+        candidate_id=
+        ;;
+      *) fail "internal release lookup state is invalid" ;;
+    esac
+    [[ "$attempt" -eq 10 ]] || sleep 1
+  done
+  fail "GitHub release identity for $tag did not converge"
+}
+
+wait_for_release_presence() {
+  local attempt candidate_id='' found_seen=false seen_id=''
+  located_release_id=
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    observe_release_identity
+    if [[ -n "$observed_release_id" ]]; then
+      if [[ -n "$seen_id" && "$seen_id" != "$observed_release_id" ]]; then
+        fail "GitHub release identity for $tag changed while it became visible"
+      fi
+      seen_id=$observed_release_id
+    fi
+    if [[ "$observed_release_state" == found ]]; then
+      if [[ "$found_seen" == true ]]; then
+        if [[ "$candidate_id" != "$observed_release_id" ]]; then
+          fail "GitHub release identity for $tag changed between stable observations"
+        fi
+        located_release_id=$observed_release_id
+        return 0
+      fi
+      candidate_id=$observed_release_id
+      found_seen=true
+    else
+      candidate_id=
+      found_seen=false
+    fi
+    [[ "$attempt" -eq 10 ]] || sleep 1
+  done
+  return 1
+}
+
+require_unique_release_id() {
+  local expected_id=$1
+  if ! locate_release; then
+    fail "GitHub release $tag disappeared"
+  fi
+  if [[ "$located_release_id" != "$expected_id" ]]; then
+    fail "GitHub release $tag was replaced: expected $expected_id, found $located_release_id"
+  fi
 }
 
 live_release_id=
 live_release_draft=
-read_live_release_state() {
-  local snapshot
-  if ! snapshot=$(gh api "repos/${repository}/releases/tags/${tag}"); then
+read_release_state_by_id() {
+  local expected_id=$1 snapshot
+  if ! snapshot=$(gh api "repos/${repository}/releases/${expected_id}"); then
     fail "could not read live GitHub release state for $tag"
   fi
-  if ! live_release_id=$(jq -er '
-    .id | select(type == "number" and . > 0 and floor == .)
+  if ! live_release_id=$(jq -er --arg tag "$tag" --argjson id "$expected_id" '
+    select(type == "object" and .tag_name == $tag) |
+    .id | select(type == "number" and . == $id)
   ' <<<"$snapshot"); then
     fail "GitHub release $tag returned an invalid live identity"
   fi
@@ -555,92 +743,199 @@ read_live_release_state() {
   fi
 }
 
+read_live_release_state() {
+  if ! locate_release; then
+    fail "could not read live GitHub release state for $tag"
+  fi
+  read_release_state_by_id "$located_release_id"
+}
+
+upload_missing_asset() {
+  local release_id=$1 path=$2 name=${2##*/} expected_size response
+  local upload_received=true asset asset_id remote_size recovery_dir
+  expected_size=$(file_size "$path")
+  if ! response=$(gh api --method POST \
+    "https://uploads.github.com/repos/${repository}/releases/${release_id}/assets" \
+    -H 'Content-Type: application/octet-stream' \
+    -f "name=$name" \
+    --input "$path"); then
+    upload_received=false
+  fi
+  if [[ "$upload_received" == true ]] && jq -e \
+    --arg name "$name" \
+    --argjson size "$expected_size" '
+      type == "object" and
+      (.id | type) == "number" and .id > 0 and .id == (.id | floor) and
+      .name == $name and .state == "uploaded" and .size == $size
+    ' <<<"$response" > /dev/null 2>&1; then
+    return 0
+  fi
+
+  # A network error or malformed response may follow a committed upload. Never
+  # retry blindly: reconcile the selected release ID and accept only exact bytes.
+  load_remote_assets "$release_id"
+  require_remote_subset_inventory
+  if ! asset=$(jq -ce --arg name "$name" '
+    [.[] | select(.name == $name)] | select(length == 1) | .[0]
+  ' <<<"$remote_assets"); then
+    fail "could not upload exact asset $name to draft release $tag"
+  fi
+  asset_id=$(jq -r '.id' <<<"$asset")
+  remote_size=$(jq -r '.size' <<<"$asset")
+  recovery_dir="$work/upload-recovery-$name"
+  mkdir "$recovery_dir"
+  download_remote_asset "$asset_id" "$name" "$remote_size" \
+    "$recovery_dir/$name"
+  if ! cmp -s "$path" "$recovery_dir/$name"; then
+    fail "ambiguous upload for $name committed different remote bytes"
+  fi
+  echo "Recovered committed asset upload for $name after its response was lost"
+}
+
+stage_exact_draft() {
+  local release_id=$1 name missing_count=0
+  local missing_assets=()
+  release_id=$("$verify_release" "$tag" draft "$release_id") ||
+    fail "GitHub release $tag is not the trusted draft"
+  load_remote_assets "$release_id"
+  require_remote_subset_inventory
+  if [[ "$remote_count" -gt 0 ]]; then
+    download_and_compare_remote "$release_id" stage-existing
+    "$verify_release" "$tag" draft "$release_id" > /dev/null ||
+      fail "GitHub release $tag changed while existing assets were verified"
+  fi
+  for name in "${expected_asset_names[@]}"; do
+    if ! grep -Fqx -- "$name" "$remote_names_file"; then
+      missing_assets[missing_count]="$dist/$name"
+      missing_count=$((missing_count + 1))
+    fi
+  done
+  if [[ "$missing_count" -gt 0 ]]; then
+    for name in "${missing_assets[@]}"; do
+      upload_missing_asset "$release_id" "$name"
+    done
+    "$verify_release" "$tag" draft "$release_id" > /dev/null ||
+      fail "GitHub release $tag changed while its assets were uploaded"
+  fi
+  verify_remote_release "$release_id" draft stage
+}
+
+finalize_exact_release() {
+  local release_id=$1 release_draft=$2 patch_response current_snapshot
+  if [[ "$release_draft" == false ]]; then
+    release_id=$("$verify_release" "$tag" published "$release_id") ||
+      fail "already-published GitHub release $tag is not the trusted immutable release"
+    verify_remote_release "$release_id" published finalize-already-published
+    echo "Accepted already-finalized exact immutable GitHub release $tag (id $release_id)"
+    return 0
+  fi
+
+  release_id=$("$verify_release" "$tag" draft "$release_id") ||
+    fail "GitHub release $tag is not the trusted draft"
+  verify_remote_release "$release_id" draft finalize-before
+  require_unique_release_id "$release_id"
+  load_remote_assets "$release_id"
+  require_exact_remote_inventory
+  current_snapshot=$(remote_asset_snapshot)
+  if [[ -z "$verified_remote_asset_snapshot" ||
+        "$current_snapshot" != "$verified_remote_asset_snapshot" ]]; then
+    fail "GitHub release $tag assets changed immediately before finalization"
+  fi
+  # The stable uniqueness check above deliberately spans two observations.
+  # Close that interval over the release metadata and annotated tag once more
+  # before making the visibility change.
+  "$verify_release" "$tag" draft "$release_id" > /dev/null ||
+    fail "GitHub release $tag changed immediately before finalization"
+  verify_live_release_tag
+  load_remote_assets "$release_id"
+  require_exact_remote_inventory
+  current_snapshot=$(remote_asset_snapshot)
+  if [[ "$current_snapshot" != "$verified_remote_asset_snapshot" ]]; then
+    fail "GitHub release $tag assets changed immediately before finalization"
+  fi
+  patch_response=received
+  if ! gh api --method PATCH \
+    "repos/${repository}/releases/${release_id}" \
+    -F draft=false \
+    -f make_latest=legacy > /dev/null; then
+    patch_response=lost
+  fi
+  verify_live_release_tag
+  if ! "$verify_release" "$tag" published "$release_id" > /dev/null; then
+    if [[ "$patch_response" == lost ]]; then
+      fail "finalization response was lost and GitHub release $tag is not the trusted immutable release"
+    fi
+    fail "GitHub release $tag did not become the trusted immutable release"
+  fi
+  verify_remote_release "$release_id" published finalize-after
+  if [[ "$patch_response" == lost ]]; then
+    echo "Recovered committed finalization after the GitHub response was lost"
+  fi
+  echo "Finalized exact immutable GitHub release $tag (id $release_id)"
+}
+
 case "$mode" in
   stage)
-    if lookup_release_presence; then
-      release_id=$("$verify_release" "$tag" draft) ||
-        fail "existing GitHub release $tag is not the trusted draft"
+    if locate_release; then
+      release_id=$located_release_id
     else
       notes_file="$work/release-notes.md"
       "$root/scripts/extract-release-notes.sh" "${tag#v}" > "$notes_file" ||
         fail "could not derive canonical release notes for $tag"
+      create_response=received
       if ! gh release create "$tag" \
         --repo "$repository" \
         --draft \
         --verify-tag \
         --title "$tag" \
         --notes-file "$notes_file" > /dev/null; then
-        fail "could not create the trusted draft GitHub release $tag"
+        create_response=lost
       fi
       verify_live_release_tag
-      release_id=$("$verify_release" "$tag" draft) ||
+      if ! wait_for_release_presence; then
+        if [[ "$create_response" == lost ]]; then
+          fail "draft creation response was lost and GitHub release $tag is absent"
+        fi
+        fail "created GitHub release $tag could not be bound to one unique numeric identity"
+      fi
+      release_id=$located_release_id
+      release_id=$("$verify_release" "$tag" draft "$release_id") ||
         fail "created GitHub release $tag is not the trusted draft"
-    fi
-
-    load_remote_assets "$release_id"
-    require_remote_subset_inventory
-    if [[ "$remote_count" -gt 0 ]]; then
-      download_and_compare_remote stage-existing
-      "$verify_release" "$tag" draft "$release_id" > /dev/null ||
-        fail "GitHub release $tag changed while existing assets were verified"
-    fi
-    missing_assets=()
-    for name in "${expected_asset_names[@]}"; do
-      if ! grep -Fqx -- "$name" "$remote_names_file"; then
-        missing_assets+=("$dist/$name")
+      if [[ "$create_response" == lost ]]; then
+        echo "Recovered committed draft creation after the GitHub response was lost"
       fi
-    done
-    if [[ ${#missing_assets[@]} -gt 0 ]]; then
-      if ! gh release upload "$tag" \
-        --repo "$repository" \
-        "${missing_assets[@]}"; then
-        fail "could not upload the missing asset set to draft release $tag"
-      fi
-      verify_live_release_tag
-      "$verify_release" "$tag" draft "$release_id" > /dev/null ||
-        fail "GitHub release $tag changed while its assets were uploaded"
     fi
-    verify_remote_release "$release_id" draft stage
+    stage_exact_draft "$release_id"
     echo "Staged exact draft GitHub release $tag (id $release_id)"
     ;;
 
   finalize)
     read_live_release_state
-    if [[ "$live_release_draft" == false ]]; then
-      release_id=$("$verify_release" "$tag" published "$live_release_id") ||
-        fail "already-published GitHub release $tag is not the trusted immutable release"
-      verify_remote_release "$release_id" published finalize-already-published
-      echo "Accepted already-finalized exact immutable GitHub release $tag (id $release_id)"
-    else
-      release_id=$("$verify_release" "$tag" draft "$live_release_id") ||
-        fail "GitHub release $tag is not the trusted draft"
-      verify_remote_release "$release_id" draft finalize-before
-      patch_response=received
-      if ! gh api --method PATCH \
-        "repos/${repository}/releases/${release_id}" \
-        -F draft=false \
-        -f make_latest=legacy > /dev/null; then
-        patch_response=lost
-      fi
-      verify_live_release_tag
-      if ! "$verify_release" "$tag" published "$release_id" > /dev/null; then
-        if [[ "$patch_response" == lost ]]; then
-          fail "finalization response was lost and GitHub release $tag is not the trusted immutable release"
-        fi
-        fail "GitHub release $tag did not become the trusted immutable release"
-      fi
-      verify_remote_release "$release_id" published finalize-after
-      if [[ "$patch_response" == lost ]]; then
-        echo "Recovered committed finalization after the GitHub response was lost"
-      fi
-      echo "Finalized exact immutable GitHub release $tag (id $release_id)"
-    fi
+    finalize_exact_release "$live_release_id" "$live_release_draft"
     ;;
 
   verify)
-    release_id=$("$verify_release" "$tag" published) ||
+    if ! locate_release; then
+      fail "GitHub release $tag is absent"
+    fi
+    release_id=$("$verify_release" "$tag" published "$located_release_id") ||
       fail "GitHub release $tag is not the trusted immutable release"
     verify_remote_release "$release_id" published verify
     echo "Verified exact immutable GitHub release $tag (id $release_id)"
+    ;;
+
+  resume)
+    if ! locate_release; then
+      fail "recovery requires existing GitHub release $tag (id $expected_release_id)"
+    fi
+    if [[ "$located_release_id" != "$expected_release_id" ]]; then
+      fail "GitHub release $tag was replaced: expected $expected_release_id, found $located_release_id"
+    fi
+    read_release_state_by_id "$expected_release_id"
+    if [[ "$live_release_draft" == true ]]; then
+      stage_exact_draft "$expected_release_id"
+      echo "Staged exact draft GitHub release $tag (id $expected_release_id)"
+    fi
+    finalize_exact_release "$expected_release_id" "$live_release_draft"
     ;;
 esac

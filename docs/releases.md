@@ -171,6 +171,20 @@ binaries.
     read is compared to raw registry bytes by digest. A final anonymous job
     executes both the version and `latest` images and proves that their raw
     indexes identify the release record's digest.
+15. A separately reviewed `Release draft recovery` workflow covers only the
+    narrow state where a defective frozen publisher stranded the already-built
+    canonical set behind a bot-owned private draft. Its owner-sent dispatch
+    selects a failed run and release merge only as evidence. Read-only preflight
+    authenticates the exact successful build/attestation/assembly/version-image
+    topology, sole failed GitHub-publication job, skipped latest/smoke jobs,
+    retained 39-file artifact, annotated tag, and unique draft identity. The
+    write job receives only `actions: read` and `contents: write`, downloads the
+    historical artifact by numeric ID and verifies its API-recorded ZIP digest,
+    then overlays reviewed current-main publisher scripts onto a detached
+    historical source worktree. It executes none of that old checkout's scripts
+    or product code. Recovery can resume only the same numeric draft, never
+    create a tag or draft, replace an asset, publish synthesized bytes, mutate
+    GHCR, or rerun the failed workflow automatically.
 
 The status reporter is intentionally narrow and the whole update/validation
 graph is serialized. It runs from the trusted default branch, grants only its
@@ -378,9 +392,33 @@ compact release record.
   bot-owned immutable release with the exact 39 byte-identical assets; it never
   trusts a stale prerequisite output or replaces an asset. An older tag retry
   reconciles `latest` to GitHub's current immutable latest release, not itself.
-  If an existing container version conflicts or the tagged pipeline itself is
-  defective, stop and use a separately reviewed recovery workflow; never move a
-  source tag, replace a version image, or disable release immutability.
+  If an existing container version conflicts, stop; never move a source tag,
+  replace a version image, or disable release immutability. If the frozen
+  pipeline itself is defective only at draft publication and its exact
+  canonical artifact still exists, merge the separately reviewed controller
+  fix without advancing the recovery epoch, then dispatch only the failed
+  evidence:
+
+  ```bash
+  gh api --method POST repos/joshrotenberg/mcp-repl/dispatches \
+    -f event_type=release_draft_recovery \
+    -F 'client_payload[schema_version]=1' \
+    -f 'client_payload[release_merge_sha]=<40-character release merge SHA>' \
+    -F 'client_payload[run_id]=<failed run ID>' \
+    -F 'client_payload[run_attempt]=<failed run attempt>'
+  ```
+
+  The controller authenticates the current default-branch checkout, exact
+  30-job failure topology, one unexpired canonical artifact, full release list,
+  numeric draft identity, safe remote asset subset, canonical notes, and
+  annotated source tag before uploading any missing byte-identical files and
+  finalizing that same draft. After it succeeds, use **Re-run failed jobs**—not
+  **Re-run all jobs**—on the original Release publish run. Its frozen publisher
+  then verifies the now-public exact release and completes `latest`
+  reconciliation plus anonymous public smoke. Preserve the original attempt's
+  evidence before rerunning. If any authenticated input or retained byte set is
+  unavailable or conflicts, abandon this path and cut a fresh recovery-epoch
+  patch instead.
 - Never manually publish the draft to work around a failed target. That would
   bypass the complete-set guarantee.
 
@@ -398,6 +436,7 @@ for script in scripts/*.sh; do bash -n "$script"; done
 ./scripts/test-publish-release.sh
 ./scripts/test-release-workflow.sh
 ./scripts/test-release-recovery.sh
+./scripts/test-release-draft-recovery.sh
 ./scripts/test-source-release.sh
 ./scripts/test-container-manifest.sh
 ./scripts/test-container-sbom.sh
