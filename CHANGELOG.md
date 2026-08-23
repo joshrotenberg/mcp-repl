@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.4] - 2026-08-23
+
+### Bug Fixes
+
+- **release:** Expose GHCR login to final index attestations (#234)
+
+
+
 ## [0.3.3] - 2026-08-23
 
 ### Bug Fixes
