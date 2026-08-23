@@ -30,7 +30,7 @@ include = [
 # packaged. Increment this recovery value exactly once in the reviewed fix PR
 # to make that source package distinct; it has no runtime meaning.
 [package.metadata.mcp-repl]
-release-recovery-epoch = 2
+release-recovery-epoch = 3
 
 # Applies to what people download, and to `cargo install`. Symbols are 4 MB
 # of a 20 MB binary and are no use without the matching source. `"debuginfo"`

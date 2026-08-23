@@ -166,9 +166,13 @@ setup_case() {
   mkdir -p "$native_dir" "$container_dir" "$output_dir"
 
   first_archive=
+  windows_archive=
   while IFS=$'\t' read -r target archive_extension binary_name; do
     archive="$native_dir/mcp-repl-$tag-$target.$archive_extension"
     [[ -n "$first_archive" ]] || first_archive=$archive
+    if [[ $target == x86_64-pc-windows-msvc ]]; then
+      windows_archive=$archive
+    fi
     printf 'native archive for %s (%s)\n' "$target" "$binary_name" > "$archive"
     digest=$(sha256_file "$archive")
     printf '%s  %s\n' "$digest" "${archive##*/}" > "$archive.sha256"
@@ -370,6 +374,36 @@ setup_case deterministic
 run_builder
 cmp -s "$work/valid/output/release-record.json" "$output" ||
   fail "identical release inputs did not produce byte-identical records"
+
+setup_case windows_binary_classifier
+replace_json "$windows_archive.spdx.json" '
+  .packages += [{
+    SPDXID: "SPDXRef-Package-binary-mcp-repl",
+    name: "mcp-repl",
+    versionInfo: "UNKNOWN",
+    downloadLocation: "NOASSERTION",
+    filesAnalyzed: false,
+    externalRefs: [{
+      referenceCategory: "SECURITY",
+      referenceType: "cpe23Type",
+      referenceLocator: "cpe:2.3:a:mcp-repl:mcp-repl:*:*:*:*:*:*:*:*"
+    }]
+  }] |
+  .relationships += [{
+    spdxElementId: "SPDXRef-DocumentRoot",
+    relationshipType: "CONTAINS",
+    relatedSpdxElement: "SPDXRef-Package-binary-mcp-repl"
+  }]'
+write_bundle \
+  "$windows_archive.sbom.sigstore.json" \
+  "${windows_archive##*/}" \
+  "$(sha256_file "$windows_archive")" \
+  "https://spdx.dev/Document/v2.3" \
+  "$windows_archive.spdx.json"
+if ! run_builder; then
+  cat "$case_dir/stderr" >&2
+  fail "a valid same-name Windows binary classifier was rejected"
+fi
 
 setup_case shuffled_manifest
 replace_json "$container_dir/image-manifest.json" '.platforms |= reverse'
