@@ -1,0 +1,42 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+dispatch-releases = true
+# dist emits workflow-wide write access; keep its generated workflow patched so
+# only the host job can write releases and attestations.
+allow-dirty = ["ci"]
+pr-run-mode = "upload"
+installers = ["shell"]
+install-path = "CARGO_HOME"
+install-updater = false
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "x86_64-pc-windows-msvc",
+]
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+checksum = "sha256"
+source-tarball = false
+cargo-auditable = true
+cargo-cyclonedx = true
+github-attestations = true
+github-attestations-phase = "host"
+github-attestations-filters = ["*.json", "*.xml", "*.sh", "*.zip", "*.tar.gz", "*.sha256"]
+
+[dist.min-glibc-version]
+"*" = "2.34"
+
+[dist.github-action-commits]
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6"
+"actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+"swatinem/rust-cache" = "6323deb102c322ba6fcbdcafc7e3dddab59af2b6"

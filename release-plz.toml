@@ -5,14 +5,11 @@
 # Use git-cliff for changelog generation
 changelog_config = "cliff.toml"
 
-# release-plz only generates the three release files on a credential-free
-# runner. First-party workflow steps own the PR and the irreversible crates.io
-# upload after merge preflight.
-publish = false
-# Defense in depth if a release-plz release command is invoked accidentally.
+# release-plz owns the release PR, crates.io publication, and the exact tag.
+# dist consumes that tag to build and publish the native GitHub release.
+publish = true
 release_always = false
 
-# GitHub publication is deliberately first-party. These remain disabled as a
-# fail-safe if a release-plz release command is ever invoked accidentally.
+# dist owns the GitHub release and its binary assets.
 git_release_enable = false
-git_tag_enable = false
+git_tag_enable = true

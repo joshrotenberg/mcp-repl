@@ -1,20 +1,10 @@
-# release-targets.json owns every value in this pre-FROM block. The tags make
-# the inputs legible to humans; the index digests make them immutable across
-# both supported architectures.
-ARG RUST_VERSION=1.90.0
+# The index digests keep both base images immutable across architectures.
 ARG CARGO_AUDITABLE_VERSION=0.7.5
 ARG RUST_BASE=docker.io/library/rust:1.90.0-slim-bookworm@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9
 ARG RUNTIME_BASE=docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
 FROM ${RUST_BASE} AS build
 ARG CARGO_AUDITABLE_VERSION
-ARG SOURCE_DATE_EPOCH
-RUN case "$SOURCE_DATE_EPOCH" in \
-      ''|*[!0-9]*) echo 'SOURCE_DATE_EPOCH must be canonical Unix seconds' >&2; exit 1 ;; \
-    esac \
- && test "$SOURCE_DATE_EPOCH" -ge 315532800 \
- && test "$SOURCE_DATE_EPOCH" -le 4294967295
-ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 WORKDIR /src
 
 RUN cargo install --locked --version "$CARGO_AUDITABLE_VERSION" cargo-auditable \

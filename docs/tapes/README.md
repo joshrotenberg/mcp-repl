@@ -4,15 +4,18 @@ The images in the top-level README are generated from the tapes here with
 [vhs](https://github.com/charmbracelet/vhs), so they can be regenerated
 rather than re-staged by hand when the output changes.
 
-Run every recording from the repository root with one command:
+Build the release binary, then run the tapes you want from the repository root:
 
 ```bash
-./scripts/recordings.sh
+cargo build --release
+vhs docs/tapes/hero.tape
+vhs docs/tapes/describe.tape
+vhs docs/tapes/elicitation.tape
+vhs docs/tapes/scripting.tape
 ```
 
-The script checks for `cargo`, `vhs`, and `jq`, builds the release binary,
-then runs every tape in the order below. The interactive tapes call that
-binary as `./target/release/mcp-repl`. `scripting.tape` keeps the shorter
+The interactive tapes call the binary as `./target/release/mcp-repl`.
+`scripting.tape` keeps the shorter
 commands visible in its screenshot, but prepends and verifies the same binary
 inside VHS's login shell before recording anything.
 

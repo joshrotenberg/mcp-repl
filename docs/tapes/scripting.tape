@@ -1,7 +1,7 @@
 # One-shot mode: NDJSON on stdout, one value per command, for piping.
 #
 # Regenerate all README media with:
-#   ./scripts/recordings.sh
+#   cargo build --release && vhs docs/tapes/scripting.tape
 # VHS writes a frame *directory* when Output ends in .png, which would
 # collide with the Screenshot below. Send the recording to a throwaway
 # GIF and keep only the still.
