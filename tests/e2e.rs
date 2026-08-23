@@ -2769,6 +2769,62 @@ async fn exercise_generators() {
     assert_eq!(values[0]["examples"][1], "wait --timeout 30");
 }
 
+/// Explicit connection selectors reserve their positional tail for a second,
+/// surface-driven clap pass whose vocabulary mirrors the REPL.
+#[cfg(feature = "unstable-dynamic-cli")]
+async fn exercise_generated_cli() {
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "echo",
+        "--message=hello world",
+        "--repeat=2",
+    ]);
+    let output = run(command, "generated tool invocation", CASE_TIMEOUT).await;
+    assert_success(&output, "generated tool invocation");
+    let values = json_lines(&output, "generated tool invocation");
+    assert_eq!(
+        values[0].pointer("/content/0/text"),
+        Some(&serde_json::json!("hello world hello world"))
+    );
+
+    let mut command = repl_command();
+    command.args(["--demo", "--color", "never", "tool", "--help"]);
+    let output = run(command, "generated tool listing", CASE_TIMEOUT).await;
+    assert_success(&output, "generated tool listing");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("SERVER TOOLS:"), "{stdout}");
+    assert!(stdout.contains("echo"), "{stdout}");
+
+    let mut command = repl_command();
+    command.args(["--demo", "--color", "never", "echo", "--repeat=2"]);
+    let output = run(command, "generated required flag", CASE_TIMEOUT).await;
+    assert_status(&output, 2, "generated required flag");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--message <STRING>"),
+        "clap must enforce the live schema's required field"
+    );
+
+    let mut command = repl_command();
+    command.args(["--demo", "--json", "read", "note://status"]);
+    let output = run(command, "generated resource read", CASE_TIMEOUT).await;
+    assert_success(&output, "generated resource read");
+    assert_eq!(
+        json_lines(&output, "generated resource read")[0].pointer("/contents/0/text"),
+        Some(&serde_json::json!("all quiet on the demo server"))
+    );
+
+    let mut command = repl_command();
+    command.args(["--demo", "--json", "prompt", "greet", "--name=Ada"]);
+    let output = run(command, "generated prompt", CASE_TIMEOUT).await;
+    assert_success(&output, "generated prompt");
+    assert_eq!(
+        json_lines(&output, "generated prompt")[0].pointer("/messages/0/content/text"),
+        Some(&serde_json::json!("Please greet Ada warmly."))
+    );
+}
+
 /// `bind`/`binds`/`unbind`: a default value for a tool parameter, applied
 /// when a call omits it and typed from the schema rather than sent as text,
 /// an explicit argument always wins over it, and everything clears when
@@ -2949,6 +3005,8 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_generators().await;
+        #[cfg(feature = "unstable-dynamic-cli")]
+        exercise_generated_cli().await;
         exercise_connection_failure_output().await;
         exercise_initialization_timeout(&fixture, &temp).await;
         exercise_elicitation_field_order().await;

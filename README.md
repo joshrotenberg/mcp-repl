@@ -89,10 +89,56 @@ $ mcp-repl --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
 212.00
 ```
 
-**A one-shot run cannot block waiting for a person.** Under `-e`, elicitation
-and sampling both default to `decline`, so a server that asks a question gets
-an immediate refusal instead of hanging the caller. `--timeout` bounds
-everything else, and exit statuses are typed, so a tool error (3) is
+### Experimental generated CLI
+
+The `unstable-dynamic-cli` Cargo feature tries a more conventional one-shot
+form while its command grammar is evaluated. It is off by default:
+
+```bash
+cargo install mcp-repl --features unstable-dynamic-cli
+```
+
+With the feature enabled and an explicit connection selector, mcp-repl
+discovers the server first and projects the REPL's one-shot vocabulary into a
+CLI. Tool and prompt schemas become flags; resources keep the same
+`read <uri>` shape they have at the prompt:
+
+```console
+$ mcp-repl --demo echo --help
+Echo a message back
+
+Usage: mcp-repl <connection options> echo [OPTIONS] --message <STRING>
+
+Options:
+      --message <STRING>  The text to echo back.
+      --repeat <INTEGER>  How many times to repeat it.
+  -h, --help              Print help
+
+$ mcp-repl --demo convert --value=100 --from=celsius --to=fahrenheit
+212.00
+[0ms]
+
+$ mcp-repl --demo read note://status
+all quiet on the demo server
+[0ms]
+```
+
+`mcp-repl --demo tool --help` lists the generated tools; `tool <name>` and
+`builtin <name>` explicitly select the same namespaces they do in the REPL.
+The shorter bare tool name works whenever it does not collide with a built-in.
+Listings, `read`, `prompt`, `call`, `find`, `describe`, `snapshot`, and
+`validate` are also available directly.
+
+This form works with `--demo`, `--http`, and `--server`. A raw stdio child has
+no reliable boundary between its own arguments and a following command, so use
+`-e` there. `-e` also remains the way to run several commands or stateful REPL
+workflows against one session.
+
+**A one-shot run cannot block waiting for a person.** Under `-e` or an
+experimental generated command, elicitation and sampling both default to
+`decline`, so a server that asks a question gets an immediate refusal instead
+of hanging the caller. `--timeout` bounds everything else, and exit statuses
+are typed, so a tool error (3) is
 distinguishable from an empty result.
 
 See [the scripting guide](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/scripting.md)
