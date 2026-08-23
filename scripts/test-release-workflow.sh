@@ -42,27 +42,20 @@ release_workflow="$root/.github/workflows/release-binaries.yml"
 release_plz="$root/.github/workflows/release-plz.yml"
 release_publish="$root/.github/workflows/release-publish.yml"
 release_draft_recovery="$root/.github/workflows/release-draft-recovery.yml"
-release_latest_recovery="$root/.github/workflows/release-latest-recovery.yml"
 draft_recovery_verifier="$root/scripts/verify-release-draft-recovery.sh"
-latest_recovery_verifier="$root/scripts/verify-release-latest-recovery.sh"
-latest_recovery_smoke="$root/scripts/smoke-release-latest-recovery.sh"
 release_publisher="$root/scripts/publish-release.sh"
-# Normal publication and both exceptional controllers share one literal,
-# repository-wide lock. Serializing whole controllers prevents an older latest
-# recovery from racing a newer release after that release's own latest job.
+# Normal publication and draft recovery share one literal, repository-wide
+# lock. Serializing whole controllers prevents recovery from racing a newer
+# release after that release's own latest job.
 if [[ $(grep -Fc 'group: release-binaries-latest' \
         "$release_workflow") -ne 1 ||
       $(grep -Fc 'group: release-binaries-latest' \
         "$release_draft_recovery") -ne 1 ||
-      $(grep -Fc 'group: release-binaries-latest' \
-        "$release_latest_recovery") -ne 1 ||
       $(grep -Fc '  queue: max' "$release_workflow") -ne 1 ||
       $(grep -Fc '  queue: max' "$release_draft_recovery") -ne 1 ||
-      $(grep -Fc '  queue: max' "$release_latest_recovery") -ne 1 ||
       $(grep -Fc '  cancel-in-progress: false' "$release_workflow") -ne 1 ||
-      $(grep -Fc '  cancel-in-progress: false' "$release_draft_recovery") -ne 1 ||
-      $(grep -Fc '  cancel-in-progress: false' "$release_latest_recovery") -ne 1 ]]; then
-  echo "normal publication and both recovery controllers must share one queued non-cancelling repository lock" >&2
+      $(grep -Fc '  cancel-in-progress: false' "$release_draft_recovery") -ne 1 ]]; then
+  echo "normal publication and draft recovery must share one queued non-cancelling repository lock" >&2
   exit 1
 fi
 # shellcheck disable=SC2016
@@ -75,9 +68,6 @@ if ! cmp -s "$actionlint_config" <(printf '%s\n' \
   '    ignore:' \
   "      - '^unexpected key \"queue\" for \"concurrency\" section\\. expected one of \"cancel-in-progress\", \"group\"$'" \
   '  .github/workflows/release-draft-recovery.yml:' \
-  '    ignore:' \
-  "      - '^unexpected key \"queue\" for \"concurrency\" section\\. expected one of \"cancel-in-progress\", \"group\"$'" \
-  '  .github/workflows/release-latest-recovery.yml:' \
   '    ignore:' \
   "      - '^unexpected key \"queue\" for \"concurrency\" section\\. expected one of \"cancel-in-progress\", \"group\"$'"); then
   echo "the temporary actionlint queue-key exception must remain byte-exact and path-specific" >&2
@@ -219,167 +209,6 @@ if [[ -z "$draft_reauth_line" || -z "$draft_download_line" ||
       "$draft_reauth_line" -ge "$draft_download_line" ||
       "$draft_download_line" -ge "$draft_publish_line" ]]; then
   echo "draft authentication must precede artifact access and every release mutation" >&2
-  exit 1
-fi
-
-latest_preflight=$(sed -n '/^  preflight:/,/^  write_boundary:/p' \
-  "$release_latest_recovery")
-latest_write_boundary=$(sed -n '/^  write_boundary:/,/^  reconcile:/p' \
-  "$release_latest_recovery")
-latest_reconcile=$(sed -n '/^  reconcile:/,/^  public_smoke:/p' \
-  "$release_latest_recovery")
-latest_public_smoke=$(sed -n '/^  public_smoke:/,$p' \
-  "$release_latest_recovery")
-latest_preflight_permissions=$(sed -n \
-  '/^    permissions:$/,/^    outputs:$/p' <<<"$latest_preflight" | sed '$d')
-latest_write_boundary_permissions=$(sed -n \
-  '/^    permissions:$/,/^    outputs:$/p' <<<"$latest_write_boundary" | sed '$d')
-latest_reconcile_permissions=$(sed -n \
-  '/^    permissions:$/,/^    steps:$/p' <<<"$latest_reconcile" | sed '$d')
-expected_latest_preflight_permissions=$'    permissions:\n      actions: read\n      attestations: read\n      contents: read\n      pull-requests: read\n      statuses: read'
-expected_latest_write_boundary_permissions=$expected_latest_preflight_permissions
-expected_latest_reconcile_permissions=$'    permissions:\n      contents: read\n      packages: write'
-
-# The disposable latest controller accepts only one exact incident. Its
-# read-only preflight owns all GitHub evidence and attestation verification;
-# only the narrow reconcile job receives package write, and its successor is
-# an entirely credential-free public smoke.
-# shellcheck disable=SC2016
-if grep -Fq 'workflow_dispatch:' "$release_latest_recovery" ||
-  grep -Fq 'workflow_call:' "$release_latest_recovery" ||
-  grep -Fq 'gh run rerun' "$release_latest_recovery" ||
-  grep -Fq '/rerun' "$release_latest_recovery" ||
-  grep -Fq 'client_payload' "$release_latest_recovery" ||
-  grep -Fq '      contents: write' "$release_latest_recovery" ||
-  grep -Fq '      actions: write' "$release_latest_recovery" ||
-  grep -Fq '      attestations: write' "$release_latest_recovery" ||
-  grep -Fq '      id-token: write' "$release_latest_recovery" ||
-  grep -Fq 'docker/login-action@' "$release_latest_recovery" ||
-  grep -Fq 'docker/setup-buildx-action@' "$release_latest_recovery" ||
-  grep -Fq 'actions/download-artifact@' "$release_latest_recovery" ||
-  grep -Fq 'actions/upload-artifact@' "$release_latest_recovery" ||
-  grep -Fq 'oci://' "$release_latest_recovery" "$latest_recovery_verifier" ||
-  grep -Eq '^[[:space:]]+GH_TOKEN:' <<<"$latest_public_smoke" ||
-  grep -Fq 'packages: write' <<<"$latest_public_smoke" ||
-  grep -Fq 'uses: actions/checkout@' <<<"$latest_reconcile$latest_public_smoke" ||
-  [[ "$latest_preflight_permissions" != "$expected_latest_preflight_permissions" ||
-     "$latest_write_boundary_permissions" != "$expected_latest_write_boundary_permissions" ||
-     "$latest_reconcile_permissions" != "$expected_latest_reconcile_permissions" ||
-     $(grep -Fc 'permissions: {}' "$release_latest_recovery") -ne 2 ||
-     $(grep -Fc 'repository_dispatch:' "$release_latest_recovery") -ne 1 ||
-     $(grep -Fc 'types: [release_latest_recovery]' \
-       "$release_latest_recovery") -ne 1 ||
-     $(grep -Fc '      packages: write' "$release_latest_recovery") -ne 1 ||
-     $(grep -Fc 'GH_TOKEN: ${{ github.token }}' \
-       "$release_latest_recovery") -ne 3 ||
-     $(grep -Fc 'uses: actions/checkout@' "$release_latest_recovery") -ne 2 ||
-     $(grep -Fc '          persist-credentials: false' \
-       "$release_latest_recovery") -ne 2 ||
-     $(grep -Fc '          ref: ${{ github.sha }}' \
-       "$release_latest_recovery") -ne 2 ||
-     $(grep -Fc 'git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"' \
-       "$release_latest_recovery") -ne 2 ||
-     $(grep -Fc 'curl --fail --location --proto '\''=https'\'' --proto-redir '\''=https'\''' \
-       "$release_latest_recovery") -ne 4 ]]; then
-  echo "latest recovery must retain its exact read-only, packages-write, and anonymous boundaries" >&2
-  exit 1
-fi
-
-# shellcheck disable=SC1003,SC2016
-if [[ $(grep -Fc './scripts/verify-release-latest-recovery.sh \' \
-        <<<"$latest_preflight") -ne 1 ||
-      $(grep -Fc 'preflight "$GITHUB_OUTPUT"' <<<"$latest_preflight") -ne 1 ||
-      $(grep -Fc './scripts/verify-release-latest-recovery.sh write "$actual"' \
-        <<<"$latest_write_boundary") -ne 1 ||
-      $(grep -Fc 'cmp "$expected" "$actual"' \
-        <<<"$latest_write_boundary") -ne 1 ||
-      $(grep -Fc 'cat "$actual" >> "$GITHUB_OUTPUT"' \
-        <<<"$latest_write_boundary") -ne 1 ||
-      $(grep -Fc '    needs: preflight' <<<"$latest_write_boundary") -ne 1 ||
-      $(grep -Fc '    needs: write_boundary' <<<"$latest_reconcile") -ne 1 ||
-      $(grep -Fc '      - write_boundary' <<<"$latest_public_smoke") -ne 1 ||
-      $(grep -Fc '      - reconcile' <<<"$latest_public_smoke") -ne 1 ||
-      $(grep -Fc 'EXPECTED_LATEST_RELEASE_ID: 375116865' \
-        <<<"$latest_reconcile") -ne 1 ||
-      $(grep -Fc './scripts/publish-container-manifest.sh latest' \
-        <<<"$latest_reconcile") -ne 1 ||
-      $(grep -Fc './scripts/smoke-release-latest-recovery.sh' \
-        <<<"$latest_public_smoke") -ne 1 ||
-      $(grep -Fc 'test -z "${GH_TOKEN:-}"' <<<"$latest_public_smoke") -ne 1 ||
-      $(grep -Fc 'test -z "${DOCKER_AUTH_CONFIG:-}"' \
-        <<<"$latest_public_smoke") -ne 1 ||
-      $(grep -Fc 'test -z "${REGISTRY_AUTH_FILE:-}"' \
-        <<<"$latest_public_smoke") -ne 1 ||
-      $(grep -Fc 'printf '\''{}\n'\'' > "$anonymous_config/config.json"' \
-        <<<"$latest_public_smoke") -ne 1 ||
-      ! -x "$latest_recovery_verifier" || ! -x "$latest_recovery_smoke" ||
-      ! -x "$root/scripts/test-release-latest-recovery.sh" ]]; then
-  echo "latest recovery must bind the exact incident and finish with an executable credential-free smoke" >&2
-  exit 1
-fi
-
-# shellcheck disable=SC2016
-latest_cmp_line=$(grep -nF 'cmp "$expected" "$actual"' \
-  <<<"$latest_reconcile" | cut -d: -f1)
-# shellcheck disable=SC2016
-latest_attempt_guard_line=$(grep -nF 'test "$GITHUB_RUN_ATTEMPT" = 1' \
-  <<<"$latest_reconcile" | cut -d: -f1)
-latest_download_line=$(grep -nF \
-  "curl --fail --location --proto '=https' --proto-redir '=https'" \
-  <<<"$latest_reconcile" | cut -d: -f1)
-latest_trap_line=$(grep -nF 'trap cleanup EXIT' \
-  <<<"$latest_reconcile" | cut -d: -f1)
-# shellcheck disable=SC2016
-latest_login_line=$(grep -nF 'docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin' \
-  <<<"$latest_reconcile" | cut -d: -f1)
-latest_publish_line=$(grep -nF './scripts/publish-container-manifest.sh latest' \
-  <<<"$latest_reconcile" | cut -d: -f1)
-latest_cleanup_line=$(grep -nE '^[[:space:]]+cleanup$' \
-  <<<"$latest_reconcile" | cut -d: -f1)
-latest_clear_trap_line=$(grep -nF 'trap - EXIT' \
-  <<<"$latest_reconcile" | cut -d: -f1)
-if [[ ! "$latest_attempt_guard_line" =~ ^[0-9]+$ ||
-      ! "$latest_cmp_line" =~ ^[0-9]+$ ||
-      ! "$latest_download_line" =~ ^[0-9]+$ ||
-      ! "$latest_trap_line" =~ ^[0-9]+$ ||
-      ! "$latest_login_line" =~ ^[0-9]+$ ||
-      ! "$latest_publish_line" =~ ^[0-9]+$ ||
-      ! "$latest_cleanup_line" =~ ^[0-9]+$ ||
-      ! "$latest_clear_trap_line" =~ ^[0-9]+$ ||
-      "$latest_attempt_guard_line" -ge "$latest_cmp_line" ||
-      "$latest_cmp_line" -ge "$latest_download_line" ||
-      "$latest_download_line" -ge "$latest_trap_line" ||
-      "$latest_trap_line" -ge "$latest_login_line" ||
-      "$latest_login_line" -ge "$latest_publish_line" ||
-      "$latest_publish_line" -ge "$latest_cleanup_line" ||
-      "$latest_cleanup_line" -ge "$latest_clear_trap_line" ]] ||
-   grep -Fq 'trap cleanup EXIT INT TERM' <<<"$latest_reconcile"; then
-  echo "latest recovery must reject reruns, compare trusted outputs before login, and clear credentials after its one write" >&2
-  exit 1
-fi
-
-# shellcheck disable=SC1003,SC2016
-if [[ $(grep -Fc 'expected_release_id=375116865' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc 'expected_tag_object_sha=9a010344d30295cd74c558b1f20877fe719dda39' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc 'expected_record_asset_id=525939539' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc 'select(($assets | length) == 39)' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc '.content_type == "application/octet-stream" and .label == ""' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc -- '--signer-digest "$release_merge_sha"' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc '.github/workflows/release-binaries.yml | \' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc 'scripts/test-release-targets.sh | \' \
-        "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc '/releases/assets/${expected_record_asset_id}' \
-        "$latest_recovery_smoke") -ne 1 ||
-      $(grep -Fc -- "--proto '=https' --proto-redir '=https'" \
-        "$latest_recovery_smoke") -ne 2 ]]; then
-  echo "latest recovery authentication must remain pinned to the complete public v0.3.5 identity" >&2
   exit 1
 fi
 

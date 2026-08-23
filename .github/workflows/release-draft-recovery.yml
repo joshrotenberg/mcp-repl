@@ -12,8 +12,7 @@ on:
 permissions: {}
 
 concurrency:
-  # Share the repository-wide mutable-release lock with normal publication and
-  # the latest-only recovery controller.
+  # Share the repository-wide mutable-release lock with normal publication.
   group: release-binaries-latest
   queue: max
   cancel-in-progress: false
