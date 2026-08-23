@@ -407,7 +407,11 @@ jobs:
           fi
           buildx_release=${BUILDX_ASSET#buildx-}
           buildx_version=${buildx_release%%.linux-*}
-          docker_config="$RUNNER_TEMP/docker-config"
+          # Pinned actions/attest resolves OCI credentials only from
+          # os.homedir()/.docker/config.json. Keep this credential-bearing
+          # ephemeral job on that same path so the successful login below is
+          # visible to both Docker/Buildx and the attestation client.
+          docker_config="$HOME/.docker"
           plugin="$docker_config/cli-plugins/docker-buildx"
           mkdir -p "${plugin%/*}"
           curl --fail --location --proto '=https' --tlsv1.2 \
@@ -436,6 +440,18 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify OCI attestation credential path
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$DOCKER_CONFIG" != "$HOME/.docker" ]]; then
+            echo "actions/attest requires Docker's default credential path" >&2
+            exit 1
+          fi
+          jq -e '.auths["ghcr.io"].auth |
+            select(type == "string" and length > 0)' \
+            "$DOCKER_CONFIG/config.json" > /dev/null
 
       - name: Stage the exact multi-platform index
         id: identity

@@ -252,6 +252,73 @@ if [[ $(grep -Fc '      contents: read' <<<"$release_container_job") -ne 1 ||
   exit 1
 fi
 
+# Pinned actions/attest ignores DOCKER_CONFIG when it resolves OCI credentials
+# and reads os.homedir()/.docker/config.json directly. The credential-bearing
+# index job must therefore install Buildx and log in under Docker's matching
+# default path; every other release job can retain its isolated temp config.
+container_manifest_job=$(sed -n '/^  container_manifest:/,/^  staging_smoke:/p' \
+  "$release_workflow")
+container_manifest_permissions=$(sed -n \
+  '/^    permissions:/,/^    outputs:/p' <<<"$container_manifest_job")
+# shellcheck disable=SC2016
+if [[ $(grep -Fc 'docker_config="$HOME/.docker"' \
+        <<<"$container_manifest_job") -ne 1 ||
+      $(grep -Fc 'docker/login-action@' <<<"$container_manifest_job") -ne 1 ||
+      $(grep -Fc -- '- name: Verify OCI attestation credential path' \
+        <<<"$container_manifest_job") -ne 1 ||
+      $(grep -Fc '[[ "$DOCKER_CONFIG" != "$HOME/.docker" ]]' \
+        <<<"$container_manifest_job") -ne 1 ||
+      $(grep -Fc '.auths["ghcr.io"].auth' \
+        <<<"$container_manifest_job") -ne 1 ||
+      $(grep -Fc '          push-to-registry: true' \
+        <<<"$container_manifest_job") -ne 2 ]] ||
+  grep -Fq 'docker_config="$RUNNER_TEMP/docker-config"' \
+    <<<"$container_manifest_job"; then
+  echo "container index attestations must share Docker's default GHCR credentials" >&2
+  exit 1
+fi
+if [[ $(grep -Ec '^      [a-z-]+: (read|write)$' \
+        <<<"$container_manifest_permissions") -ne 5 ||
+      $(grep -Fc '      actions: read' \
+        <<<"$container_manifest_permissions") -ne 1 ||
+      $(grep -Fc '      attestations: write' \
+        <<<"$container_manifest_permissions") -ne 1 ||
+      $(grep -Fc '      contents: read' \
+        <<<"$container_manifest_permissions") -ne 1 ||
+      $(grep -Fc '      id-token: write' \
+        <<<"$container_manifest_permissions") -ne 1 ||
+      $(grep -Fc '      packages: write' \
+        <<<"$container_manifest_permissions") -ne 1 ]]; then
+  echo "container index assembly must retain its exact least-privilege boundary" >&2
+  exit 1
+fi
+manifest_login_line=$(grep -Fn -- \
+  '- name: Log in for content-addressed index and OCI attestations' \
+  <<<"$container_manifest_job" | cut -d: -f1)
+manifest_credential_line=$(grep -Fn -- \
+  '- name: Verify OCI attestation credential path' \
+  <<<"$container_manifest_job" | cut -d: -f1)
+manifest_stage_line=$(grep -Fn -- '- name: Stage the exact multi-platform index' \
+  <<<"$container_manifest_job" | cut -d: -f1)
+manifest_provenance_line=$(grep -Fn -- \
+  '- name: Attest the final container index provenance' \
+  <<<"$container_manifest_job" | cut -d: -f1)
+manifest_sbom_line=$(grep -Fn -- \
+  '- name: Attest the final container index SBOM' \
+  <<<"$container_manifest_job" | cut -d: -f1)
+if [[ ! "$manifest_login_line" =~ ^[0-9]+$ ||
+      ! "$manifest_credential_line" =~ ^[0-9]+$ ||
+      ! "$manifest_stage_line" =~ ^[0-9]+$ ||
+      ! "$manifest_provenance_line" =~ ^[0-9]+$ ||
+      ! "$manifest_sbom_line" =~ ^[0-9]+$ ||
+      "$manifest_login_line" -ge "$manifest_credential_line" ||
+      "$manifest_credential_line" -ge "$manifest_stage_line" ||
+      "$manifest_stage_line" -ge "$manifest_provenance_line" ||
+      "$manifest_provenance_line" -ge "$manifest_sbom_line" ]]; then
+  echo "container index credentials must precede staging and both attestations" >&2
+  exit 1
+fi
+
 touch_line=$(grep -Fn 'touch src/main.rs src/lib.rs' "$release_build" | cut -d: -f1)
 # These single-quoted patterns intentionally match literal workflow variables.
 # shellcheck disable=SC2016
