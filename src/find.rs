@@ -298,23 +298,23 @@ fn search_matching(
         }
     };
 
-    for t in &surface.tools {
+    for t in surface.tools() {
         push(Kind::Tool, &t.name, t.description.as_deref().unwrap_or(""));
     }
-    for p in &surface.prompts {
+    for p in surface.prompts() {
         push(
             Kind::Prompt,
             &p.name,
             p.description.as_deref().unwrap_or(""),
         );
     }
-    for r in &surface.resources {
+    for r in surface.resources() {
         // A resource is read by URI, so that is the typed name; its own name
         // reads as description when it has none of its own.
         let description = r.description.clone().unwrap_or_else(|| r.name.clone());
         push(Kind::Resource, &r.uri, &description);
     }
-    for t in &surface.templates {
+    for t in surface.templates() {
         let description = t.description.clone().unwrap_or_else(|| t.name.clone());
         push(Kind::Template, &t.uri_template, &description);
     }
@@ -398,8 +398,8 @@ pub fn did_you_mean(surface: &Surface, word: &str) -> Option<String> {
     let candidates = BUILTINS
         .iter()
         .map(|builtin| builtin.name.to_string())
-        .chain(surface.tools.iter().map(|t| t.name.clone()))
-        .chain(surface.prompts.iter().map(|p| p.name.clone()));
+        .chain(surface.tools().iter().map(|t| t.name.clone()))
+        .chain(surface.prompts().iter().map(|p| p.name.clone()));
 
     let mut best: Option<(usize, String)> = None;
     for candidate in candidates {
@@ -446,28 +446,28 @@ mod tests {
     }
 
     fn surface() -> Surface {
-        Surface {
-            tools: vec![
+        Surface::new(
+            vec![
                 tool("get_downloads", "Get download statistics"),
                 tool("get_version_downloads", "Daily stats for one version"),
                 tool("search_crates", "Find crates by name or keywords"),
                 tool("get_owners", "Crate owners and maintainers"),
             ],
-            prompts: vec![
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "name": "analyze_crate",
                     "description": "Comprehensive crate analysis",
                 }))
                 .unwrap(),
             ],
-            resources: vec![
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "uri": "crates://serde/readme",
                     "name": "serde readme",
                 }))
                 .unwrap(),
             ],
-            templates: vec![
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "uriTemplate": "crates://{name}/info",
                     "name": "crate info",
@@ -475,8 +475,8 @@ mod tests {
                 }))
                 .unwrap(),
             ],
-            unavailable: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     /// A regex search, the way `find -E` runs one.
@@ -757,7 +757,7 @@ mod tests {
     fn a_name_past_the_cap_is_never_suggested() {
         let mut s = surface();
         let long_name = "n".repeat(MAX_COMPARE + 1);
-        s.tools.push(
+        s.tools_mut().push(
             serde_json::from_value(serde_json::json!({
                 "name": long_name,
                 "description": "a name no server should have",
@@ -778,7 +778,7 @@ mod tests {
     fn a_surface_of_huge_names_does_not_stall_a_suggestion() {
         let mut s = surface();
         for i in 0..200 {
-            s.tools.push(
+            s.tools_mut().push(
                 serde_json::from_value(serde_json::json!({
                     "name": format!("{}{i}", "n".repeat(16 * 1024)),
                     "description": "a name no server should have",

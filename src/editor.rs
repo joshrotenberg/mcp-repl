@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::session::Session;
 use nu_ansi_term::{Color, Style};
 use reedline::{
     ColumnarMenu, Completer, DefaultHinter, Emacs, ExternalPrinter, FileBackedHistory, Highlighter,
@@ -20,13 +21,10 @@ use reedline::{
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
     Suggestion, ValidationResult, Validator, default_emacs_keybindings,
 };
-use tower_mcp::protocol::ToolDefinition;
-
-use crate::session::Session;
 
 use crate::alias::Aliases;
 use crate::style;
-use crate::{BUILTINS, Surface};
+use crate::{BUILTINS, Surface, command_set::CommandSet};
 
 const MENU_NAME: &str = "completion_menu";
 
@@ -127,39 +125,6 @@ pub struct ReplCompleter {
 /// server-supplied names, descriptions, and `completion/complete` values, so
 /// this is where control sequences are neutralized before reedline paints
 /// them into the menu.
-/// Follow a local `$ref` to the definition it names.
-///
-/// Schema generators split named types out into `$defs` and leave a `$ref`
-/// behind, so a Rust or Python server describing an enum argument sends
-/// `{"$ref": "#/$defs/Scale"}` rather than the values inline. Without this,
-/// completion works only for servers that happen to inline everything.
-///
-/// Only same-document refs are followed: this runs while the user is typing,
-/// and fetching a remote schema is neither fast nor safe. A ref that does not
-/// resolve yields the original schema, so an unusual shape degrades to no
-/// completion rather than a wrong one.
-pub(crate) fn resolve_ref<'a>(
-    root: &'a serde_json::Value,
-    schema: &'a serde_json::Value,
-) -> &'a serde_json::Value {
-    let Some(reference) = schema.get("$ref").and_then(|r| r.as_str()) else {
-        return schema;
-    };
-    let Some(path) = reference.strip_prefix("#/") else {
-        return schema;
-    };
-    let mut current = root;
-    for segment in path.split('/') {
-        // JSON Pointer escapes, in the order the spec requires.
-        let segment = segment.replace("~1", "/").replace("~0", "~");
-        match current.get(&segment) {
-            Some(next) => current = next,
-            None => return schema,
-        }
-    }
-    current
-}
-
 fn suggestion(value: impl Into<String>, description: Option<String>, span: Span) -> Suggestion {
     Suggestion {
         value: crate::untrusted::sanitize(&value.into()).into_owned(),
@@ -261,34 +226,39 @@ impl ReplCompleter {
     /// Completions for `read <partial>`: literal resource URIs, template
     /// URI templates, and server-completed template variables when the
     /// partial has reached a template's `{variable}`.
-    fn complete_resource_word(&self, surface: &Surface, word: &str, span: Span) -> Vec<Suggestion> {
+    fn complete_resource_word(
+        &self,
+        commands: &CommandSet,
+        word: &str,
+        span: Span,
+    ) -> Vec<Suggestion> {
         let mut out = Vec::new();
-        for r in &surface.resources {
+        for r in &commands.resources {
             if r.uri.starts_with(word) {
                 out.push(word_suggestion(&r.uri, Some(r.name.clone()), span));
             }
         }
-        for t in &surface.templates {
-            if t.uri_template.starts_with(word) {
-                out.push(suggestion(&t.uri_template, Some(t.name.clone()), span));
+        for t in &commands.templates {
+            if t.uri.starts_with(word) {
+                out.push(suggestion(&t.uri, Some(t.name.clone()), span));
             }
             // Template variable completion: `file:///{path}` with word
             // `file:///src/` asks the server to complete `path` = `src/`.
-            let Some(open) = t.uri_template.find('{') else {
+            let Some(open) = t.uri.find('{') else {
                 continue;
             };
-            let Some(close_rel) = t.uri_template[open..].find('}') else {
+            let Some(close_rel) = t.uri[open..].find('}') else {
                 continue;
             };
             let close = open + close_rel;
-            let static_prefix = &t.uri_template[..open];
+            let static_prefix = &t.uri[..open];
             if word.len() < static_prefix.len() || !word.starts_with(static_prefix) {
                 continue;
             }
-            let var = &t.uri_template[open + 1..close];
-            let suffix = &t.uri_template[close + 1..];
+            let var = &t.uri[open + 1..close];
+            let suffix = &t.uri[close + 1..];
             let partial_value = &word[static_prefix.len()..];
-            for v in self.complete_template_var_via_server(&t.uri_template, var, partial_value) {
+            for v in self.complete_template_var_via_server(&t.uri, var, partial_value) {
                 let mut full = format!("{static_prefix}{v}");
                 if !suffix.contains('{') {
                     full.push_str(suffix);
@@ -302,87 +272,56 @@ impl ReplCompleter {
     /// Completions for a word in a tool's argument list: argument names from
     /// the tool's `inputSchema` properties, and enum values after `=`.
     fn complete_tool_arg_word(
-        surface: &Surface,
+        commands: &CommandSet,
         tool_name: &str,
         word: &str,
         span: Span,
     ) -> Vec<Suggestion> {
         let mut out = Vec::new();
-        let Some(tool) = surface.tools.iter().find(|t| t.name == tool_name) else {
-            return out;
-        };
-        let Some(props) = tool
-            .input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-        else {
+        let Some(tool) = commands.tool(tool_name) else {
             return out;
         };
         if let Some((arg_name, partial)) = word.split_once('=') {
-            // Enum values from the property schema, when declared.
-            if let Some(values) = props
-                .get(arg_name)
-                .map(|schema| resolve_ref(&tool.input_schema, schema))
-                .and_then(|s| s.get("enum").cloned())
-                .as_ref()
-                .and_then(|e| e.as_array())
-            {
-                for v in values {
-                    if let Some(v) = v.as_str()
-                        && v.starts_with(partial)
-                    {
-                        out.push(word_suggestion(format!("{arg_name}={v}"), None, span));
+            if let Some(argument) = tool.argument(arg_name) {
+                for choice in &argument.choices {
+                    if choice.starts_with(partial) {
+                        out.push(word_suggestion(format!("{arg_name}={choice}"), None, span));
                     }
                 }
             }
             return out;
         }
-        let required: Vec<&str> = tool
-            .input_schema
-            .get("required")
-            .and_then(|r| r.as_array())
-            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        for (key, prop) in props {
-            if !key.starts_with(word) {
+        for argument in &tool.arguments {
+            if !argument.name.starts_with(word) {
                 continue;
             }
-            // The description stays on the property (a `$ref` sibling keeps
-            // it), but the type lives in the definition it points at.
-            let target = resolve_ref(&tool.input_schema, prop);
-            let ty = target.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let desc = prop
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
-            let req = if required.contains(&key.as_str()) {
-                "required "
-            } else {
-                ""
-            };
-            let full = format!("{req}{ty} {desc}");
+            let req = if argument.required { "required " } else { "" };
+            let full = format!(
+                "{req}{} {}",
+                argument.value_type.as_deref().unwrap_or(""),
+                argument.description.as_deref().unwrap_or("")
+            );
             let full = full.trim();
             let desc = (!full.is_empty()).then(|| full.to_string());
-            out.push(suggestion(format!("{key}="), desc, span));
+            out.push(suggestion(format!("{}=", argument.name), desc, span));
         }
         out
     }
 
-    fn tool_description(tool: &ToolDefinition) -> Option<String> {
-        let tags = crate::tool_tags(tool);
-        match (tool.description.as_deref(), tags.is_empty()) {
+    fn tool_description(tool: &crate::command_set::CommandSpec) -> Option<String> {
+        match (tool.description.as_deref(), tool.tags.is_empty()) {
             (_, false) => Some(format!(
                 "{}{}[{}]",
                 tool.description.as_deref().unwrap_or(""),
                 if tool.description.is_some() { "  " } else { "" },
-                tags.join(" ")
+                tool.tags.join(" ")
             )),
             (description, true) => description.map(str::to_string),
         }
     }
 
-    fn complete_tool_name_word(surface: &Surface, word: &str, span: Span) -> Vec<Suggestion> {
-        surface
+    fn complete_tool_name_word(commands: &CommandSet, word: &str, span: Span) -> Vec<Suggestion> {
+        commands
             .tools
             .iter()
             .filter(|tool| tool.name.starts_with(word))
@@ -400,6 +339,7 @@ impl ReplCompleter {
 
     fn complete_command_word(
         surface: &Surface,
+        commands: &CommandSet,
         aliases: &Aliases,
         word: &str,
         span: Span,
@@ -428,7 +368,7 @@ impl ReplCompleter {
         }
         // A colliding bare spelling is represented once above as ambiguous,
         // rather than twice as though either duplicate would be runnable.
-        for tool in &surface.tools {
+        for tool in &commands.tools {
             if tool.name.starts_with(word) && !crate::is_builtin(&tool.name) {
                 out.push(word_suggestion(
                     &tool.name,
@@ -441,44 +381,40 @@ impl ReplCompleter {
     }
 
     /// Completions for `describe <name>`: every named thing on the surface.
-    fn complete_describe_word(surface: &Surface, word: &str, span: Span) -> Vec<Suggestion> {
+    fn complete_describe_word(commands: &CommandSet, word: &str, span: Span) -> Vec<Suggestion> {
         let mut out = Vec::new();
-        for t in &surface.tools {
+        for t in &commands.tools {
             if t.name.starts_with(word) {
                 out.push(word_suggestion(&t.name, Some("tool".to_string()), span));
             }
         }
-        for p in &surface.prompts {
+        for p in &commands.prompts {
             if p.name.starts_with(word) {
                 out.push(word_suggestion(&p.name, Some("prompt".to_string()), span));
             }
         }
-        for r in &surface.resources {
+        for r in &commands.resources {
             if r.uri.starts_with(word) {
                 out.push(word_suggestion(&r.uri, Some("resource".to_string()), span));
             }
         }
-        for t in &surface.templates {
-            if t.uri_template.starts_with(word) {
-                out.push(word_suggestion(
-                    &t.uri_template,
-                    Some("template".to_string()),
-                    span,
-                ));
+        for t in &commands.templates {
+            if t.uri.starts_with(word) {
+                out.push(word_suggestion(&t.uri, Some("template".to_string()), span));
             }
         }
         for builtin in BUILTINS.iter() {
             let (name, description) = (builtin.name, builtin.summary);
-            let already_named = surface.tools.iter().any(|tool| tool.name == *name)
-                || surface.prompts.iter().any(|prompt| prompt.name == *name)
-                || surface
+            let already_named = commands.tools.iter().any(|tool| tool.name == *name)
+                || commands.prompts.iter().any(|prompt| prompt.name == *name)
+                || commands
                     .resources
                     .iter()
                     .any(|resource| resource.name == *name || resource.uri == *name)
-                || surface
+                || commands
                     .templates
                     .iter()
-                    .any(|template| template.name == *name || template.uri_template == *name);
+                    .any(|template| template.name == *name || template.uri == *name);
             if name.starts_with(word) && !already_named {
                 out.push(word_suggestion(
                     name,
@@ -500,6 +436,7 @@ impl Completer for ReplCompleter {
         };
         let span = Span::new(word_start, pos);
         let surface = self.surface.read().unwrap();
+        let commands = surface.commands();
         let mut out: Vec<Suggestion> = Vec::new();
 
         let first = head.split_whitespace().next().unwrap_or("");
@@ -509,6 +446,7 @@ impl Completer for ReplCompleter {
             // First word: built-ins, every alias, and every tool name.
             out.extend(Self::complete_command_word(
                 &surface,
+                commands,
                 &self.aliases.read().unwrap(),
                 word,
                 span,
@@ -529,10 +467,10 @@ impl Completer for ReplCompleter {
                 let words = head.split_whitespace().count();
                 let naming_tool = words == 1 || (words == 2 && !head.ends_with(' '));
                 if naming_tool {
-                    out.extend(Self::complete_tool_name_word(&surface, word, span));
+                    out.extend(Self::complete_tool_name_word(commands, word, span));
                 } else if let Some(tool_name) = head.split_whitespace().nth(1) {
                     out.extend(Self::complete_tool_arg_word(
-                        &surface, tool_name, word, span,
+                        commands, tool_name, word, span,
                     ));
                 }
             }
@@ -576,7 +514,7 @@ impl Completer for ReplCompleter {
                 }
             }
             "read" | "subscribe" => {
-                out.extend(self.complete_resource_word(&surface, word, span));
+                out.extend(self.complete_resource_word(commands, word, span));
             }
             // Only what is actually subscribed can be unsubscribed.
             "unsubscribe" => {
@@ -626,7 +564,7 @@ impl Completer for ReplCompleter {
                 }
             }
             "describe" | "snapshot" => {
-                out.extend(Self::complete_describe_word(&surface, word, span));
+                out.extend(Self::complete_describe_word(commands, word, span));
             }
             "unalias" => {
                 for entry in self.aliases.read().unwrap().entries() {
@@ -644,7 +582,7 @@ impl Completer for ReplCompleter {
                 let second_word = words == 2 && !head.ends_with(' ');
                 let naming_prompt = second_word || words == 1;
                 if naming_prompt {
-                    for p in &surface.prompts {
+                    for p in &commands.prompts {
                         if p.name.starts_with(word) {
                             out.push(word_suggestion(&p.name, p.description.clone(), span));
                         }
@@ -656,7 +594,7 @@ impl Completer for ReplCompleter {
                         {
                             out.push(word_suggestion(format!("{arg_name}={v}"), None, span));
                         }
-                    } else if let Some(p) = surface.prompts.iter().find(|p| p.name == prompt_name) {
+                    } else if let Some(p) = commands.prompt(prompt_name) {
                         // Argument name: from the prompt definition.
                         for a in &p.arguments {
                             if a.name.starts_with(word) {
@@ -673,7 +611,7 @@ impl Completer for ReplCompleter {
                 }
             }
             "call" => {
-                for t in &surface.tools {
+                for t in &commands.tools {
                     if t.name.starts_with(word) {
                         out.push(word_suggestion(&t.name, t.description.clone(), span));
                     }
@@ -692,20 +630,20 @@ impl Completer for ReplCompleter {
                         }
                     }
                 } else if naming_tool {
-                    for t in &surface.tools {
+                    for t in &commands.tools {
                         if t.name.starts_with(word) {
                             out.push(word_suggestion(&t.name, t.description.clone(), span));
                         }
                     }
                 } else if let Some(tool_name) = head.split_whitespace().nth(1) {
                     out.extend(Self::complete_tool_arg_word(
-                        &surface, tool_name, word, span,
+                        commands, tool_name, word, span,
                     ));
                 }
             }
             tool_name => {
                 out.extend(Self::complete_tool_arg_word(
-                    &surface, tool_name, word, span,
+                    commands, tool_name, word, span,
                 ));
             }
         }
@@ -747,13 +685,13 @@ impl ReplHighlighter {
             return Style::new().fg(Color::Cyan).bold();
         }
         let surface = self.surface.read().unwrap();
-        if surface.tools.iter().any(|t| t.name == word) {
+        if surface.tools().iter().any(|t| t.name == word) {
             return Style::new().fg(Color::Green).bold();
         }
         // Prefix of something completable: neutral while typing.
         let is_prefix = BUILTINS.any_starts_with(word)
             || aliases.entries().iter().any(|e| e.name.starts_with(word))
-            || surface.tools.iter().any(|t| t.name.starts_with(word));
+            || surface.tools().iter().any(|t| t.name.starts_with(word));
         if is_prefix {
             Style::new()
         } else {
@@ -767,7 +705,11 @@ impl ReplHighlighter {
                 let surface = self.surface.read().unwrap();
                 if crate::is_tool(&surface, word) {
                     Style::new().fg(Color::Green).bold()
-                } else if surface.tools.iter().any(|tool| tool.name.starts_with(word)) {
+                } else if surface
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.name.starts_with(word))
+                {
                     Style::new()
                 } else {
                     Style::new().fg(Color::Red)
@@ -1137,13 +1079,14 @@ fn run_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_set::resolve_ref;
     use crate::directories::{Directories, Platform};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
     fn surface_with_colliding_wait() -> Surface {
-        Surface {
-            tools: vec![
+        Surface::new(
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "name": "wait",
                     "description": "Wait on the server",
@@ -1154,8 +1097,11 @@ mod tests {
                 }))
                 .expect("tool definition"),
             ],
-            ..Default::default()
-        }
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     /// A schema shaped the way a generator emits one: named types hoisted
@@ -1174,8 +1120,8 @@ mod tests {
     }
 
     fn surface_for_editor_paths() -> Surface {
-        Surface {
-            tools: vec![
+        Surface::new(
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "name": "convert",
                     "description": "Convert safely\u{001b}]52;c;hostile\u{0007}",
@@ -1183,7 +1129,7 @@ mod tests {
                 }))
                 .expect("tool definition"),
             ],
-            prompts: vec![
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "name": "greet",
                     "description": "Generate a greeting",
@@ -1191,22 +1137,22 @@ mod tests {
                 }))
                 .expect("prompt definition"),
             ],
-            resources: vec![
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "uri": "note://status",
                     "name": "Status",
                 }))
                 .expect("resource definition"),
             ],
-            templates: vec![
+            vec![
                 serde_json::from_value(serde_json::json!({
                     "uriTemplate": "note://{name}",
                     "name": "Notes",
                 }))
                 .expect("resource template definition"),
             ],
-            ..Default::default()
-        }
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -1269,7 +1215,8 @@ mod tests {
     #[test]
     fn tool_argument_completion_is_schema_driven_and_sanitized() {
         let surface = surface_for_editor_paths();
-        let names = ReplCompleter::complete_tool_arg_word(&surface, "convert", "", Span::new(8, 8));
+        let commands = surface.commands();
+        let names = ReplCompleter::complete_tool_arg_word(commands, "convert", "", Span::new(8, 8));
         let to = names
             .iter()
             .find(|suggestion| suggestion.value == "to=")
@@ -1278,7 +1225,7 @@ mod tests {
         assert!(!to.append_whitespace, "a value still belongs after `=`");
 
         let values =
-            ReplCompleter::complete_tool_arg_word(&surface, "convert", "to=f", Span::new(8, 12));
+            ReplCompleter::complete_tool_arg_word(commands, "convert", "to=f", Span::new(8, 12));
         assert_eq!(
             values
                 .iter()
@@ -1288,7 +1235,8 @@ mod tests {
         );
         assert!(values[0].append_whitespace);
 
-        let tools = ReplCompleter::complete_tool_name_word(&surface, "con", Span::new(0, 3));
+        let commands = surface.commands();
+        let tools = ReplCompleter::complete_tool_name_word(commands, "con", Span::new(0, 3));
         let description = tools[0].description.as_deref().unwrap_or_default();
         assert!(!description.contains('\u{1b}'), "{description:?}");
         assert!(description.contains('\u{fffd}'), "{description:?}");
@@ -1304,8 +1252,9 @@ mod tests {
             ("note://{", "note://{name}", "template"),
             ("hel", "help", "built-in"),
         ] {
+            let commands = surface.commands();
             let suggestions =
-                ReplCompleter::complete_describe_word(&surface, partial, Span::new(0, 0));
+                ReplCompleter::complete_describe_word(commands, partial, Span::new(0, 0));
             let found = suggestions
                 .iter()
                 .find(|suggestion| suggestion.value == expected)
@@ -1468,8 +1417,14 @@ fourth
     fn a_colliding_command_completion_is_truthful_and_not_duplicated() {
         let surface = surface_with_colliding_wait();
         let aliases = Aliases::default();
-        let suggestions =
-            ReplCompleter::complete_command_word(&surface, &aliases, "wai", Span::new(0, 3));
+        let commands = surface.commands();
+        let suggestions = ReplCompleter::complete_command_word(
+            &surface,
+            commands,
+            &aliases,
+            "wai",
+            Span::new(0, 3),
+        );
         assert_eq!(
             suggestions
                 .iter()
@@ -1489,7 +1444,8 @@ fourth
     #[test]
     fn both_explicit_namespaces_complete_their_own_names() {
         let surface = surface_with_colliding_wait();
-        let tools = ReplCompleter::complete_tool_name_word(&surface, "wai", Span::new(5, 8));
+        let commands = surface.commands();
+        let tools = ReplCompleter::complete_tool_name_word(commands, "wai", Span::new(5, 8));
         assert!(tools.iter().any(|suggestion| suggestion.value == "wait"));
 
         let builtins = ReplCompleter::complete_builtin_name_word("wai", Span::new(8, 11));

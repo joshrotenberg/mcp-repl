@@ -46,6 +46,7 @@ mod bench;
 mod bind;
 mod builtin;
 mod command;
+mod command_set;
 pub mod config;
 mod connection_auth;
 mod directories;
@@ -81,6 +82,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+pub(crate) use command_set::{Surface, tool_tags};
 use connection_auth::{
     raw_header_is_authorization, selected_oauth_profile, validate_bearer_fd_exclusive,
     validate_profile_bearer_fd_exclusive,
@@ -95,9 +97,8 @@ use tower_mcp::client::{
     OAuthScopeEscalationConfig, StdioClientTransport,
 };
 use tower_mcp::protocol::{
-    Content, DiscoverResult, Implementation, InitializeResult, LogLevel, PromptDefinition,
-    ResourceDefinition, ResourceTemplateDefinition, ServerCapabilities, SubscriptionFilter,
-    TaskObject, ToolDefinition,
+    Content, DiscoverResult, Implementation, InitializeResult, LogLevel, ServerCapabilities,
+    SubscriptionFilter, TaskObject, ToolDefinition,
 };
 use tower_mcp::{ProtocolSupport, ProtocolSupportError};
 
@@ -602,30 +603,6 @@ fn exit_with_error(status: ExitStatus, message: &str) -> ! {
     std::process::exit(status.code());
 }
 
-/// The server surface the REPL turns into commands. Refreshed on connect
-/// and whenever a list_changed notification arrives.
-#[derive(Default)]
-pub(crate) struct Surface {
-    pub tools: Vec<ToolDefinition>,
-    pub prompts: Vec<PromptDefinition>,
-    pub resources: Vec<ResourceDefinition>,
-    pub templates: Vec<ResourceTemplateDefinition>,
-    /// Parts whose listing failed, by the name the commands use.
-    ///
-    /// An empty vector is not the same fact as a failed read, and without
-    /// this the two are indistinguishable: a server whose `tools/list` could
-    /// not be parsed looked exactly like a server with no tools, so `tools`
-    /// printed nothing and the run reported success.
-    pub unavailable: Vec<&'static str>,
-}
-
-impl Surface {
-    /// Whether a named part failed to load rather than coming back empty.
-    pub fn is_unavailable(&self, what: &str) -> bool {
-        self.unavailable.contains(&what)
-    }
-}
-
 /// Every command the REPL provides itself.
 ///
 /// One record per command: the completion menu and `find` read the
@@ -1087,7 +1064,7 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 }
 
 pub(crate) fn is_tool(surface: &Surface, name: &str) -> bool {
-    surface.tools.iter().any(|tool| tool.name == name)
+    surface.tools().iter().any(|tool| tool.name == name)
 }
 
 pub(crate) fn is_ambiguous_command(surface: &Surface, name: &str) -> bool {
@@ -1588,13 +1565,13 @@ fn note_truncation(shown: usize, total: usize, full: &str) {
 /// so a large surface does not flood the screen. The full list is always
 /// available via `tools`.
 fn print_tool_overview(surface: &Surface) {
-    if surface.tools.is_empty() {
+    if surface.tools().is_empty() {
         return;
     }
     // Half the window: the banner shares the first screen with the counts,
     // the hint line, and the prompt.
-    let cap = listing_limit().map_or(surface.tools.len(), |rows| (rows / 2).max(5));
-    for t in surface.tools.iter().take(cap) {
+    let cap = listing_limit().map_or(surface.tools().len(), |rows| (rows / 2).max(5));
+    for t in surface.tools().iter().take(cap) {
         println!(
             "{} {}{}",
             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
@@ -1602,12 +1579,12 @@ fn print_tool_overview(surface: &Surface) {
             tool_tag_suffix(t)
         );
     }
-    if surface.tools.len() > cap {
+    if surface.tools().len() > cap {
         println!(
             "{}",
             paint(
                 Style::new().dimmed(),
-                &format!("... +{} more, type `tools`", surface.tools.len() - cap)
+                &format!("... +{} more, type `tools`", surface.tools().len() - cap)
             )
         );
     }
@@ -1670,10 +1647,10 @@ fn print_find(surface: &Surface, query: &find::Query, output: &vars::Output) {
 fn print_counts(surface: &Surface) {
     println!(
         "{}, {}, {}, {}. Type `help`.",
-        plural(surface.tools.len(), "tool"),
-        plural(surface.prompts.len(), "prompt"),
-        plural(surface.resources.len(), "resource"),
-        plural(surface.templates.len(), "template")
+        plural(surface.tools().len(), "tool"),
+        plural(surface.prompts().len(), "prompt"),
+        plural(surface.resources().len(), "resource"),
+        plural(surface.templates().len(), "template")
     );
     if let Some(note) = collision_note(surface) {
         println!("{}", paint(Style::new().dimmed(), &note));
@@ -1696,7 +1673,7 @@ fn print_counts(surface: &Surface) {
 /// server-supplied string the banner prints.
 fn collision_note(surface: &Surface) -> Option<String> {
     let shadowed: Vec<String> = surface
-        .tools
+        .tools()
         .iter()
         .filter(|tool| is_builtin(&tool.name))
         .map(|tool| sanitize(&tool.name).into_owned())
@@ -1947,13 +1924,13 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
         not_initialized: false,
         unavailable: Vec::new(),
     };
-    let surface = Surface {
-        tools: take("tools", tools, &mut at),
-        prompts: take("prompts", prompts, &mut at),
-        resources: take("resources", resources, &mut at),
-        templates: take("resource templates", templates, &mut at),
-        unavailable: std::mem::take(&mut at.unavailable),
-    };
+    let surface = Surface::new(
+        take("tools", tools, &mut at),
+        take("prompts", prompts, &mut at),
+        take("resources", resources, &mut at),
+        take("resource templates", templates, &mut at),
+        std::mem::take(&mut at.unavailable),
+    );
     (surface, at.not_initialized)
 }
 
@@ -4864,7 +4841,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             let instructions_list_tools = info
                 .instructions
                 .as_deref()
-                .is_some_and(|instr| s.tools.first().is_some_and(|t| instr.contains(&t.name)));
+                .is_some_and(|instr| s.tools().first().is_some_and(|t| instr.contains(&t.name)));
             if !instructions_list_tools {
                 print_tool_overview(&s);
             }
@@ -4918,7 +4895,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     } else {
         let parsed = {
             let surface = surface.read().unwrap();
-            dynamic_cli::parse(&surface.tools, &surface.prompts, &dynamic_argv)
+            dynamic_cli::parse(surface.commands(), &dynamic_argv)
         };
         match parsed {
             Ok(invocation) => Some(invocation.repl_line()),
@@ -5033,9 +5010,9 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 let fresh = fetch_surface(&session.client()).await;
                 async_output.line(format!("{} {}, {}, {}",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),
-                    plural(fresh.tools.len(), "tool"),
-                    plural(fresh.prompts.len(), "prompt"),
-                    plural(fresh.resources.len(), "resource")));
+                    plural(fresh.tools().len(), "tool"),
+                    plural(fresh.prompts().len(), "prompt"),
+                    plural(fresh.resources().len(), "resource")));
                 *surface.write().unwrap() = fresh;
             }
             maybe_line = line_rx.recv() => {
@@ -5152,7 +5129,7 @@ fn backgroundable_tool(surface: &Arc<RwLock<Surface>>, line: &str) -> Option<Str
         return None;
     }
     let surface = surface.read().ok()?;
-    let tool = surface.tools.iter().find(|tool| tool.name == word)?;
+    let tool = surface.tools().iter().find(|tool| tool.name == word)?;
     tool_tags(tool)
         .contains(&"task-capable")
         .then(|| tool.name.clone())
@@ -5697,7 +5674,7 @@ async fn handle_line(
                             "description": builtin.summary,
                         }))
                         .collect::<Vec<_>>(),
-                    "tools": s.tools,
+                    "tools": s.tools(),
                 }));
                 return false;
             }
@@ -5733,9 +5710,9 @@ async fn handle_line(
             println!("  ping | refresh | info | quit");
             println!("  help <command>                            explain one built-in");
             let s = surface.read().unwrap();
-            if !s.tools.is_empty() {
+            if !s.tools().is_empty() {
                 println!("tools:");
-                for t in &s.tools {
+                for t in s.tools() {
                     println!(
                         "  {} {}",
                         style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
@@ -5766,10 +5743,10 @@ async fn handle_line(
             }
             if !output.is_plain() || json_output() {
                 let v = match cmd {
-                    "tools" => serde_json::to_value(&s.tools),
-                    "prompts" => serde_json::to_value(&s.prompts),
-                    "resources" => serde_json::to_value(&s.resources),
-                    _ => serde_json::to_value(&s.templates),
+                    "tools" => serde_json::to_value(s.tools()),
+                    "prompts" => serde_json::to_value(s.prompts()),
+                    "resources" => serde_json::to_value(s.resources()),
+                    _ => serde_json::to_value(s.templates()),
                 }
                 .unwrap_or_default();
                 emit_value(v, &output, || unreachable!("plain output handled below"));
@@ -5781,9 +5758,9 @@ async fn handle_line(
             let limit = if full { None } else { listing_limit() };
             match cmd {
                 "tools" => {
-                    let total = s.tools.len();
+                    let total = s.tools().len();
                     let shown = limit.unwrap_or(total).min(total);
-                    for t in s.tools.iter().take(shown) {
+                    for t in s.tools().iter().take(shown) {
                         println!(
                             "{} {}{}",
                             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
@@ -5794,9 +5771,9 @@ async fn handle_line(
                     note_truncation(shown, total, "tools --full");
                 }
                 "prompts" => {
-                    let total = s.prompts.len();
+                    let total = s.prompts().len();
                     let shown = limit.unwrap_or(total).min(total);
-                    for p in s.prompts.iter().take(shown) {
+                    for p in s.prompts().iter().take(shown) {
                         let args: Vec<String> = p
                             .arguments
                             .iter()
@@ -5818,9 +5795,9 @@ async fn handle_line(
                     note_truncation(shown, total, "prompts --full");
                 }
                 "resources" => {
-                    let total = s.resources.len();
+                    let total = s.resources().len();
                     let shown = limit.unwrap_or(total).min(total);
-                    for r in s.resources.iter().take(shown) {
+                    for r in s.resources().iter().take(shown) {
                         println!(
                             "{} {}",
                             style::column(Style::new().fg(Color::Green), &sanitize(&r.uri), 40),
@@ -5830,23 +5807,23 @@ async fn handle_line(
                     note_truncation(shown, total, "resources --full");
                     // Templates (parameterized URIs) are a separate MCP list
                     // and easy to miss; point at them.
-                    if !s.templates.is_empty() {
+                    if !s.templates().is_empty() {
                         println!(
                             "{}",
                             paint(
                                 Style::new().dimmed(),
                                 &format!(
                                     "(+ {} resource template(s) with variables, see `templates`)",
-                                    s.templates.len()
+                                    s.templates().len()
                                 )
                             )
                         );
                     }
                 }
                 _ => {
-                    let total = s.templates.len();
+                    let total = s.templates().len();
                     let shown = limit.unwrap_or(total).min(total);
-                    for t in s.templates.iter().take(shown) {
+                    for t in s.templates().iter().take(shown) {
                         println!(
                             "{} {}",
                             style::column(
@@ -5858,14 +5835,14 @@ async fn handle_line(
                         );
                     }
                     note_truncation(shown, total, "templates --full");
-                    if !s.resources.is_empty() {
+                    if !s.resources().is_empty() {
                         println!(
                             "{}",
                             paint(
                                 Style::new().dimmed(),
                                 &format!(
                                     "(+ {} concrete resource(s), see `resources`)",
-                                    s.resources.len()
+                                    s.resources().len()
                                 )
                             )
                         );
@@ -5916,7 +5893,7 @@ async fn handle_line(
             }
             let snapshot = {
                 let surface = surface.read().unwrap();
-                schema_contract::Snapshot::from_surface(&surface.tools, &surface.prompts, name)
+                schema_contract::Snapshot::from_surface(surface.tools(), surface.prompts(), name)
             };
             let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
@@ -5984,7 +5961,7 @@ async fn handle_line(
             };
             let current = {
                 let surface = surface.read().unwrap();
-                snapshot.matching_surface(&surface.tools, &surface.prompts)
+                snapshot.matching_surface(surface.tools(), surface.prompts())
             };
             let report = schema_contract::validate(&snapshot, current.as_ref(), mode);
             render_validation_report(&report, true);
@@ -6566,18 +6543,18 @@ async fn handle_line(
             let fresh = refresh_surface(session).await;
             if json_output() {
                 print_json(&serde_json::json!({
-                    "tools": fresh.tools.len(),
-                    "prompts": fresh.prompts.len(),
-                    "resources": fresh.resources.len(),
-                    "templates": fresh.templates.len(),
+                    "tools": fresh.tools().len(),
+                    "prompts": fresh.prompts().len(),
+                    "resources": fresh.resources().len(),
+                    "templates": fresh.templates().len(),
                 }));
             } else {
                 println!(
                     "{}, {}, {}, {}",
-                    plural(fresh.tools.len(), "tool"),
-                    plural(fresh.prompts.len(), "prompt"),
-                    plural(fresh.resources.len(), "resource"),
-                    plural(fresh.templates.len(), "template")
+                    plural(fresh.tools().len(), "tool"),
+                    plural(fresh.prompts().len(), "prompt"),
+                    plural(fresh.resources().len(), "resource"),
+                    plural(fresh.templates().len(), "template")
                 );
             }
             if !json_output() {
@@ -6728,7 +6705,7 @@ async fn dispatch_direct_tool(
     let schema = {
         let surface = surface.read().unwrap();
         surface
-            .tools
+            .tools()
             .iter()
             .find(|tool| tool.name == tool_name)
             .map(|tool| tool.input_schema.clone())
@@ -6795,7 +6772,7 @@ async fn handle_bench(
     };
     let schema = {
         let s = surface.read().unwrap();
-        s.tools
+        s.tools()
             .iter()
             .find(|t| t.name == plan.tool)
             .map(|t| t.input_schema.clone())
@@ -7031,7 +7008,13 @@ fn handle_alias(
             );
             // An alias wins over a tool of the same name, since expansion
             // happens before dispatch. Worth saying once, at definition.
-            if surface.read().unwrap().tools.iter().any(|t| t.name == name) {
+            if surface
+                .read()
+                .unwrap()
+                .tools()
+                .iter()
+                .any(|t| t.name == name)
+            {
                 println!(
                     "{}",
                     paint(
@@ -7119,7 +7102,7 @@ fn handle_bind(
     // checkable immediately rather than discovered silently at call time.
     // Disconnected, there is no surface to check against, so no warning.
     if connected {
-        let declared = surface.read().unwrap().tools.iter().any(|tool| {
+        let declared = surface.read().unwrap().tools().iter().any(|tool| {
             tool.input_schema
                 .get("properties")
                 .and_then(|properties| properties.get(name))
@@ -7186,7 +7169,7 @@ fn enforce_tool_contract(
     let report = {
         let surface = surface.read().unwrap();
         surface
-            .tools
+            .tools()
             .iter()
             .find(|definition| definition.name == name)
             .and_then(|definition| contracts.check_tool(definition))
@@ -7204,7 +7187,7 @@ fn enforce_prompt_contract(
     let report = {
         let surface = surface.read().unwrap();
         surface
-            .prompts
+            .prompts()
             .iter()
             .find(|definition| definition.name == name)
             .and_then(|definition| contracts.check_prompt(definition))
@@ -7216,7 +7199,7 @@ fn enforce_prompt_contract(
 
 fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
     surface
-        .tools
+        .tools()
         .iter()
         .find(|definition| definition.name == name)
         .map(|definition| {
@@ -7227,7 +7210,7 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
         })
         .or_else(|| {
             surface
-                .prompts
+                .prompts()
                 .iter()
                 .find(|definition| definition.name == name)
                 .map(|definition| {
@@ -7239,7 +7222,7 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
         })
         .or_else(|| {
             surface
-                .resources
+                .resources()
                 .iter()
                 .find(|definition| definition.name == name || definition.uri == name)
                 .map(|definition| {
@@ -7251,7 +7234,7 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
         })
         .or_else(|| {
             surface
-                .templates
+                .templates()
                 .iter()
                 .find(|definition| definition.name == name || definition.uri_template == name)
                 .map(|definition| {
@@ -7374,39 +7357,6 @@ fn parse_wait_timeout<'a>(
     Ok((limit, remaining))
 }
 
-/// The short safety tags for a tool: what it says it does to the world, and
-/// whether it can run as a task.
-///
-/// `describe` has shown these all along, but the decision they inform is
-/// made while reading a list, before anyone thinks to describe anything.
-pub(crate) fn tool_tags(tool: &ToolDefinition) -> Vec<&'static str> {
-    let mut tags = Vec::new();
-    if let Some(a) = &tool.annotations {
-        if a.read_only_hint {
-            tags.push("read-only");
-        }
-        // A destructive read-only tool is a contradiction; trust read-only.
-        if a.destructive_hint && !a.read_only_hint {
-            tags.push("destructive");
-        }
-        if a.idempotent_hint {
-            tags.push("idempotent");
-        }
-        if a.open_world_hint {
-            tags.push("open-world");
-        }
-    }
-    if let Some(execution) = &tool.execution {
-        let v = serde_json::to_value(execution).unwrap_or_default();
-        match v.get("taskSupport").and_then(|m| m.as_str()) {
-            Some("required") => tags.push("task-only"),
-            Some("optional") => tags.push("task-capable"),
-            _ => {}
-        }
-    }
-    tags
-}
-
 /// The tags as they trail a listing row, or empty when the server declared
 /// none.
 fn tool_tag_suffix(tool: &ToolDefinition) -> String {
@@ -7440,7 +7390,7 @@ fn example_invocation(name: &str, schema: &serde_json::Value) -> String {
         // hop away.
         let target = properties
             .get(key)
-            .map(|property| editor::resolve_ref(schema, property));
+            .map(|property| command_set::resolve_ref(schema, property));
         let ty = target
             .and_then(|t| t.get("type"))
             .and_then(|t| t.as_str())
@@ -7481,14 +7431,14 @@ fn describe(surface: &Surface, name: &str) {
     // `describe` is surface-first while `help` is built-in-only. That gives a
     // colliding server name a useful schema view without making the built-in
     // hard to inspect (`help <name>` still reaches it).
-    let surface_has_name = surface.tools.iter().any(|tool| tool.name == name)
-        || surface.prompts.iter().any(|prompt| prompt.name == name)
+    let surface_has_name = surface.tools().iter().any(|tool| tool.name == name)
+        || surface.prompts().iter().any(|prompt| prompt.name == name)
         || surface
-            .resources
+            .resources()
             .iter()
             .any(|resource| resource.name == name || resource.uri == name)
         || surface
-            .templates
+            .templates()
             .iter()
             .any(|template| template.name == name || template.uri_template == name);
     if !surface_has_name && let Some(help) = builtin_help(name) {
@@ -7509,7 +7459,7 @@ fn describe(surface: &Surface, name: &str) {
         }
         return;
     }
-    if let Some(t) = surface.tools.iter().find(|t| t.name == name) {
+    if let Some(t) = surface.tools().iter().find(|t| t.name == name) {
         println!(
             "tool {}  {}",
             paint(Style::new().fg(Color::Green).bold(), &sanitize(&t.name)),
@@ -7556,7 +7506,7 @@ fn describe(surface: &Surface, name: &str) {
         );
         return;
     }
-    if let Some(p) = surface.prompts.iter().find(|p| p.name == name) {
+    if let Some(p) = surface.prompts().iter().find(|p| p.name == name) {
         println!(
             "prompt {}  {}",
             paint(Style::new().fg(Color::Green).bold(), &sanitize(&p.name)),
@@ -7582,7 +7532,7 @@ fn describe(surface: &Surface, name: &str) {
         return;
     }
     if let Some(r) = surface
-        .resources
+        .resources()
         .iter()
         .find(|r| r.uri == name || r.name == name)
     {
@@ -7606,7 +7556,7 @@ fn describe(surface: &Surface, name: &str) {
         return;
     }
     if let Some(t) = surface
-        .templates
+        .templates()
         .iter()
         .find(|t| t.uri_template == name || t.name == name)
     {
@@ -7853,14 +7803,17 @@ mod tests {
             }
             serde_json::from_value(value).expect("tool definition")
         };
-        Arc::new(RwLock::new(Surface {
-            tools: vec![
+        Arc::new(RwLock::new(Surface::new(
+            vec![
                 tool("slow_add", true),
                 tool("echo", false),
                 tool("wait", true),
             ],
-            ..Default::default()
-        }))
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )))
     }
 
     /// A bare tool definition with nothing but a name, for tests that only
@@ -7975,23 +7928,29 @@ mod tests {
 
     #[test]
     fn the_collision_note_is_silent_when_nothing_collides() {
-        let surface = Surface {
-            tools: vec![tool_named("slow_add"), tool_named("echo")],
-            ..Default::default()
-        };
+        let surface = Surface::new(
+            vec![tool_named("slow_add"), tool_named("echo")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(collision_note(&surface), None);
     }
 
     #[test]
     fn the_collision_note_stays_one_line_for_many_collisions() {
-        let surface = Surface {
-            tools: vec![
+        let surface = Surface::new(
+            vec![
                 tool_named("connect"),
                 tool_named("tool"),
                 tool_named("wait"),
             ],
-            ..Default::default()
-        };
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         let note = collision_note(&surface).expect("a note when tools collide");
         assert_eq!(note.lines().count(), 1);
         assert!(note.contains("connect"));
@@ -8741,15 +8700,15 @@ mod tests {
         let (surface, not_initialized) = fetch_surface_once(&client).await;
         assert!(!not_initialized);
         assert!(
-            surface.tools.len() > first.tools.len(),
+            surface.tools().len() > first.tools.len(),
             "the REPL follows the demo cursor instead of presenting one page"
         );
         for expected in ["content_types", "logs", "notes", "toggle_extra"] {
             assert!(
-                surface.tools.iter().any(|tool| tool.name == expected),
+                surface.tools().iter().any(|tool| tool.name == expected),
                 "the paged surface lost {expected}: {:?}",
                 surface
-                    .tools
+                    .tools()
                     .iter()
                     .map(|tool| tool.name.as_str())
                     .collect::<Vec<_>>()
@@ -9888,7 +9847,7 @@ world",
         }
         // The surface is re-fetched from the new session, not left stale.
         assert!(
-            !surface.read().unwrap().tools.is_empty(),
+            !surface.read().unwrap().tools().is_empty(),
             "surface should be refreshed after reconnect"
         );
     }
