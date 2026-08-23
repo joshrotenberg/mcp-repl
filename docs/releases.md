@@ -174,17 +174,25 @@ binaries.
 15. A separately reviewed `Release draft recovery` workflow covers only the
     narrow state where a defective frozen publisher stranded the already-built
     canonical set behind a bot-owned private draft. Its owner-sent dispatch
-    selects a failed run and release merge only as evidence. Read-only preflight
+    selects a failed run and release merge as evidence and supplies a numeric
+    release ID only as an untrusted candidate. Read-only preflight validates
+    the request shape but neither queries nor emits private-release state; it
     authenticates the exact successful build/attestation/assembly/version-image
     topology, sole failed GitHub-publication job, skipped latest/smoke jobs,
-    retained 39-file artifact, annotated tag, and unique draft identity. The
-    write job receives only `actions: read` and `contents: write`, downloads the
+    retained 39-file artifact, and annotated tag. The write job receives only
+    `actions: read` and `contents: write`; before any artifact access or release
+    mutation, it repeats the immutable checks and binds the candidate ID to two
+    identical complete push-visible REST release inventories, exact bot-owned
+    metadata and notes, and a safe canonical asset subset. It then downloads the
     historical artifact by numeric ID and verifies its API-recorded ZIP digest,
-    then overlays reviewed current-main publisher scripts onto a detached
+    and overlays reviewed current-main publisher scripts onto a detached
     historical source worktree. It executes none of that old checkout's scripts
-    or product code. Recovery can resume only the same numeric draft, never
-    create a tag or draft, replace an asset, publish synthesized bytes, mutate
-    GHCR, or rerun the failed workflow automatically.
+    or product code. The publisher independently repeats stable full-list,
+    numeric-ID, metadata, asset, and tag checks. Recovery can resume only that
+    same draft, never create a tag or draft, replace an asset, publish synthesized
+    bytes, mutate GHCR, or rerun the failed workflow automatically. Repository
+    workflow permissions remain read-only by default; write authority exists
+    only on this resume job.
 
 The status reporter is intentionally narrow and the whole update/validation
 graph is serialized. It runs from the trusted default branch, grants only its
@@ -402,17 +410,21 @@ compact release record.
   ```bash
   gh api --method POST repos/joshrotenberg/mcp-repl/dispatches \
     -f event_type=release_draft_recovery \
-    -F 'client_payload[schema_version]=1' \
+    -F 'client_payload[schema_version]=2' \
+    -F 'client_payload[release_id]=<numeric private draft release ID>' \
     -f 'client_payload[release_merge_sha]=<40-character release merge SHA>' \
     -F 'client_payload[run_id]=<failed run ID>' \
     -F 'client_payload[run_attempt]=<failed run attempt>'
   ```
 
-  The controller authenticates the current default-branch checkout, exact
-  30-job failure topology, one unexpired canonical artifact, full release list,
-  numeric draft identity, safe remote asset subset, canonical notes, and
-  annotated source tag before uploading any missing byte-identical files and
-  finalizing that same draft. After it succeeds, use **Re-run failed jobs**—not
+  The read-only preflight authenticates the current default-branch checkout,
+  exact 30-job failure topology, one unexpired canonical artifact, and annotated
+  source tag without attempting private-draft discovery. The candidate
+  `release_id` becomes trusted only when the write-scoped resume step repeats
+  that evidence and binds it to stable complete push-visible release lists,
+  canonical notes, and a safe remote asset subset. Only then may the publisher
+  upload missing byte-identical files and finalize that same draft. After it
+  succeeds, use **Re-run failed jobs**—not
   **Re-run all jobs**—on the original Release publish run. Its frozen publisher
   then verifies the now-public exact release and completes `latest`
   reconciliation plus anonymous public smoke. Preserve the original attempt's
