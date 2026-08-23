@@ -148,6 +148,9 @@ require_native_spdx() {
   namespace="https://github.com/$repository/releases/download/$tag/$archive_name.spdx.json#$source_sha-$archive_digest"
   created=$(jq -nr --argjson epoch "$source_epoch" '$epoch | todateiso8601') ||
     die "could not derive the native SBOM creation timestamp"
+  # Syft can independently classify a PE binary with the same display name as
+  # its Cargo package. Bind the release crate by its exact version and Cargo
+  # purl; a name-only uniqueness check would reject that valid extra evidence.
   jq -e \
     --arg archive_name "$archive_name" \
     --arg archive_digest "$archive_digest" \
@@ -196,7 +199,6 @@ require_native_spdx() {
         (.relationshipType | length) > 0 and
         ($ids | index($relationship.spdxElementId)) != null and
         ($ids | index($relationship.relatedSpdxElement)) != null) and
-      ([.packages[] | select(.name == "mcp-repl") | .SPDXID]) as $named_mcp_ids |
       ([.packages[] |
         select(.name == "mcp-repl") |
         select(.versionInfo == $version) |
@@ -220,7 +222,6 @@ require_native_spdx() {
         select(any(.checksums[];
           .algorithm == "SHA256" and .checksumValue == $archive_digest)) |
         .SPDXID] | unique) as $root_ids |
-      ($named_mcp_ids | length) == 1 and
       ($mcp_ids | length) == 1 and
       ($root_ids | length) == 1 and
       ($mcp_ids[0]) as $mcp_id |
