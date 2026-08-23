@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.5] - 2026-08-23
+
+### Bug Fixes
+
+- **release:** Accept the Windows SBOM classifier (#237)
+
+
+
 ## [0.3.4] - 2026-08-23
 
 ### Bug Fixes
