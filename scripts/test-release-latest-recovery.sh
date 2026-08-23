@@ -447,11 +447,12 @@ release_json() {
 
 emit_asset() {
   local id=$1 name=$2 size=$3 digest=$4 uploader='github-actions[bot]' state=uploaded
-  local content_type=application/octet-stream label=null
+  local content_type=application/octet-stream label='""'
   [[ "$mode" != foreign_asset ]] || uploader=octocat
   [[ "$mode" != pending_asset ]] || state=new
   [[ "$mode" != wrong_asset_content_type ]] || content_type=text/plain
   [[ "$mode" != labeled_asset ]] || label='"unexpected"'
+  [[ "$mode" != null_asset_label ]] || label=null
   jq -cn --argjson id "$id" --arg name "$name" --argjson size "$size" \
     --arg digest "$digest" --arg uploader "$uploader" --arg state "$state" \
     --arg content_type "$content_type" --argjson label "$label" '{
@@ -956,7 +957,8 @@ check_verifier "asset IDs are globally unique" duplicate_asset_id preflight 1 "e
 check_verifier "all assets are bot-owned" foreign_asset preflight 1 "exact trusted 39-asset"
 check_verifier "all assets are uploaded" pending_asset preflight 1 "exact trusted 39-asset"
 check_verifier "asset content types are exact" wrong_asset_content_type preflight 1 "exact trusted 39-asset"
-check_verifier "asset labels remain null" labeled_asset preflight 1 "exact trusted 39-asset"
+check_verifier "asset labels remain exact empty strings" labeled_asset preflight 1 "exact trusted 39-asset"
+check_verifier "null asset labels are rejected" null_asset_label preflight 1 "exact trusted 39-asset"
 check_verifier "record asset is required" missing_record_asset preflight 1 "exact trusted 39-asset"
 check_verifier "record metadata is exact" bad_record_metadata preflight 1 "exact immutable asset identity"
 check_verifier "every native asset tuple is record-bound" wrong_native_tuple preflight 1 "canonical 39-file"

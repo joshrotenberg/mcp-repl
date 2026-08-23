@@ -367,7 +367,7 @@ if [[ $(grep -Fc 'expected_release_id=375116865' \
         "$latest_recovery_verifier") -ne 1 ||
       $(grep -Fc 'select(($assets | length) == 39)' \
         "$latest_recovery_verifier") -ne 1 ||
-      $(grep -Fc '.content_type == "application/octet-stream" and .label == null' \
+      $(grep -Fc '.content_type == "application/octet-stream" and .label == ""' \
         "$latest_recovery_verifier") -ne 1 ||
       $(grep -Fc -- '--signer-digest "$release_merge_sha"' \
         "$latest_recovery_verifier") -ne 1 ||
