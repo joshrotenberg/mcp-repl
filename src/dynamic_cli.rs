@@ -9,7 +9,8 @@
 use std::collections::HashSet;
 
 use clap::{Arg, ArgAction, ArgMatches, Command, error::ErrorKind};
-use tower_mcp::protocol::{PromptDefinition, ToolDefinition};
+
+use crate::command_set::{CommandSet, CommandSpec};
 
 const LIST_BUILTINS: &[&str] = &["tools", "prompts", "resources", "templates"];
 const ONE_SHOT_BUILTINS: &[&str] = &[
@@ -71,13 +72,9 @@ struct SurfaceCommandSpec {
 }
 
 /// Parse one command using a clap tree assembled from the connected surface.
-pub(crate) fn parse(
-    tools: &[ToolDefinition],
-    prompts: &[PromptDefinition],
-    argv: &[String],
-) -> Result<Invocation, clap::Error> {
-    let tool_specs = tool_specs(tools);
-    let prompt_specs = prompt_specs(prompts);
+pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation, clap::Error> {
+    let tool_specs = command_specs(&commands.tools, "tool");
+    let prompt_specs = command_specs(&commands.prompts, "prompt");
     let mut root = Command::new("mcp-repl")
         .bin_name("mcp-repl <connection options>")
         .about("Run one command against the connected MCP server")
@@ -440,131 +437,59 @@ fn spec_named<'a>(specs: &'a [SurfaceCommandSpec], command: &str) -> &'a Surface
         .expect("every generated subcommand came from a surface spec")
 }
 
-fn tool_specs(tools: &[ToolDefinition]) -> Vec<SurfaceCommandSpec> {
+fn command_specs(commands: &[CommandSpec], fallback: &str) -> Vec<SurfaceCommandSpec> {
     let mut used_commands = HashSet::new();
-    tools
+    commands
         .iter()
         .enumerate()
-        .map(|(index, tool)| {
-            let required: HashSet<&str> = tool
-                .input_schema
-                .get("required")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .collect();
-            let properties = tool
-                .input_schema
-                .get("properties")
-                .and_then(serde_json::Value::as_object);
-            let arguments = properties
-                .into_iter()
-                .flat_map(|properties| properties.iter())
-                .map(|(property, schema)| {
-                    let schema = crate::editor::resolve_ref(&tool.input_schema, schema);
-                    (
-                        property.as_str(),
-                        schema,
-                        required.contains(property.as_str()),
-                    )
-                });
-            SurfaceCommandSpec {
-                command: unique_cli_name(&tool.name, "tool", &mut used_commands),
-                name: tool.name.clone(),
-                about: tool.description.as_deref().map(clean_text),
-                arguments: argument_specs(index, arguments),
-            }
+        .map(|(index, command)| SurfaceCommandSpec {
+            command: unique_cli_name(&command.name, fallback, &mut used_commands),
+            name: command.name.clone(),
+            about: command.description.as_deref().map(clean_text),
+            arguments: argument_specs(index, &command.arguments),
         })
         .collect()
 }
 
-fn prompt_specs(prompts: &[PromptDefinition]) -> Vec<SurfaceCommandSpec> {
-    let mut used_commands = HashSet::new();
-    prompts
-        .iter()
-        .enumerate()
-        .map(|(index, prompt)| SurfaceCommandSpec {
-            command: unique_cli_name(&prompt.name, "prompt", &mut used_commands),
-            name: prompt.name.clone(),
-            about: prompt.description.as_deref().map(clean_text),
-            arguments: prompt
-                .arguments
-                .iter()
-                .enumerate()
-                .scan(
-                    HashSet::from(["help".to_string(), "version".to_string()]),
-                    |used_flags, (argument_index, argument)| {
-                        Some(ArgumentSpec {
-                            id: format!("prompt-{index}-arg-{argument_index}"),
-                            property: argument.name.clone(),
-                            flag: unique_cli_name(&argument.name, "arg", used_flags),
-                            required: argument.required,
-                            help: argument.description.as_deref().map(clean_text),
-                            value_name: "STRING".to_string(),
-                        })
-                    },
-                )
-                .collect(),
-        })
-        .collect()
-}
-
-fn argument_specs<'a>(
+fn argument_specs(
     owner_index: usize,
-    arguments: impl IntoIterator<Item = (&'a str, &'a serde_json::Value, bool)>,
+    arguments: &[crate::command_set::ArgumentSpec],
 ) -> Vec<ArgumentSpec> {
     let mut used_flags = HashSet::from(["help".to_string(), "version".to_string()]);
     arguments
-        .into_iter()
+        .iter()
         .enumerate()
-        .map(
-            |(argument_index, (property, schema, required))| ArgumentSpec {
-                id: format!("surface-{owner_index}-arg-{argument_index}"),
-                property: property.to_string(),
-                flag: unique_cli_name(property, "arg", &mut used_flags),
-                required,
-                help: argument_help(schema),
-                value_name: schema_type(schema).to_ascii_uppercase(),
-            },
-        )
+        .map(|(argument_index, argument)| ArgumentSpec {
+            id: format!("surface-{owner_index}-arg-{argument_index}"),
+            property: argument.name.clone(),
+            flag: unique_cli_name(&argument.name, "arg", &mut used_flags),
+            required: argument.required,
+            help: argument_help(argument),
+            value_name: argument
+                .value_type
+                .as_deref()
+                .unwrap_or("value")
+                .to_ascii_uppercase(),
+        })
         .collect()
 }
 
-fn argument_help(schema: &serde_json::Value) -> Option<String> {
-    let description = schema
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .map(clean_text);
-    let choices = schema
-        .get("enum")
-        .and_then(serde_json::Value::as_array)
-        .filter(|values| !values.is_empty())
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(clean_text)
-                        .unwrap_or_else(|| value.to_string())
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        });
+fn argument_help(argument: &crate::command_set::ArgumentSpec) -> Option<String> {
+    let description = argument.description.as_deref().map(clean_text);
+    let choices = (!argument.choices.is_empty()).then(|| {
+        argument
+            .choices
+            .iter()
+            .map(|choice| clean_text(choice))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
     match (description, choices) {
         (Some(description), Some(choices)) => Some(format!("{description} [values: {choices}]")),
         (Some(description), None) => Some(description),
         (None, Some(choices)) => Some(format!("Allowed values: {choices}")),
         (None, None) => None,
     }
-}
-
-fn schema_type(schema: &serde_json::Value) -> &str {
-    schema
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("value")
 }
 
 /// Preserve normal MCP names exactly and make unusual names safe for clap.
@@ -606,7 +531,22 @@ fn clean_text(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tower_mcp::protocol::PromptArgument;
+    use tower_mcp::protocol::{PromptArgument, PromptDefinition, ToolDefinition};
+
+    fn parse(
+        tools: &[ToolDefinition],
+        prompts: &[PromptDefinition],
+        argv: &[String],
+    ) -> Result<Invocation, clap::Error> {
+        let surface = crate::Surface::new(
+            tools.to_vec(),
+            prompts.to_vec(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        super::parse(surface.commands(), argv)
+    }
 
     fn tool(name: &str, schema: serde_json::Value) -> ToolDefinition {
         ToolDefinition {
