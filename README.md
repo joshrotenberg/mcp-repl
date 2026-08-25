@@ -95,8 +95,12 @@ The `unstable-dynamic-cli` Cargo feature tries a more conventional one-shot
 form while its command grammar is evaluated. It is off by default:
 
 ```bash
-cargo install mcp-repl --features unstable-dynamic-cli
+cargo install --git https://github.com/joshrotenberg/mcp-repl \
+  --features unstable-dynamic-cli
 ```
+
+This feature has not reached a crates.io release yet, so it currently needs to
+be installed from Git.
 
 With the feature enabled and an explicit connection selector, mcp-repl
 discovers the server first and projects the REPL's one-shot vocabulary into a
