@@ -19,8 +19,14 @@ MCP client for a shell script, a CI job, or an agent.
 
 ## Install
 
-With Rust 1.90.0 or newer, install the latest published release on any
-supported platform:
+On macOS or Linux, install the latest release with Homebrew:
+
+```bash
+brew install joshrotenberg/brew/mcp-repl
+```
+
+Or, with Rust 1.90.0 or newer, install from crates.io on any supported
+platform:
 
 ```bash
 cargo install --locked mcp-repl
@@ -42,9 +48,9 @@ inside it, and OAuth has no credential store there. See
 [the connecting guide](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/connecting.md#in-a-container)
 for what differs.
 
-Completions and a man page come from the binary itself, and ship in the
-release archives. The man page includes both startup options and the same
-REPL built-in reference shown by `help <command>`:
+Completions and a man page come from the binary itself. The man page includes
+both startup options and the same REPL built-in reference shown by
+`help <command>`:
 
 ```bash
 mcp-repl --completions zsh > ~/.zfunc/_mcp-repl

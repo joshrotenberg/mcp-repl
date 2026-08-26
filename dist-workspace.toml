@@ -9,9 +9,11 @@ dispatch-releases = true
 # only the host job can write releases and attestations.
 allow-dirty = ["ci"]
 pr-run-mode = "upload"
-installers = ["shell"]
+installers = ["shell", "homebrew"]
 install-path = "CARGO_HOME"
 install-updater = false
+tap = "joshrotenberg/homebrew-brew"
+publish-jobs = ["homebrew"]
 targets = [
   "aarch64-apple-darwin",
   "aarch64-unknown-linux-gnu",
