@@ -2,9 +2,8 @@
 #
 # Copy this to the platform path and edit it:
 #
-#   Unix     $XDG_CONFIG_HOME/mcp-repl/config.toml, or ~/.config/mcp-repl/config.toml
-#   macOS    ~/Library/Application Support/mcp-repl/config.toml
-#   Windows  %APPDATA%\mcp-repl\config.toml
+#   Unix/macOS  $XDG_CONFIG_HOME/mcp-repl/config.toml, or ~/.config/mcp-repl/config.toml
+#   Windows     %APPDATA%\mcp-repl\config.toml
 #
 # Or point at any file with --config PATH.
 #

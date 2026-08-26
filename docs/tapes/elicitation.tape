@@ -1,7 +1,7 @@
 # Elicitation: the server asks the operator, and the REPL says which server
 # is asking before anything is typed.
 #
-# Regenerate all README media with:
+# Regenerate this README media asset with:
 #   cargo build --release && vhs docs/tapes/elicitation.tape
 # VHS writes a frame *directory* when Output ends in .png, which would
 # collide with the Screenshot below. Send the recording to a throwaway

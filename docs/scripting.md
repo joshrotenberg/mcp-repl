@@ -79,8 +79,8 @@ wrappers). REPL-only commands use documented convenience values or envelopes:
 `find` and `subscriptions` return arrays; `describe` returns
 `{"kind": ..., "definition": ...}`; `snapshot` returns its canonical contract
 or a file acknowledgement; `validate` returns its compatibility report; and
-`help`, `bench`, `jobs`, aliases, `wire`, `last`, `refresh`, `info`, `vars`,
-`unset`, and `quit` return objects.
+`help`, `bench`, `jobs`, aliases, parameter binds, `wire`, `last`, `refresh`,
+`info`, `vars`, `unset`, and `quit` return objects.
 
 JSON errors stay on stdout so they occupy that command's one output line:
 

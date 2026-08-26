@@ -15,8 +15,8 @@ the reasoning around those commands rather than a second flag manual.
 ## What to try
 
 Start with `mcp-repl`, then run `connect demo` (or start directly with
-`mcp-repl --demo`). The demo needs no external server, and its tools are typed so the features
-that depend on a schema are all reachable:
+`mcp-repl --demo`). The demo needs no external server, and its tools are typed
+so the features that depend on a schema are all reachable:
 
 ```text
 mcp-repl-demo> help                        # built-ins plus the server's tools
@@ -24,6 +24,7 @@ mcp-repl-demo> help wait                   # what one built-in does
 mcp-repl-demo> echo <Tab>                  # completes `message=` and `repeat=`, with types
 mcp-repl-demo> echo message="hi there"     # args coerced by inputSchema
 mcp-repl-demo> echo msg=hi                 # refused: `message` is required
+mcp-repl-demo> bind repeat=2               # default a parameter across calls
 mcp-repl-demo> convert value=100 from=celsius to=<Tab>  # completes the enum values
 mcp-repl-demo> slow_add a=2 b=3 &          # runs task-augmented; `jobs`, `wait 1`
 mcp-repl-demo> logs                        # four severities; `loglevel` filters them
@@ -394,17 +395,45 @@ dl = "get_downloads"
 With no platform config directory and no `--config`, aliases still work for
 the session and the REPL says they were not saved.
 
+## Parameter defaults
+
+`bind <param>=<value>` supplies a default whenever a tool declares that
+parameter and the call omits it. An explicit argument always wins:
+
+```text
+mcp-repl-demo> bind repeat=3
+repeat = 3
+mcp-repl-demo> echo message=hello
+hello hello hello
+mcp-repl-demo> echo message=hello repeat=1
+hello
+mcp-repl-demo> binds
+repeat  3
+mcp-repl-demo> unbind repeat
+removed repeat
+```
+
+Values are stored as written and coerced from each tool's `inputSchema` when
+the call runs. That lets one bind apply to tools that share a parameter name,
+even when their schemas use different types. A bind for a parameter no current
+tool declares warns instead of appearing to work silently.
+
+`bind <name>` shows one current value, `binds` lists them all, and
+`unbind <name>` removes one. Binds last for the current connection only;
+`connect` clears them so a server-specific session id or tenant cannot leak
+into the next server.
+
 ## Capture and filtering
 
 The REPL is a small shell. A command's result can be captured into a variable,
 referenced in later arguments, or filtered inline.
 
 ```text
-demo> x = search_crates query=serde
+cratesio> x = search_crates query=serde
 $x = {2 fields}
-demo> get_crate_info name=$x.crates[0].name
+cratesio> get_crate_info name=$x.crates[0].name
 ...
-demo> get_crate_info name=serde | crates[0].downloads
+cratesio> get_crate_info name=serde | crates[0].downloads
 11897234
 ```
 

@@ -2,10 +2,10 @@
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| Latest published minor release line | Yes |
-| Earlier release lines | No |
+| Version                             | Supported |
+| ----------------------------------- | --------- |
+| Latest published minor release line | Yes       |
+| Earlier release lines               | No        |
 
 mcp-repl is pre-1.0 and moves quickly. Security fixes are released from the
 current line rather than backported; upgrade to the latest release before
@@ -17,11 +17,13 @@ Versions before 0.2.0 were released from the
 
 ## Reporting a Vulnerability
 
-Please report security vulnerabilities via [GitHub Security Advisories](https://github.com/joshrotenberg/mcp-repl/security/advisories/new).
+Please report security vulnerabilities via
+[GitHub Security Advisories](https://github.com/joshrotenberg/mcp-repl/security/advisories/new).
 
 Do **not** open a public issue for security vulnerabilities.
 
-You should receive an initial response within 72 hours. If a vulnerability is confirmed, a fix will be released as soon as possible, typically within 7 days.
+You should receive an initial response within 72 hours. If a vulnerability is
+confirmed, a fix will be released as soon as possible, typically within 7 days.
 
 ## Scope
 

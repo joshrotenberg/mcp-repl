@@ -25,7 +25,7 @@ apply here, is the useful form for that discussion.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
-RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
 All of these must pass before submitting a PR. The black-box tests build and
@@ -72,9 +72,10 @@ cargo llvm-cov --all-features --workspace --html
 
 The report starts at `target/llvm-cov/html/index.html`. For a compact baseline
 without opening or generating a browser report, run
-`cargo llvm-cov --all-features --workspace --summary-only`. Coverage is a map to untested branches,
-not a merge threshold: prioritize security boundaries, state restoration, and
-editor behavior over a repository-wide vanity percentage.
+`cargo llvm-cov --all-features --workspace --summary-only`. Coverage is a map
+to untested branches, not a merge threshold: prioritize security boundaries,
+state restoration, and editor behavior over a repository-wide vanity
+percentage.
 
 Adding or updating a dependency also needs:
 

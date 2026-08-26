@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [0.3.6] - 2026-08-23
 
+### Bug Fixes
+
+- Resolve bare server programs through `PATHEXT` on Windows (#248)
+- Give schema-rich help enough stack space on Windows (#248)
+
+### Miscellaneous Tasks
+
+- Replace the custom binary distribution pipeline with cargo-dist (#248)
 
 
 ## [0.3.5] - 2026-08-23
@@ -313,5 +321,4 @@ All notable changes to this project will be documented in this file.
 ### Miscellaneous Tasks
 
 - **mcp-repl:** Prepare for crates.io publishing ([#980](https://github.com/joshrotenberg/tower-mcp/pull/980))
-
 
