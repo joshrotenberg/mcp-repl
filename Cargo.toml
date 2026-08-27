@@ -5,8 +5,9 @@ edition = "2024"
 rust-version = "1.90.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/joshrotenberg/mcp-repl"
+homepage = "https://github.com/joshrotenberg/mcp-repl"
 readme = "README.md"
-description = "Interactive MCP client REPL: connects to any MCP server and turns its tools, prompts, and resources into the command set"
+description = "Interactive MCP client that turns a server's surface into terminal commands"
 keywords = ["mcp", "repl", "cli", "client", "protocol"]
 categories = ["command-line-utilities", "development-tools"]
 # Keep the source package deliberately consumer-facing. Cargo adds its

@@ -17,8 +17,9 @@ runner or script suite.
 4. On the resulting push to `main`, release-plz publishes the crate through
    crates.io trusted publishing and creates the exact release tag.
 5. The workflow dispatches cargo-dist at that tag. cargo-dist builds the native
-   archives, checksums, installer, SBOM, and GitHub attestations, then creates
-   the GitHub Release.
+   archives, checksums, shell and Homebrew installers, SBOM, and GitHub
+   attestations, then creates the GitHub Release and updates the formula in
+   `joshrotenberg/homebrew-brew`.
 6. The same tagged source is built for `linux/amd64` and `linux/arm64` and
    published to GHCR as the version and `latest` tags with BuildKit provenance
    and SBOM attestations.
@@ -42,6 +43,11 @@ Configure a crates.io trusted publisher for:
 
 Protect the `crates-io` environment so only the `main` branch can deploy to it.
 No long-lived crates.io token is needed.
+
+Add a repository Actions secret named `HOMEBREW_TAP_TOKEN`. It should be a
+fine-grained personal access token limited to `joshrotenberg/homebrew-brew`,
+with repository Contents permission set to read and write. cargo-dist uses it
+only to commit each release's formula to the tap.
 
 ## Local checks
 

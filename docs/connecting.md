@@ -499,8 +499,10 @@ prompt; the session, its history, and any background tasks survive. At the
 prompt it keeps its usual meaning and clears the line. In `--exec` mode an
 interrupt stops the sequence and exits 6.
 
-Cancelling stops the REPL waiting; it does not tell the server to stop. A
-tool with side effects may still be running on the other end.
+Cancelling drops the in-flight request and sends the server an MCP
+`notifications/cancelled` notification naming it. A server that honors the
+notification stops the work too; one that ignores cancellation may continue,
+so side effects already in progress cannot be assumed to have rolled back.
 
 A server that accepts a request and never answers is a different problem,
 since a script has nobody to press Ctrl-C. `--timeout <seconds>` (default

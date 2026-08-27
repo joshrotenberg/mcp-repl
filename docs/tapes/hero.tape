@@ -1,6 +1,6 @@
 # The front-page recording: the server's surface is the command set.
 #
-# Regenerate all README media with:
+# Regenerate this README media asset with:
 #   cargo build --release && vhs docs/tapes/hero.tape
 #
 # --no-history keeps the recording deterministic: without it reedline offers
