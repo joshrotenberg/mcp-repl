@@ -101,8 +101,13 @@ jobs:
           RELEASE_PR: ${{ steps.release-pr.outputs.pr }}
         run: |
           set -euo pipefail
-          if [[ -z "$RELEASE_PR" || "$RELEASE_PR" == null ]]; then
+          # release-plz reports no release PR as `{}`, not as an empty string
+          # or `null`, so the branch is what has to be tested rather than the
+          # payload. `// empty` yields nothing for a missing key, an explicit
+          # null, or an empty object alike.
+          branch=$(jq -r '.head_branch // empty' <<< "${RELEASE_PR:-}")
+          if [[ -z "$branch" ]]; then
+            echo "no release PR to run CI for"
             exit 0
           fi
-          branch=$(jq -er '.head_branch' <<< "$RELEASE_PR")
           gh workflow run ci.yml --ref "$branch"
