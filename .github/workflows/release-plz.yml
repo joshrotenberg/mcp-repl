@@ -3,6 +3,11 @@ name: Release-plz
 on:
   push:
     branches: [main]
+  # Releases are otherwise only reachable by pushing to main, so a run that
+  # fails partway leaves no way to retry it. That happened with 0.3.6: the
+  # crate published, the tag did not, and finishing it needed a push with
+  # nothing to say.
+  workflow_dispatch:
 
 permissions:
   contents: read
