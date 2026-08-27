@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.7] - 2026-08-27
+
+### Documentation
+
+- Refresh onboarding and add Homebrew releases (#253)
+
+
+
 ## [0.3.6] - 2026-08-23
 
 ### Bug Fixes
