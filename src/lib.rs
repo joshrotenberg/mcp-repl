@@ -502,6 +502,44 @@ fn unwrap_nested(message: &str) -> String {
     }
 }
 
+/// The retry a modern-era-only server is asking for, when it says so.
+///
+/// A server that speaks only the 2026-07-28 lifecycle answers `initialize`
+/// with a JSON-RPC error naming the versions it does support. That is not a
+/// dead end: the spec has the server send it precisely so a dual-era client
+/// can switch lifecycles and try again. mcp-repl can already speak that
+/// lifecycle through `--protocol 2026-07-28`, so the only thing missing was
+/// saying so.
+///
+/// A hint rather than an automatic retry. Switching lifecycles unasked would
+/// change a server's handshake behind the operator, which is the property
+/// `ProtocolMode` exists to promise.
+fn modern_era_retry_hint(rpc: &tower_mcp::error::JsonRpcError) -> Option<String> {
+    if rpc.code != -32601 {
+        return None;
+    }
+    // Accept either spelling. `supportedVersions` is what a discover result
+    // carries, and a modern-only server has been seen naming the error field
+    // `supported`; which one arrives should not decide whether the operator
+    // is told what to do.
+    let data = rpc.data.as_ref()?;
+    let versions = ["supported", "supportedVersions"]
+        .iter()
+        .find_map(|key| data.get(key).and_then(serde_json::Value::as_array))?;
+    let speakable = versions
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|version| version == tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28);
+    // Only the flag. The server's own message already explains the situation,
+    // and repeating it back adds length without adding anything to act on.
+    speakable.then(|| {
+        format!(
+            "retry with `--protocol {}`",
+            tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28
+        )
+    })
+}
+
 /// What a server's failure should look like to the operator.
 ///
 /// The framework's `Display` for a JSON-RPC error is `{0:?}`, so the struct
@@ -533,6 +571,11 @@ fn describe_mcp_error(error: &tower_mcp::Error) -> String {
         if !detail.is_empty() && detail != "null" {
             described.push_str(&format!(": {}", sanitize(&detail)));
         }
+    }
+    // The server named a way forward; printing its error without the
+    // instruction wastes the one thing it went out of its way to send.
+    if let Some(hint) = modern_era_retry_hint(rpc) {
+        described.push_str(&format!("\n  hint: {hint}"));
     }
     described
 }
@@ -8041,6 +8084,70 @@ mod tests {
         });
         // Not `JsonRpcError { code: -32601, message: "...", data: None }`.
         assert_eq!(describe_mcp_error(&error), "Method not found (code -32601)");
+    }
+
+    #[test]
+    fn a_modern_only_server_is_told_how_to_retry() {
+        // The transcript from #257, with the data that server sends.
+        let error = tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
+            code: -32601,
+            message: "This server speaks the modern (stateless) MCP era only; \
+                      initialize is not supported."
+                .to_string(),
+            data: Some(serde_json::json!({ "supported": ["2026-07-28"] })),
+        });
+        let described = describe_mcp_error(&error);
+        assert!(
+            described.contains("hint: retry with `--protocol 2026-07-28`"),
+            "{described}"
+        );
+        // The server's own words survive: the hint is added, not substituted.
+        assert!(
+            described.contains("modern (stateless) MCP era only"),
+            "{described}"
+        );
+    }
+
+    #[test]
+    fn the_retry_hint_is_offered_under_either_spelling() {
+        for key in ["supported", "supportedVersions"] {
+            let error = tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
+                code: -32601,
+                message: "initialize is not supported".to_string(),
+                data: Some(serde_json::json!({ key: ["2026-07-28"] })),
+            });
+            assert!(
+                describe_mcp_error(&error).contains("--protocol"),
+                "no hint for `{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_method_not_found_gets_no_protocol_hint() {
+        // -32601 is every rejection a server sends. The hint belongs only on
+        // the one naming a lifecycle this client can actually speak.
+        for data in [
+            None,
+            Some(serde_json::json!({ "supported": ["1999-01-01"] })),
+            Some(serde_json::json!({ "supported": "not-an-array" })),
+            Some(serde_json::json!({ "detail": "no such tool" })),
+        ] {
+            let error = tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
+                code: -32601,
+                message: "Method not found".to_string(),
+                data: data.clone(),
+            });
+            let described = describe_mcp_error(&error);
+            assert!(!described.contains("hint:"), "{data:?} -> {described}");
+        }
+        // A different code carrying the same data is still not this case.
+        let wrong_code = tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(serde_json::json!({ "supported": ["2026-07-28"] })),
+        });
+        assert!(!describe_mcp_error(&wrong_code).contains("hint:"));
     }
 
     #[test]
