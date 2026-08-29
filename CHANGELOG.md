@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.8] - 2026-08-29
+
+### Bug Fixes
+
+- Render a startup failure the way every other failure is rendered (#260)
+
+### Features
+
+- Tell the operator how to retry against a modern-era-only server (#258)
+
+
+
 ## [0.3.7] - 2026-08-27
 
 ### Documentation
