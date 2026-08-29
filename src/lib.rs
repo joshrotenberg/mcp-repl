@@ -3127,7 +3127,12 @@ impl ConnectFailure {
     fn mcp(error: tower_mcp::Error) -> Self {
         Self {
             status: ExitStatus::from_mcp_error(&error),
-            message: collapse_repeated_label(&error.to_string()).to_string(),
+            // The same rendering every other server failure gets. Building
+            // this one from `to_string` instead meant a connect failure was
+            // the one place a JSON-RPC error arrived as Rust debug output,
+            // and the one place a hint attached to it never appeared, which
+            // is exactly where a handshake rejection lands.
+            message: describe_mcp_error(&error),
         }
     }
 }
@@ -4303,9 +4308,13 @@ pub fn run_cli() {
         .expect("build Tokio runtime");
 
     if let Err(error) = runtime.block_on(run(args, bearer_from_fd)) {
+        // The same rendering an in-session failure gets. A startup failure is
+        // the first thing many people see from this program, and it was the
+        // one place a JSON-RPC error arrived as its Display rather than as a
+        // sentence, so any guidance attached to it never appeared.
         exit_with_error(
             ExitStatus::from_mcp_error(&error),
-            collapse_repeated_label(&error.to_string()),
+            &describe_mcp_error(&error),
         );
     }
 }
