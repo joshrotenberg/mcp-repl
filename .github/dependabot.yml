@@ -15,3 +15,10 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(ci):"
+    # CodeQL fails when its init and analyze steps run different versions,
+    # and Dependabot otherwise opens a separate pull request for each step,
+    # so neither bump can pass on its own. Group them into one.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
