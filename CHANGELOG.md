@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.8] - 2026-09-15
+
+### Bug Fixes
+
+- Render a startup failure the way every other failure is rendered (#260)
+- **deps:** Update rustls for RUSTSEC-2026-0285 (#273)
+
+### Documentation
+
+- Install the generated CLI from crates.io (#274)
+
+### Features
+
+- Tell the operator how to retry against a modern-era-only server (#258)
+
+
+
 ## [0.3.7] - 2026-08-27
 
 ### Documentation
