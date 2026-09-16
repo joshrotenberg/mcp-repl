@@ -279,11 +279,14 @@ fn serve_raw_tools_only(
     downgrade: bool,
     strict_cursor: bool,
     ignore_initialize: bool,
+    cancel_first_call: bool,
 ) -> Result<(), tower_mcp::BoxError> {
     use std::io::{BufRead, Write};
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
+    let mut hold_next_call = cancel_first_call;
+    let mut pending_call = None;
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -294,11 +297,46 @@ fn serve_raw_tools_only(
         if ignore_initialize && method == "initialize" {
             continue;
         }
+        if method == "notifications/cancelled"
+            && pending_call.as_ref() == request["params"].get("requestId")
+        {
+            write_marker(
+                "MCP_REPL_FIXTURE_CANCEL_FILE",
+                request["params"]["requestId"].to_string(),
+            );
+            pending_call = None;
+        }
         // A notification carries no id and takes no response.
         let Some(id) = request.get("id").filter(|id| !id.is_null()).cloned() else {
             continue;
         };
         let response = match method {
+            // Keep the first call pending until the client sends cancellation.
+            // This real child deliberately installs no SIGINT handler: terminal
+            // interrupts must reach it through MCP, not its process group.
+            "tools/call" if hold_next_call => {
+                hold_next_call = false;
+                pending_call = Some(id.clone());
+                write_marker(
+                    "MCP_REPL_FIXTURE_CALL_FILE",
+                    serde_json::json!({ "id": id, "pid": std::process::id() }).to_string(),
+                );
+                continue;
+            }
+            "tools/call" if cancel_first_call => {
+                let args = &request["params"]["arguments"];
+                let sum =
+                    args["a"].as_i64().unwrap_or_default() + args["b"].as_i64().unwrap_or_default();
+                write_marker(
+                    "MCP_REPL_FIXTURE_FOLLOWUP_FILE",
+                    std::process::id().to_string(),
+                );
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": sum.to_string() }] },
+                })
+            }
             "initialize" => serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -407,6 +445,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             std::env::args().any(|arg| arg == "--downgrade-protocol"),
             std::env::args().any(|arg| arg == "--strict-cursor"),
             std::env::args().any(|arg| arg == "--ignore-initialize"),
+            std::env::args().any(|arg| arg == "--cancel-first-call"),
         )?;
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
         return Ok(());
