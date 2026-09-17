@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.9] - 2026-09-17
+
+### Bug Fixes
+
+- Isolate stdio servers from terminal interrupts (closes #278) (#285)
+
+### Documentation
+
+- Document the shell installer in the README (#287)
+
+### Features
+
+- Add --protocol auto to probe the server's lifecycle (closes #257) (#284)
+
+
+
 ## [0.3.8] - 2026-09-15
 
 ### Bug Fixes
