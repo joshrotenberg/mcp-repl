@@ -2423,30 +2423,6 @@ async fn exercise_stdio_group_cancellation(fixture: &Path, connect_interactively
     );
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn stdio_group_cancellation_at_startup() {
-    let fixture = build_fixture().await;
-    tokio::time::timeout(
-        CASE_TIMEOUT,
-        exercise_stdio_group_cancellation(&fixture, false),
-    )
-    .await
-    .expect("startup stdio cancellation timed out");
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn stdio_group_cancellation_after_connect() {
-    let fixture = build_fixture().await;
-    tokio::time::timeout(
-        CASE_TIMEOUT,
-        exercise_stdio_group_cancellation(&fixture, true),
-    )
-    .await
-    .expect("interactive connect cancellation timed out");
-}
-
 /// The id of the last traced request for `method`, read back out of the
 /// pretty-printed frame that `--trace` writes.
 #[cfg(unix)]
@@ -3156,6 +3132,10 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_respond_needs_the_final_lifecycle().await;
         #[cfg(unix)]
         exercise_cancellation().await;
+        #[cfg(unix)]
+        exercise_stdio_group_cancellation(&fixture, false).await;
+        #[cfg(unix)]
+        exercise_stdio_group_cancellation(&fixture, true).await;
         exercise_json_contract(&fixture, &temp).await;
         exercise_colliding_tool_names(&fixture, &temp).await;
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
