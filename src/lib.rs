@@ -3348,6 +3348,10 @@ impl ConnectRuntime {
                     };
                     let mut child = tokio::process::Command::new(program);
                     child.args(&command[1..]);
+                    // Terminal Ctrl-C belongs to the REPL; the server receives
+                    // cancellation through MCP instead of a broadcast SIGINT.
+                    #[cfg(unix)]
+                    child.process_group(0);
                     child.envs(env);
                     child.env_remove("MCP_BEARER");
                     if let Some(cwd) = cwd {
@@ -4846,6 +4850,10 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 }
                 let mut cmd = tokio::process::Command::new(&command[0]);
                 cmd.args(&command[1..]);
+                // Terminal Ctrl-C belongs to the REPL; the server receives
+                // cancellation through MCP instead of a broadcast SIGINT.
+                #[cfg(unix)]
+                cmd.process_group(0);
                 cmd.envs(env);
                 // The child inherits this process's environment, which is
                 // usually what a stdio server wants. MCP_BEARER is the

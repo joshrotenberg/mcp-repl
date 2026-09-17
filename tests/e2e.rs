@@ -2304,6 +2304,125 @@ async fn exercise_cancellation() {
     );
 }
 
+/// Terminal Ctrl-C targets the foreground process group, not only the REPL.
+/// Exercise both ways of spawning a server, with a real child that would die
+/// from SIGINT rather than an in-process demo sharing the REPL's handler.
+#[cfg(unix)]
+async fn exercise_stdio_group_cancellation(fixture: &Path, connect_interactively: bool) {
+    let temp = TempDir::new().expect("cancellation temp directory");
+    let call_file = temp.path().join("call.json");
+    let cancel_file = temp.path().join("cancel.json");
+    let followup_file = temp.path().join("followup.pid");
+    let exit_file = temp.path().join("server.exit");
+    let config_file = temp.path().join("config.toml");
+    std::fs::write(&config_file, "").expect("write isolated config");
+    let mut command = repl_command();
+    command
+        .args(["--protocol", "stable", "--no-history", "--color", "never"])
+        .arg("--config")
+        .arg(&config_file)
+        .env("MCP_REPL_FIXTURE_CALL_FILE", &call_file)
+        .env("MCP_REPL_FIXTURE_CANCEL_FILE", &cancel_file)
+        .env("MCP_REPL_FIXTURE_FOLLOWUP_FILE", &followup_file)
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        // Give this REPL a group owned by the test so the signal cannot reach
+        // the test runner or other concurrently running cases.
+        .process_group(0);
+    if connect_interactively {
+        command.arg("--demo");
+    } else {
+        command
+            .arg("--")
+            .arg(fixture)
+            .args(["--tools-only", "--cancel-first-call"]);
+    }
+    let mut child = command.spawn().expect("spawn stdio cancellation case");
+    let pid = i32::try_from(child.id().expect("REPL pid")).expect("Unix REPL pid");
+    let mut stdin = child.stdin.take().expect("REPL stdin");
+    let mut stdout = child.stdout.take().expect("REPL stdout");
+    let mut stderr = child.stderr.take().expect("REPL stderr");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    if connect_interactively {
+        let path = serde_json::to_string(&fixture.to_string_lossy()).expect("quote fixture path");
+        stdin
+            .write_all(format!("connect -- {path} --tools-only --cancel-first-call\n").as_bytes())
+            .await
+            .expect("connect fixture");
+    }
+    stdin
+        .write_all(b"add a=1 b=2\n")
+        .await
+        .expect("start pending tool call");
+    let call: serde_json::Value =
+        serde_json::from_str(&wait_for_file(&call_file, "spawned server's pending call").await)
+            .expect("call marker JSON");
+    let server_pid =
+        i32::try_from(call["pid"].as_u64().expect("server pid")).expect("Unix server pid");
+
+    // SAFETY: the negative pid names only the group created for our child.
+    // This models the terminal's broadcast after the server received the call.
+    assert_eq!(unsafe { libc::kill(-pid, libc::SIGINT) }, 0);
+    let cancelled: serde_json::Value = serde_json::from_str(
+        &wait_for_file(&cancel_file, "spawned server's MCP cancellation").await,
+    )
+    .expect("cancellation marker JSON");
+    assert_eq!(cancelled, call["id"], "cancel the pending request");
+    wait_for_output(&mut stderr, &mut err, "^C cancelled", "cancelled command").await;
+
+    stdin
+        .write_all(b"add a=20 b=22\n")
+        .await
+        .expect("call tool after cancellation");
+    wait_for_output(&mut stdout, &mut out, "42", "tool after cancellation").await;
+    assert_eq!(
+        wait_for_file(&followup_file, "followup server pid").await,
+        server_pid.to_string(),
+        "the same server must answer the next call"
+    );
+
+    // Switching connections explicitly shuts down the previous client. Check
+    // reaping while the REPL is still alive, before its exit could orphan a child.
+    stdin
+        .write_all(b"connect demo\necho message=server-reaped\n")
+        .await
+        .expect("close the stdio connection");
+    wait_for_output(
+        &mut stdout,
+        &mut out,
+        "server-reaped",
+        "reconnect completed",
+    )
+    .await;
+    assert_eq!(
+        wait_for_file(&exit_file, "cancelled server's normal shutdown").await,
+        "clean"
+    );
+    // SAFETY: signal 0 only checks whether the known child pid still exists.
+    let exists = unsafe { libc::kill(server_pid, 0) };
+    let error = std::io::Error::last_os_error();
+    assert_eq!(exists, -1, "the closed server must be reaped");
+    assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+
+    stdin.write_all(b"quit\n").await.expect("quit REPL");
+    drop(stdin);
+    let status = child.wait().await.expect("wait for REPL");
+    stdout.read_to_end(&mut out).await.expect("drain stdout");
+    stderr.read_to_end(&mut err).await.expect("drain stderr");
+    assert_success(
+        &Output {
+            status,
+            stdout: out,
+            stderr: err,
+        },
+        "interactive stdio cancellation and shutdown",
+    );
+}
+
 /// The id of the last traced request for `method`, read back out of the
 /// pretty-printed frame that `--trace` writes.
 #[cfg(unix)]
@@ -3013,6 +3132,10 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_respond_needs_the_final_lifecycle().await;
         #[cfg(unix)]
         exercise_cancellation().await;
+        #[cfg(unix)]
+        exercise_stdio_group_cancellation(&fixture, false).await;
+        #[cfg(unix)]
+        exercise_stdio_group_cancellation(&fixture, true).await;
         exercise_json_contract(&fixture, &temp).await;
         exercise_colliding_tool_names(&fixture, &temp).await;
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
