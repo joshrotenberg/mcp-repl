@@ -32,6 +32,16 @@ platform:
 cargo install --locked mcp-repl
 ```
 
+Or, on macOS or Linux, run the installer attached to each release:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/joshrotenberg/mcp-repl/releases/latest/download/mcp-repl-installer.sh | sh
+```
+
+It installs `mcp-repl` into `$CARGO_HOME/bin` (`~/.cargo/bin` when
+`CARGO_HOME` is unset) and adds that directory to `PATH` through your shell's
+startup files. Set `MCP_REPL_NO_MODIFY_PATH=1` to leave those files alone.
+
 Prebuilt macOS, Linux, and Windows archives are also attached to the
 [latest release](https://github.com/joshrotenberg/mcp-repl/releases/latest).
 Download the archive for your platform, extract it, and place `mcp-repl` (or
