@@ -19,8 +19,8 @@ mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
 
 `bash`, `zsh`, `fish`, `powershell`, and `elvish` are supported. Completion
 covers the flags and their accepted values, so `--protocol <Tab>` offers
-`stable` and `2026-07-28`, and `--elicitation <Tab>` offers `prompt` and
-`decline`.
+`stable`, `2026-07-28`, and `auto`, and `--elicitation <Tab>` offers `prompt`
+and `decline`.
 
 Both generators run before anything connects: they need no config file, no
 server, and no terminal, which is what lets a packaging script call the
@@ -70,6 +70,9 @@ mcp-repl path/to/.mcp.json:server-name
 
 # Opt into the final, sessionless 2026-07-28 lifecycle:
 mcp-repl --protocol 2026-07-28 --http http://127.0.0.1:3001/mcp
+
+# Probe first and use whichever lifecycle the server answers:
+mcp-repl --protocol auto -- ./my-server --stdio
 ```
 
 The binary compiles both stable and final protocol support. Runtime selection
@@ -78,6 +81,17 @@ is explicit: `--protocol stable` (the default) uses
 (`--protocol final` is an alias) uses `server/discover` and sends the selected
 protocol metadata on every request. Keeping stable as the default means an
 mcp-repl upgrade cannot silently change an existing server's lifecycle.
+
+`--protocol auto` probes with `server/discover` before deciding: a server
+that answers it gets the final lifecycle, and a server that does not (method
+not found, any other JSON-RPC error, a closed transport, or a probe that
+times out) gets a fresh `stable` connection instead. The probe uses its own
+short deadline rather than `--timeout`, so a legacy server is not made to
+look hung. Because a probed transport cannot be reused for the fallback
+handshake, a legacy stdio server is started twice under `auto`: once for the
+probe, again once the probe's child is closed and reaped. `auto` is opt-in;
+`stable` remains the default so an mcp-repl upgrade never adds probing to a
+connection that did not ask for it.
 
 ### Try it against a live server
 

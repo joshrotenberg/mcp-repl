@@ -321,6 +321,12 @@ explicit. `--protocol stable` (the default) uses
 every request. Keeping stable as the default means upgrading mcp-repl cannot
 silently change how it talks to a server you already use.
 
+`--protocol auto` is opt-in negotiation: it probes with `server/discover`
+first and stays on the final lifecycle if the server answers, falling back to
+a fresh `stable` connection otherwise. A legacy stdio server is started twice
+under `auto`, once for the probe and again for the fallback, since a probed
+transport cannot be reused for the handshake it falls back to.
+
 ## Contributing
 
 Bug reports and pull requests are welcome. `cargo test` runs the unit tests

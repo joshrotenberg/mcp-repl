@@ -119,19 +119,31 @@ use wire::{TracingTransport, wire};
 /// The final implementation is compiled into the binary, but stable remains
 /// the runtime default so upgrading mcp-repl never silently changes a server's
 /// handshake. `final` is accepted as a convenient alias for the dated value.
+/// `auto` is opt-in for the same reason: it probes the server with
+/// `server/discover` before deciding, so a connection only ever does that
+/// probing when the operator asked for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum ProtocolMode {
     #[default]
     Stable,
     #[value(name = "2026-07-28", alias = "final")]
     Final,
+    Auto,
 }
 
 impl ProtocolMode {
+    /// The protocol support allowlist for a client that will actually
+    /// connect. Only meaningful for a resolved lifecycle: call this with
+    /// [`ProtocolMode::Auto`] and it panics, because negotiating `auto` means
+    /// picking `Stable` or `Final` before any client is built (see
+    /// `resolve_protocol`).
     fn support(self) -> Result<ProtocolSupport, ProtocolSupportError> {
         match self {
             Self::Stable => Ok(ProtocolSupport::stable()),
             Self::Final => ProtocolSupport::try_new(["2026-07-28"]),
+            Self::Auto => {
+                unreachable!("auto is resolved to stable or final before a client is built")
+            }
         }
     }
 }
@@ -167,8 +179,12 @@ EXAMPLES:
 Inside the REPL, `help` lists the built-ins and `help <command>` explains one."
 )]
 struct Args {
-    /// Protocol lifecycle to use. `stable` uses initialize/initialized;
-    /// `2026-07-28` (alias: `final`) uses the sessionless discover lifecycle.
+    /// Protocol lifecycle to use. `stable` (the default) uses
+    /// initialize/initialized; `2026-07-28` (alias: `final`) uses the
+    /// sessionless discover lifecycle; `auto` probes with `server/discover`
+    /// first and uses the final lifecycle if the server answers it, falling
+    /// back to `stable` otherwise. A legacy stdio server is started twice
+    /// under `auto`: once for the probe, again for the fallback.
     #[arg(long, value_enum, default_value = "stable", hide_short_help = true)]
     protocol: ProtocolMode,
 
@@ -406,6 +422,40 @@ where
         Ok(result) => result,
         Err(_) => Err(tower_mcp::Error::Transport(format!(
             "no response after {}s (--timeout); the request may still be running on the server",
+            limit.as_secs()
+        ))),
+    }
+}
+
+/// Deadline for the `auto` probe's `server/discover` request.
+///
+/// Deliberately independent of `--timeout`/[`DEFAULT_REQUEST_TIMEOUT_SECS`]:
+/// the probe exists only to answer "does this server speak the final
+/// lifecycle," and inheriting the full 120-second default would make every
+/// `auto` connection to a legacy server look hung for two minutes before
+/// falling back to `initialize`. `--timeout` can still shorten the probe
+/// further when the operator set it below this ceiling.
+const PROTOCOL_PROBE_DEADLINE_SECS: u64 = 10;
+
+fn protocol_probe_deadline() -> Duration {
+    let ceiling = Duration::from_secs(PROTOCOL_PROBE_DEADLINE_SECS);
+    match request_timeout() {
+        Some(configured) if configured < ceiling => configured,
+        _ => ceiling,
+    }
+}
+
+/// Run the `auto` probe's `server/discover` request under
+/// [`protocol_probe_deadline`] rather than the ordinary request deadline.
+async fn with_probe_deadline<T, Fut>(fut: Fut) -> Result<T, tower_mcp::Error>
+where
+    Fut: Future<Output = Result<T, tower_mcp::Error>>,
+{
+    let limit = protocol_probe_deadline();
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(tower_mcp::Error::Transport(format!(
+            "no response to the protocol probe (server/discover) after {}s",
             limit.as_secs()
         ))),
     }
@@ -1510,6 +1560,9 @@ async fn establish_connection(
                 .unwrap_or_else(|| "2026-07-28".to_string());
             Ok(ConnectionInfo::from_discovery(discovery, protocol_version))
         }
+        ProtocolMode::Auto => {
+            unreachable!("auto is resolved to stable or final before establish_connection runs")
+        }
     }
 }
 
@@ -1525,7 +1578,77 @@ fn client_builder(protocol: ProtocolMode) -> Result<McpClientBuilder, ProtocolSu
     Ok(match protocol {
         ProtocolMode::Stable => builder,
         ProtocolMode::Final => builder.with_tasks(),
+        ProtocolMode::Auto => {
+            unreachable!("auto is resolved to stable or final before a client is built")
+        }
     })
+}
+
+/// Whether a `server/discover` failure is a modern server reporting that it
+/// has no protocol version in common with this client, as opposed to a
+/// legacy server that does not understand `server/discover` at all.
+///
+/// `McpClient::discover` already retries one `UnsupportedProtocolVersion`
+/// against the server's advertised intersection, so seeing the error here
+/// means the mismatch is real: falling back to `initialize` would not fix
+/// it, and the operator needs to see why rather than land on a misleading
+/// legacy connection. Every other failure - method not found, any other
+/// JSON-RPC error, a closed transport, or the probe's own deadline expiring -
+/// is exactly what a legacy server that has never heard of `server/discover`
+/// looks like, so those fall back.
+fn is_modern_incompatible(error: &tower_mcp::Error) -> bool {
+    matches!(
+        error,
+        tower_mcp::Error::JsonRpc(rpc)
+            if rpc.code == tower_mcp::McpErrorCode::UnsupportedProtocolVersion.code()
+    )
+}
+
+/// Resolve `--protocol auto` against one connection, or pass a fixed
+/// lifecycle straight through unchanged.
+///
+/// `connect_transport` must build an independent client and transport on
+/// every call. tower-mcp's protocol guide requires exactly that for dual-era
+/// probing: create a fresh client/transport for the fallback and never reuse
+/// one that was already probed, since a partially probed connection risks
+/// mixing lifecycle state. For a stdio target this means spawning the child
+/// process again, which is why a legacy stdio server is started twice under
+/// `auto`.
+///
+/// A fixed lifecycle calls `connect_transport` exactly once and defers to
+/// [`establish_initial_connection`] exactly as it always has, `connector`
+/// included, so `stable` and `2026-07-28` behave identically to before this
+/// function existed.
+async fn resolve_protocol<F, Fut>(
+    requested: ProtocolMode,
+    connector: Option<&Connector>,
+    connect_transport: F,
+) -> tower_mcp::Result<(McpClient, ConnectionInfo, ProtocolMode)>
+where
+    F: Fn(ProtocolMode) -> Fut,
+    Fut: Future<Output = tower_mcp::Result<McpClient>>,
+{
+    if requested != ProtocolMode::Auto {
+        let client = connect_transport(requested).await?;
+        let (client, info) = establish_initial_connection(client, connector, requested).await?;
+        return Ok((client, info, requested));
+    }
+
+    let probe_client = connect_transport(ProtocolMode::Final).await?;
+    match with_probe_deadline(establish_connection(&probe_client, ProtocolMode::Final)).await {
+        Ok(info) => Ok((probe_client, info, ProtocolMode::Final)),
+        Err(error) if is_modern_incompatible(&error) => Err(error),
+        Err(_legacy_signal) => {
+            // Close the probe connection in an orderly way rather than
+            // dropping it: a stdio child must see its stdin close and be
+            // reaped, not linger as an orphan while a second child spawns.
+            let _ = probe_client.shutdown().await;
+            let client = connect_transport(ProtocolMode::Stable).await?;
+            let (client, info) =
+                establish_initial_connection(client, None, ProtocolMode::Stable).await?;
+            Ok((client, info, ProtocolMode::Stable))
+        }
+    }
 }
 
 /// The connection banner: server identity, negotiated protocol, and any
@@ -3237,16 +3360,28 @@ impl ConnectRuntime {
         };
 
         let mut connector = None;
-        let builder = client_builder(self.protocol)
-            .map_err(|error| ConnectFailure::usage(error.to_string()))?;
-        let client = if demo {
-            builder
-                .connect(
-                    TracingTransport::new(ChannelTransport::new(demo_router())),
-                    (self.make_handler)(),
-                )
-                .await
-                .map_err(ConnectFailure::mcp)?
+        let requested_protocol = self.protocol;
+        let (client, info) = if demo {
+            let connect_transport = {
+                let make_handler = self.make_handler.clone();
+                move |protocol: ProtocolMode| {
+                    let make_handler = make_handler.clone();
+                    async move {
+                        client_builder(protocol)
+                            .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
+                            .connect(
+                                TracingTransport::new(ChannelTransport::new(demo_router())),
+                                make_handler(),
+                            )
+                            .await
+                    }
+                }
+            };
+            let (client, info, _resolved) =
+                resolve_protocol(requested_protocol, None, connect_transport)
+                    .await
+                    .map_err(ConnectFailure::mcp)?;
+            (client, info)
         } else {
             match connection.expect("non-demo targets resolve a connection") {
                 config::Connection::Http {
@@ -3300,22 +3435,69 @@ impl ConnectRuntime {
                     }
                     .map_err(ConnectFailure::usage)?;
                     let oauth = self.oauth_runtime(oauth_name.as_deref(), &url).await?;
-                    if !self.no_reconnect {
-                        connector = Some(http_connector(
-                            url.clone(),
-                            http_config.clone(),
-                            oauth.clone(),
-                            self.make_handler.clone(),
-                            self.protocol,
-                        ));
-                    }
-                    builder
-                        .connect(
-                            TracingTransport::new(http_transport(url, http_config, oauth)),
-                            (self.make_handler)(),
-                        )
-                        .await
-                        .map_err(ConnectFailure::mcp)?
+                    let pre_negotiated_connector = (requested_protocol != ProtocolMode::Auto
+                        && !self.no_reconnect)
+                        .then(|| {
+                            http_connector(
+                                url.clone(),
+                                http_config.clone(),
+                                oauth.clone(),
+                                self.make_handler.clone(),
+                                requested_protocol,
+                            )
+                        });
+                    let connect_transport = {
+                        let url = url.clone();
+                        let http_config = http_config.clone();
+                        let oauth = oauth.clone();
+                        let make_handler = self.make_handler.clone();
+                        move |protocol: ProtocolMode| {
+                            let url = url.clone();
+                            let http_config = http_config.clone();
+                            let oauth = oauth.clone();
+                            let make_handler = make_handler.clone();
+                            async move {
+                                client_builder(protocol)
+                                    .map_err(|error| {
+                                        tower_mcp::Error::Transport(error.to_string())
+                                    })?
+                                    .connect(
+                                        TracingTransport::new(http_transport(
+                                            url,
+                                            http_config,
+                                            oauth,
+                                        )),
+                                        make_handler(),
+                                    )
+                                    .await
+                            }
+                        }
+                    };
+                    let (client, info, resolved) = resolve_protocol(
+                        requested_protocol,
+                        pre_negotiated_connector.as_ref(),
+                        connect_transport,
+                    )
+                    .await
+                    .map_err(ConnectFailure::mcp)?;
+                    // `auto` cannot build the reconnect recipe until the
+                    // probe settles on a lifecycle; a fixed protocol already
+                    // built it above, identically to before this function
+                    // existed.
+                    connector = if requested_protocol == ProtocolMode::Auto {
+                        (!self.no_reconnect).then(|| {
+                            http_connector(
+                                url.clone(),
+                                http_config.clone(),
+                                oauth.clone(),
+                                self.make_handler.clone(),
+                                resolved,
+                            )
+                        })
+                    } else {
+                        pre_negotiated_connector
+                    };
+                    (client, info)
                 }
                 config::Connection::Stdio { command, env, cwd } => {
                     if self.bearer_from_fd.is_some() {
@@ -3343,43 +3525,67 @@ impl ConnectRuntime {
                         );
                         self.authorize_import(&plan)?;
                     }
-                    let Some(program) = command.first() else {
+                    if command.is_empty() {
                         return Err(ConnectFailure::usage("stdio command is empty"));
+                    }
+                    // A legacy stdio server is started twice under `auto`:
+                    // once for the probe, again for the fallback once it
+                    // drops the probe's child and connects fresh.
+                    let connect_transport = {
+                        let command = command.clone();
+                        let env = env.clone();
+                        let cwd = cwd.clone();
+                        let async_output = self.async_output.clone();
+                        let make_handler = self.make_handler.clone();
+                        move |protocol: ProtocolMode| {
+                            let command = command.clone();
+                            let env = env.clone();
+                            let cwd = cwd.clone();
+                            let async_output = async_output.clone();
+                            let make_handler = make_handler.clone();
+                            async move {
+                                let program = &command[0];
+                                let mut child = tokio::process::Command::new(program);
+                                child.args(&command[1..]);
+                                // Terminal Ctrl-C belongs to the REPL; the
+                                // server receives cancellation through MCP
+                                // instead of a broadcast SIGINT.
+                                #[cfg(unix)]
+                                child.process_group(0);
+                                child.envs(env);
+                                child.env_remove("MCP_BEARER");
+                                if let Some(cwd) = cwd {
+                                    child.current_dir(cwd);
+                                }
+                                child.stderr(std::process::Stdio::piped());
+                                let mut transport = StdioClientTransport::spawn_command(&mut child)
+                                    .await
+                                    .map_err(|error| {
+                                        tower_mcp::Error::Transport(format!(
+                                            "could not start stdio server {program:?}: {error}"
+                                        ))
+                                    })?;
+                                if let Some(stderr) = transport.take_stderr() {
+                                    forward_child_stderr(stderr, async_output.clone());
+                                }
+                                client_builder(protocol)
+                                    .map_err(|error| {
+                                        tower_mcp::Error::Transport(error.to_string())
+                                    })?
+                                    .connect(TracingTransport::new(transport), make_handler())
+                                    .await
+                            }
+                        }
                     };
-                    let mut child = tokio::process::Command::new(program);
-                    child.args(&command[1..]);
-                    // Terminal Ctrl-C belongs to the REPL; the server receives
-                    // cancellation through MCP instead of a broadcast SIGINT.
-                    #[cfg(unix)]
-                    child.process_group(0);
-                    child.envs(env);
-                    child.env_remove("MCP_BEARER");
-                    if let Some(cwd) = cwd {
-                        child.current_dir(cwd);
-                    }
-                    child.stderr(std::process::Stdio::piped());
-                    let mut transport = StdioClientTransport::spawn_command(&mut child)
-                        .await
-                        .map_err(|error| {
-                            ConnectFailure::mcp(tower_mcp::Error::Transport(format!(
-                                "could not start stdio server {program:?}: {error}"
-                            )))
-                        })?;
-                    if let Some(stderr) = transport.take_stderr() {
-                        forward_child_stderr(stderr, self.async_output.clone());
-                    }
-                    builder
-                        .connect(TracingTransport::new(transport), (self.make_handler)())
-                        .await
-                        .map_err(ConnectFailure::mcp)?
+                    let (client, info, _resolved) =
+                        resolve_protocol(requested_protocol, None, connect_transport)
+                            .await
+                            .map_err(ConnectFailure::mcp)?;
+                    (client, info)
                 }
             }
         };
 
-        let (client, info) =
-            establish_initial_connection(client, connector.as_ref(), self.protocol)
-                .await
-                .map_err(ConnectFailure::mcp)?;
         let surface = fetch_surface_initial(&client).await;
         let profile_aliases = profile_name
             .as_ref()
@@ -4627,22 +4833,34 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // refuse an individual request, and a server can only ask when the
     // capability is declared, so `--sampling decline` still exercises the
     // server's rejection path.
-    let builder = client_builder(args.protocol)
-        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error.to_string()));
+    //
+    // `client_builder` and the connect step both move inside
+    // `connect_transport` below rather than running once up front: `auto`
+    // needs to build a client per attempt (final for the probe, stable for
+    // the fallback), and a fixed lifecycle just calls it once.
+    let requested_protocol = args.protocol;
     // Only `--http` can be resurrected. A stdio child that dies takes its
     // stdin and stdout with it (respawning it is a separate concern), and the
     // in-process demo router cannot lose a session at all.
     let mut connector: Option<Connector> = None;
-    let client = if args.demo {
+    let connected = if args.demo {
         tracing::debug!("connecting to the in-process demo server");
-        Some(
-            builder
-                .connect(
-                    TracingTransport::new(ChannelTransport::new(demo_router())),
-                    make_handler(),
-                )
-                .await?,
-        )
+        let connect_transport = {
+            let make_handler = make_handler.clone();
+            move |protocol: ProtocolMode| {
+                let make_handler = make_handler.clone();
+                async move {
+                    client_builder(protocol)
+                        .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
+                        .connect(
+                            TracingTransport::new(ChannelTransport::new(demo_router())),
+                            make_handler(),
+                        )
+                        .await
+                }
+            }
+        };
+        Some(resolve_protocol(requested_protocol, None, connect_transport).await?)
     } else {
         match connection {
             Some(config::Connection::Http {
@@ -4804,23 +5022,60 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 } else {
                     None
                 };
-                if !args.no_reconnect {
-                    connector = Some(http_connector(
-                        url.clone(),
-                        config.clone(),
-                        oauth.clone(),
-                        make_handler.clone(),
-                        args.protocol,
-                    ));
-                }
-                Some(
-                    builder
-                        .connect(
-                            TracingTransport::new(http_transport(url, config, oauth)),
-                            make_handler(),
+                let pre_negotiated_connector =
+                    (requested_protocol != ProtocolMode::Auto && !args.no_reconnect).then(|| {
+                        http_connector(
+                            url.clone(),
+                            config.clone(),
+                            oauth.clone(),
+                            make_handler.clone(),
+                            requested_protocol,
                         )
-                        .await?,
+                    });
+                let connect_transport = {
+                    let url = url.clone();
+                    let config = config.clone();
+                    let oauth = oauth.clone();
+                    let make_handler = make_handler.clone();
+                    move |protocol: ProtocolMode| {
+                        let url = url.clone();
+                        let config = config.clone();
+                        let oauth = oauth.clone();
+                        let make_handler = make_handler.clone();
+                        async move {
+                            client_builder(protocol)
+                                .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
+                                .connect(
+                                    TracingTransport::new(http_transport(url, config, oauth)),
+                                    make_handler(),
+                                )
+                                .await
+                        }
+                    }
+                };
+                let resolved = resolve_protocol(
+                    requested_protocol,
+                    pre_negotiated_connector.as_ref(),
+                    connect_transport,
                 )
+                .await?;
+                // `auto` cannot build the reconnect recipe until the probe
+                // settles on a lifecycle; a fixed protocol already built it
+                // above, identically to before this function existed.
+                connector = if requested_protocol == ProtocolMode::Auto {
+                    (!args.no_reconnect).then(|| {
+                        http_connector(
+                            url.clone(),
+                            config.clone(),
+                            oauth.clone(),
+                            make_handler.clone(),
+                            resolved.2,
+                        )
+                    })
+                } else {
+                    pre_negotiated_connector
+                };
+                Some(resolved)
             }
             Some(config::Connection::Stdio { command, env, cwd }) => {
                 // An imported entry is code from somewhere else: show what it
@@ -4848,31 +5103,54 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                         }
                     }
                 }
-                let mut cmd = tokio::process::Command::new(&command[0]);
-                cmd.args(&command[1..]);
-                // Terminal Ctrl-C belongs to the REPL; the server receives
-                // cancellation through MCP instead of a broadcast SIGINT.
-                #[cfg(unix)]
-                cmd.process_group(0);
-                cmd.envs(env);
-                // The child inherits this process's environment, which is
-                // usually what a stdio server wants. MCP_BEARER is the
-                // exception: it is an HTTP credential by construction, and
-                // nothing reached over stdio has any use for it.
-                cmd.env_remove("MCP_BEARER");
-                if let Some(cwd) = cwd {
-                    cmd.current_dir(cwd);
-                }
-                cmd.stderr(std::process::Stdio::piped());
-                let mut transport = StdioClientTransport::spawn_command(&mut cmd).await?;
-                if let Some(stderr) = transport.take_stderr() {
-                    forward_child_stderr(stderr, async_output.clone());
-                }
-                Some(
-                    builder
-                        .connect(TracingTransport::new(transport), make_handler())
-                        .await?,
-                )
+                // A legacy stdio server is started twice under `auto`: once
+                // for the probe, again for the fallback once it drops the
+                // probe's child and connects fresh. `connect_transport` does
+                // the spawning, so every attempt gets its own process.
+                let connect_transport = {
+                    let command = command.clone();
+                    let env = env.clone();
+                    let cwd = cwd.clone();
+                    let async_output = async_output.clone();
+                    let make_handler = make_handler.clone();
+                    move |protocol: ProtocolMode| {
+                        let command = command.clone();
+                        let env = env.clone();
+                        let cwd = cwd.clone();
+                        let async_output = async_output.clone();
+                        let make_handler = make_handler.clone();
+                        async move {
+                            let mut cmd = tokio::process::Command::new(&command[0]);
+                            cmd.args(&command[1..]);
+                            // Terminal Ctrl-C belongs to the REPL; the server
+                            // receives cancellation through MCP instead of a
+                            // broadcast SIGINT.
+                            #[cfg(unix)]
+                            cmd.process_group(0);
+                            cmd.envs(env);
+                            // The child inherits this process's environment,
+                            // which is usually what a stdio server wants.
+                            // MCP_BEARER is the exception: it is an HTTP
+                            // credential by construction, and nothing reached
+                            // over stdio has any use for it.
+                            cmd.env_remove("MCP_BEARER");
+                            if let Some(cwd) = cwd {
+                                cmd.current_dir(cwd);
+                            }
+                            cmd.stderr(std::process::Stdio::piped());
+                            let mut transport =
+                                StdioClientTransport::spawn_command(&mut cmd).await?;
+                            if let Some(stderr) = transport.take_stderr() {
+                                forward_child_stderr(stderr, async_output.clone());
+                            }
+                            client_builder(protocol)
+                                .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
+                                .connect(TracingTransport::new(transport), make_handler())
+                                .await
+                        }
+                    }
+                };
+                Some(resolve_protocol(requested_protocol, None, connect_transport).await?)
             }
             None => {
                 if one_shot || args.json {
@@ -4882,72 +5160,71 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             }
         }
     };
-    let (session, surface) = if let Some(client) = client {
-        let (client, info) =
-            establish_initial_connection(client, connector.as_ref(), args.protocol).await?;
-        if let Ok(mut label) = server_label.write() {
-            label.clone_from(&info.server_info.name);
-        }
-        if !quiet {
-            print_banner(&info);
-        }
-        let session = Arc::new(Session::new(client, connector));
-        let surface = Arc::new(RwLock::new(fetch_surface_initial(&session.client()).await));
-        if !quiet {
-            let s = surface.read().unwrap();
-            print_counts(&s);
-            // List the tools at startup so the surface is browsable immediately,
-            // unless the server already enumerated them in its instructions.
-            let instructions_list_tools = info
-                .instructions
-                .as_deref()
-                .is_some_and(|instr| s.tools().first().is_some_and(|t| instr.contains(&t.name)));
-            if !instructions_list_tools {
-                print_tool_overview(&s);
+    let (session, surface, resolved_protocol) =
+        if let Some((client, info, resolved_protocol)) = connected {
+            if let Ok(mut label) = server_label.write() {
+                label.clone_from(&info.server_info.name);
             }
-            if !one_shot {
-                print_first_run_hint();
+            if !quiet {
+                print_banner(&info);
             }
-        }
-        (session, surface)
-    } else {
-        if let Ok(mut label) = server_label.write() {
-            *label = "mcp-repl".to_string();
-        }
-        // A bare invocation lands here, so for many people this is the first
-        // thing mcp-repl ever says. One command was not enough to go on: it
-        // named neither `help` nor `-h`, and implied `connect` took only
-        // `demo`.
-        println!("not connected. To get started:");
-        for (command, description) in [
-            ("connect demo", "a bundled server, nothing to install"),
+            let session = Arc::new(Session::new(client, connector));
+            let surface = Arc::new(RwLock::new(fetch_surface_initial(&session.client()).await));
+            if !quiet {
+                let s = surface.read().unwrap();
+                print_counts(&s);
+                // List the tools at startup so the surface is browsable immediately,
+                // unless the server already enumerated them in its instructions.
+                let instructions_list_tools = info.instructions.as_deref().is_some_and(|instr| {
+                    s.tools().first().is_some_and(|t| instr.contains(&t.name))
+                });
+                if !instructions_list_tools {
+                    print_tool_overview(&s);
+                }
+                if !one_shot {
+                    print_first_run_hint();
+                }
+            }
+            (session, surface, resolved_protocol)
+        } else {
+            if let Ok(mut label) = server_label.write() {
+                *label = "mcp-repl".to_string();
+            }
+            // A bare invocation lands here, so for many people this is the first
+            // thing mcp-repl ever says. One command was not enough to go on: it
+            // named neither `help` nor `-h`, and implied `connect` took only
+            // `demo`.
+            println!("not connected. To get started:");
+            for (command, description) in [
+                ("connect demo", "a bundled server, nothing to install"),
+                (
+                    "connect <url|profile|command...>",
+                    "an HTTP URL, saved profile, or stdio server",
+                ),
+                ("help", "the commands available here"),
+                ("quit", "leave"),
+            ] {
+                println!(
+                    "  {}  {}",
+                    style::column(Style::new().bold(), command, 32),
+                    paint(Style::new().dimmed(), description)
+                );
+            }
+            // A blank line separates what to type here from what to have typed
+            // instead, which are different kinds of advice.
+            println!();
+            for line in [
+                "Or start connected: mcp-repl --demo, --http <url>, --server <name>",
+                "`mcp-repl -h` lists the startup flags.",
+            ] {
+                println!("{}", paint(Style::new().dimmed(), line));
+            }
             (
-                "connect <url|profile|command...>",
-                "an HTTP URL, saved profile, or stdio server",
-            ),
-            ("help", "the commands available here"),
-            ("quit", "leave"),
-        ] {
-            println!(
-                "  {}  {}",
-                style::column(Style::new().bold(), command, 32),
-                paint(Style::new().dimmed(), description)
-            );
-        }
-        // A blank line separates what to type here from what to have typed
-        // instead, which are different kinds of advice.
-        println!();
-        for line in [
-            "Or start connected: mcp-repl --demo, --http <url>, --server <name>",
-            "`mcp-repl -h` lists the startup flags.",
-        ] {
-            println!("{}", paint(Style::new().dimmed(), line));
-        }
-        (
-            Arc::new(Session::disconnected()),
-            Arc::new(RwLock::new(Surface::default())),
-        )
-    };
+                Arc::new(Session::disconnected()),
+                Arc::new(RwLock::new(Surface::default())),
+                requested_protocol,
+            )
+        };
 
     #[cfg(feature = "unstable-dynamic-cli")]
     let dynamic_command = if dynamic_argv.is_empty() {
@@ -5028,8 +5305,11 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // Final list-change notifications are subscription-scoped. Start the
     // long-lived stream only for an interactive final connection, after the
     // initial surface fetch; stable notifications already arrive directly,
-    // and one-shot output must remain deterministic.
-    let _surface_subscription = (args.protocol == ProtocolMode::Final).then(|| {
+    // and one-shot output must remain deterministic. `resolved_protocol` is
+    // what the connection actually negotiated, not what `--protocol` asked
+    // for: under `auto` that is the only way to tell whether the probe
+    // landed on the final lifecycle.
+    let _surface_subscription = (resolved_protocol == ProtocolMode::Final).then(|| {
         surface_subscription::SurfaceSubscription::start(session.clone(), async_output.clone())
     });
 
@@ -8347,6 +8627,90 @@ mod tests {
         }
     }
 
+    /// Answers every request with JSON-RPC method-not-found, the shape a
+    /// legacy server gives `server/discover`.
+    struct MethodNotFoundTransport {
+        incoming_tx: tokio::sync::mpsc::Sender<String>,
+        incoming_rx: tokio::sync::mpsc::Receiver<String>,
+    }
+
+    impl MethodNotFoundTransport {
+        fn new() -> Self {
+            let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(4);
+            Self {
+                incoming_tx,
+                incoming_rx,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ClientTransport for MethodNotFoundTransport {
+        async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
+            let request: serde_json::Value = serde_json::from_str(message)?;
+            if let Some(id) = request.get("id") {
+                self.incoming_tx
+                    .send(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32601, "message": "Method not found" },
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?;
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
+            Ok(self.incoming_rx.recv().await)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn close(&mut self) -> tower_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Accepts every request and never answers, so a caller waiting on a
+    /// response hangs until something else (a deadline) gives up.
+    struct HangingTransport;
+
+    #[async_trait]
+    impl ClientTransport for HangingTransport {
+        async fn send(&mut self, _message: &str) -> tower_mcp::Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
+            std::future::pending().await
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn close(&mut self) -> tower_mcp::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Restores `REQUEST_TIMEOUT_SECS` when a test that shortens it (to make
+    /// the probe deadline exercisable without a real ten-second wait) finishes
+    /// or panics, so a later test in the same process never inherits it.
+    struct RestoreRequestTimeout(u64);
+
+    impl Drop for RestoreRequestTimeout {
+        fn drop(&mut self) {
+            REQUEST_TIMEOUT_SECS.store(self.0, Ordering::Relaxed);
+        }
+    }
+
     fn jsonrpc(code: i32, message: &str) -> tower_mcp::Error {
         tower_mcp::Error::JsonRpc(tower_mcp::error::JsonRpcError {
             code,
@@ -8373,6 +8737,12 @@ mod tests {
                 ["2026-07-28"]
             );
         }
+
+        // `auto` is a real, opt-in value; it resolves to stable or final per
+        // connection rather than having a `ProtocolSupport` of its own, so
+        // `.support()` is not exercised here the way it is above.
+        let auto_args = Args::try_parse_from(["mcp-repl", "--protocol", "auto", "--demo"]).unwrap();
+        assert_eq!(auto_args.protocol, ProtocolMode::Auto);
     }
 
     #[test]
@@ -8516,6 +8886,139 @@ mod tests {
             sent[0]["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
             "mcp-repl"
         );
+    }
+
+    /// `auto` probes first: a server that answers `server/discover` stays on
+    /// the final lifecycle, and the probe client is the one actually used, so
+    /// `initialize` is never sent at all.
+    #[tokio::test]
+    async fn auto_prefers_discover_and_never_sends_initialize_when_it_succeeds() {
+        let (transport, outgoing) = DiscoveryTransport::new(serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "auto-final-server",
+                    "version": "1.0.0"
+                }
+            }
+        }));
+        // `Fn` cannot move a captured value out on each call; `Option::take`
+        // both supplies the single transport this scenario needs and turns a
+        // second, unexpected attempt into an immediate panic instead of a
+        // silent extra connection.
+        let transport = Arc::new(Mutex::new(Some(transport)));
+        let connect_transport = move |protocol: ProtocolMode| {
+            let transport = transport.clone();
+            async move {
+                let transport = transport
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("a successful probe must not be attempted again");
+                client_builder(protocol)
+                    .unwrap()
+                    .connect_simple(transport)
+                    .await
+            }
+        };
+
+        let (client, info, resolved) =
+            resolve_protocol(ProtocolMode::Auto, None, connect_transport)
+                .await
+                .expect("a server that answers discover resolves");
+
+        assert_eq!(resolved, ProtocolMode::Final);
+        assert_eq!(info.server_info.name, "auto-final-server");
+        assert_eq!(info.protocol_version, "2026-07-28");
+        assert!(client.discovery().await.is_some());
+        assert!(client.server_info().await.is_none());
+
+        let sent = outgoing.lock().unwrap();
+        assert_eq!(sent.len(), 1, "only the probe, no initialize fallback");
+        assert_eq!(sent[0]["method"], "server/discover");
+    }
+
+    /// A server that answers `server/discover` with method-not-found is
+    /// exactly what a legacy server looks like: `auto` drops the probe and
+    /// connects again with a fresh client that sends `initialize`.
+    #[tokio::test]
+    async fn auto_falls_back_to_a_fresh_stable_client_when_discover_is_not_found() {
+        let connect_transport = |protocol: ProtocolMode| async move {
+            match protocol {
+                ProtocolMode::Final => {
+                    client_builder(protocol)
+                        .unwrap()
+                        .connect_simple(MethodNotFoundTransport::new())
+                        .await
+                }
+                ProtocolMode::Stable => {
+                    client_builder(protocol)
+                        .unwrap()
+                        .connect_simple(ChannelTransport::new(demo_router()))
+                        .await
+                }
+                ProtocolMode::Auto => unreachable!("resolve_protocol resolves before connecting"),
+            }
+        };
+
+        let (client, info, resolved) =
+            resolve_protocol(ProtocolMode::Auto, None, connect_transport)
+                .await
+                .expect("a legacy server falls back to a stable connection");
+
+        assert_eq!(resolved, ProtocolMode::Stable);
+        assert_eq!(info.server_info.name, "mcp-repl-demo");
+        assert_eq!(
+            info.protocol_version,
+            tower_mcp::protocol::LATEST_PROTOCOL_VERSION
+        );
+        // `initialize`, not `discover`, is what populates this.
+        assert!(client.server_info().await.is_some());
+        assert!(client.discovery().await.is_none());
+    }
+
+    /// A server that never answers `server/discover` at all (rather than
+    /// rejecting it) must not hang the connection for the ordinary
+    /// `--timeout`/120s default: the probe's own short deadline gives up and
+    /// falls back the same way an explicit rejection would.
+    #[tokio::test]
+    async fn auto_falls_back_to_stable_when_the_probe_deadline_expires() {
+        // Shortens the probe deadline (10s ceiling, `--timeout` when lower) so
+        // this test does not wait the full ten seconds; restored on drop so a
+        // later test in the same process never inherits it.
+        let previous = REQUEST_TIMEOUT_SECS.swap(1, Ordering::Relaxed);
+        let _restore = RestoreRequestTimeout(previous);
+
+        let connect_transport = |protocol: ProtocolMode| async move {
+            match protocol {
+                ProtocolMode::Final => {
+                    client_builder(protocol)
+                        .unwrap()
+                        .connect_simple(HangingTransport)
+                        .await
+                }
+                ProtocolMode::Stable => {
+                    client_builder(protocol)
+                        .unwrap()
+                        .connect_simple(ChannelTransport::new(demo_router()))
+                        .await
+                }
+                ProtocolMode::Auto => unreachable!("resolve_protocol resolves before connecting"),
+            }
+        };
+
+        let (client, info, resolved) =
+            resolve_protocol(ProtocolMode::Auto, None, connect_transport)
+                .await
+                .expect("an expired probe deadline falls back to a stable connection");
+
+        assert_eq!(resolved, ProtocolMode::Stable);
+        assert_eq!(info.server_info.name, "mcp-repl-demo");
+        assert!(client.server_info().await.is_some());
     }
 
     #[test]
