@@ -1967,6 +1967,61 @@ async fn exercise_downgraded_protocol(fixture: &Path, temp: &TempDir) {
     );
 }
 
+/// `--protocol auto` probes with `server/discover` before choosing a
+/// lifecycle. The default fixture serves both eras, so the probe succeeds and
+/// the connection stays final; the `--tools-only` fixture speaks JSON-RPC by
+/// hand and falls through to method-not-found for anything it does not list,
+/// which is exactly what a legacy server looks like, so `auto` drops that
+/// probe and connects again with a fresh stable client through `initialize`.
+async fn exercise_protocol_auto(fixture: &Path, temp: &TempDir) {
+    let dual_era = run_stdio(
+        fixture,
+        temp,
+        "protocol-auto-final",
+        &["--protocol", "auto", "--verbose", "--exec", "quit"],
+    )
+    .await;
+    assert_success(&dual_era, "protocol auto against a dual-era server");
+    let stdout = String::from_utf8_lossy(&dual_era.stdout);
+    assert!(
+        stdout.contains("protocol 2026-07-28"),
+        "a server that answers server/discover stays on the final lifecycle:\n{stdout}"
+    );
+
+    let exit_file = temp.path().join("protocol-auto-legacy.exit");
+    let mut command = repl_command();
+    command
+        .args(["--protocol", "auto", "--verbose", "--exec", "quit"])
+        .arg(fixture)
+        .arg("--tools-only")
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let legacy = run(
+        command,
+        "protocol auto against a legacy server",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&legacy, "protocol auto against a legacy server");
+    // The probe's own stdio child must be closed and reaped, not orphaned,
+    // before the fallback spawns a second one; both report the same clean
+    // exit, so this only confirms neither was left running.
+    assert_eq!(
+        wait_for_file(&exit_file, "stdio fixture shutdown").await,
+        "clean",
+        "mcp-repl left a stdio child running"
+    );
+    let stdout = String::from_utf8_lossy(&legacy.stdout);
+    assert!(
+        stdout.contains("protocol 2025-11-25"),
+        "a server that cannot answer server/discover falls back to a stable \
+         connection through initialize:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("2026-07-28"),
+        "the fallback must not report the lifecycle it abandoned:\n{stdout}"
+    );
+}
+
 /// An absent pagination cursor must be absent, not null.
 ///
 /// `cursor` is optional in the schema, and a server that generates its
@@ -3149,6 +3204,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_unreadable_listing(&fixture, &temp).await;
         exercise_absent_cursor(&fixture, &temp).await;
         exercise_downgraded_protocol(&fixture, &temp).await;
+        exercise_protocol_auto(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;
