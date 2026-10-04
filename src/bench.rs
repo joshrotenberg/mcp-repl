@@ -238,6 +238,9 @@ pub async fn run(
         let remaining = remaining.clone();
         workers.push(tokio::spawn(async move {
             let mut calls = Vec::new();
+            // `AtomicUsize::try_update` is the new name, but it requires
+            // Rust 1.95 and the project MSRV is 1.90.
+            #[allow(deprecated)]
             while remaining
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     left.checked_sub(1)
