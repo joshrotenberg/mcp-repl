@@ -12,8 +12,15 @@ all-features = true
 
 [advisories]
 version = 2
-# Nothing ignored. An entry here needs a comment saying why and when it goes.
-ignore = []
+# keyring 4.2's v1 compatibility API hardcodes its zbus Secret Service backend,
+# whose standalone name/wire crates were declared unmaintained after this lockfile
+# was generated. There is no safe upgrade yet. Remove these temporary exceptions
+# when the explicit backend migration in #309 lands.
+ignore = [
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
+]
 
 [licenses]
 version = 2
