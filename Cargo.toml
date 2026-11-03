@@ -82,7 +82,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reedline = { version = "0.49", features = ["external_printer"] }
 nu-ansi-term = "0.50"
-keyring = "4.1"
+keyring-core = "1.0.1"
 webbrowser = { version = "1.2", features = ["hardened"] }
 tempfile = "3"
 unicode-width = "0.2"
@@ -92,11 +92,26 @@ clap_mangen = "0.3"
 crossterm = { version = "0.29", default-features = false }
 url = "2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1.1.0"
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+# Preserve desktop Secret Service storage, with an encrypted D-Bus session.
+# Vendor libdbus so source installs and musl archives need no system libdbus.
+dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust", "vendored"] }
+
 [target.'cfg(unix)'.dependencies]
 # `--bearer-fd` has to validate that an inherited descriptor is open before
 # claiming ownership with `File::from_raw_fd`. The standard library exposes
 # ownership, but not the validating `fcntl(F_GETFD)` probe.
 libc = "0.2"
+
+# Detect the C compiler/runtime used by vendored native dependencies.
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's

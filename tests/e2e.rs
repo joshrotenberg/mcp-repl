@@ -186,6 +186,9 @@ fn repl_command() -> Command {
     // tracing filter must not add framework records to those assertions;
     // individual cases opt back in when logging is what they exercise.
     command.env_remove("RUST_LOG");
+    // HTTP fixtures must never receive a developer's ambient bearer token.
+    // Authentication cases explicitly set their own synthetic credentials.
+    command.env_remove("MCP_BEARER");
     command
 }
 
@@ -1590,11 +1593,10 @@ async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir
 
 /// `--login`/`--logout` under `--json` speak the same NDJSON contract.
 ///
-/// The success path of `--login` needs a real authorization server, so what
-/// is reachable here is everything around it: that `--json` is accepted at
-/// all, that a failure is the standard envelope rather than prose, and that
-/// `--logout` reports what it removed. The shape of a saved profile is
-/// covered by a unit test.
+/// Exercise only usage failures, before any credential store is initialized.
+/// Successful credential persistence and removal are covered by in-memory
+/// unit tests; an E2E test must never read or remove a developer's keychain
+/// entries, even when its configuration file is temporary.
 async fn exercise_login_json(temp: &TempDir) {
     let config = temp.path().join("login.toml");
     std::fs::write(&config, "").expect("write empty config");
@@ -1625,49 +1627,36 @@ async fn exercise_login_json(temp: &TempDir) {
         String::from_utf8_lossy(&with_exec.stdout)
     );
 
-    // Removing a profile touches the operating-system credential store, which
-    // a headless runner does not have. Both outcomes are correct, and the
-    // contract is what this pins: exactly one parseable value either way,
-    // the success shape or the standard auth envelope. The failure branch is
-    // worth covering in its own right, since "a script gets an envelope
-    // rather than prose when it fails" is half the point of the flag.
+    // Name validation runs before credential-store initialization. A slash
+    // makes this invalid on every supported platform, so the test cannot
+    // reach any real credential even when a keychain is available.
     let mut logout = repl_command();
-    logout.args(["--logout", "work", "--json", "--config", &config]);
-    let logout = run(logout, "logout json", CASE_TIMEOUT).await;
-    let values = json_lines(&logout, "logout json");
+    logout.args(["--logout", "invalid/profile", "--json", "--config", &config]);
+    let logout = run(logout, "logout invalid profile json", CASE_TIMEOUT).await;
+    assert_status(&logout, 2, "logout invalid profile json");
+    let values = json_lines(&logout, "logout invalid profile json");
     assert_eq!(values.len(), 1, "one value per invocation");
-    match logout.status.code() {
-        Some(0) => {
-            assert_eq!(values[0]["profile"], "work");
-            assert_eq!(values[0]["removed"], true);
-        }
-        Some(5) => {
-            assert_eq!(values[0]["kind"], "auth");
-            assert_eq!(values[0]["exitStatus"], 5);
-        }
-        other => panic!("unexpected logout status {other:?}: {}", values[0]),
-    }
+    assert_eq!(values[0]["kind"], "usage");
+    assert_eq!(values[0]["exitStatus"], 2);
+    assert!(
+        String::from_utf8_lossy(&logout.stdout).contains("OAuth profile names"),
+        "the failure comes from name validation: {}",
+        values[0]
+    );
 
-    // Without `--json`, the human wording is unchanged. Same split: the
-    // message goes to stdout on success and stderr on failure, because
-    // stdout is the data stream.
+    // The same safe validation failure uses stderr in human mode and leaves
+    // stdout empty for data.
     let mut human = repl_command();
-    human.args(["--logout", "work", "--config", &config]);
-    let human = run(human, "logout human", CASE_TIMEOUT).await;
+    human.args(["--logout", "invalid/profile", "--config", &config]);
+    let human = run(human, "logout invalid profile human", CASE_TIMEOUT).await;
+    assert_status(&human, 2, "logout invalid profile human");
     let stdout = String::from_utf8_lossy(&human.stdout);
     let stderr = String::from_utf8_lossy(&human.stderr);
-    if human.status.success() {
-        assert!(stdout.contains("removed OAuth profile"), "{stdout}");
-    } else {
-        assert!(
-            stderr.contains("credential store"),
-            "a failure explains itself on stderr:\n{stderr}"
-        );
-        assert!(
-            stdout.is_empty(),
-            "and stdout stays the data stream: {stdout}"
-        );
-    }
+    assert!(
+        stderr.contains("OAuth profile names"),
+        "name validation explains itself on stderr:\n{stderr}"
+    );
+    assert!(stdout.is_empty(), "stdout stays the data stream: {stdout}");
 }
 
 /// `[repl] request_timeout` supplies the default `--timeout` uses.

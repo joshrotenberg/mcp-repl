@@ -98,29 +98,69 @@ fn decode_chunks(chunks: impl IntoIterator<Item = String>) -> Result<String, Str
         .map_err(|_| "stored OAuth credential record is not UTF-8".to_string())
 }
 
-fn keyring_entry(account: &str) -> Result<keyring::v1::Entry, String> {
-    keyring::v1::Entry::new(KEYRING_SERVICE, account).map_err(|error| error.to_string())
+// Use a private store rather than keyring-core's process-wide default. This
+// keeps library callers and isolated tests from replacing each other's store.
+fn platform_store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> {
+    #[cfg(target_os = "macos")]
+    let store = apple_native_keyring_store::keychain::Store::new()?;
+    #[cfg(target_os = "windows")]
+    let store = windows_native_keyring_store::Store::new()?;
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    let store = dbus_secret_service_keyring_store::Store::new()?;
+    #[cfg(all(any(unix, windows), not(any(target_os = "ios", target_os = "android"))))]
+    {
+        Ok(store)
+    }
+    #[cfg(not(all(any(unix, windows), not(any(target_os = "ios", target_os = "android")))))]
+    Err(keyring_core::Error::Invalid(
+        "platform".to_string(),
+        "must be macOS, Windows, or a non-iOS, non-Android *nix variant".to_string(),
+    ))
 }
 
-fn delete_keyring_entry(account: &str) -> Result<(), String> {
-    match keyring_entry(account)?.delete_credential() {
-        Ok(()) | Err(keyring::v1::Error::NoEntry) => Ok(()),
+fn keyring_entry(
+    store: &keyring_core::CredentialStore,
+    account: &str,
+) -> Result<keyring_core::Entry, String> {
+    // No modifiers: preserve the v1 backend's service/account identity and
+    // default collection, including discovery of existing Secret Service items.
+    store
+        .build(KEYRING_SERVICE, account, None)
+        .map_err(|error| error.to_string())
+}
+
+fn delete_keyring_entry(
+    store: &keyring_core::CredentialStore,
+    account: &str,
+) -> Result<(), String> {
+    match keyring_entry(store, account)?.delete_credential() {
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(error.to_string()),
     }
 }
 
-fn read_keyring_manifest(profile: &str) -> Result<Option<KeyringManifest>, String> {
-    match keyring_entry(profile)?.get_password() {
+fn read_keyring_manifest(
+    store: &keyring_core::CredentialStore,
+    profile: &str,
+) -> Result<Option<KeyringManifest>, String> {
+    match keyring_entry(store, profile)?.get_password() {
         Ok(encoded) => KeyringManifest::parse(&encoded).map(Some),
-        Err(keyring::v1::Error::NoEntry) => Ok(None),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
 }
 
-fn delete_keyring_generation(profile: &str, manifest: &KeyringManifest) -> Result<(), String> {
+fn delete_keyring_generation(
+    store: &keyring_core::CredentialStore,
+    profile: &str,
+    manifest: &KeyringManifest,
+) -> Result<(), String> {
     let mut first_error = None;
     for index in 0..manifest.chunks {
-        if let Err(error) = delete_keyring_entry(&chunk_account(profile, manifest, index))
+        if let Err(error) = delete_keyring_entry(store, &chunk_account(profile, manifest, index))
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -136,21 +176,22 @@ trait SecretBackend: Send + Sync {
     async fn remove(&self, profile: &str) -> Result<(), String>;
 }
 
-#[derive(Debug, Default)]
-struct KeyringSecretBackend;
+#[derive(Debug)]
+struct KeyringSecretBackend {
+    store: Arc<keyring_core::CredentialStore>,
+}
 
 impl KeyringSecretBackend {
-    fn check() -> Result<(), String> {
-        keyring::v1::Entry::store_status()
-            .as_ref()
-            .map_err(|error| {
-                format!(
-                    "the operating-system credential store is unavailable: {error}. \
+    fn from_store(
+        store: keyring_core::Result<Arc<keyring_core::CredentialStore>>,
+    ) -> Result<Self, String> {
+        store.map(|store| Self { store }).map_err(|error| {
+            format!(
+                "the operating-system credential store is unavailable: {error}. \
                  mcp-repl will not fall back to plaintext; use MCP_BEARER for a headless \
                  environment or configure the platform credential service"
-                )
-            })
-            .copied()
+            )
+        })
     }
 }
 
@@ -158,20 +199,23 @@ impl KeyringSecretBackend {
 impl SecretBackend for KeyringSecretBackend {
     async fn load(&self, profile: &str) -> Result<Option<String>, String> {
         let profile = profile.to_string();
+        let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            let Some(manifest) = read_keyring_manifest(&profile)? else {
+            let Some(manifest) = read_keyring_manifest(store.as_ref(), &profile)? else {
                 return Ok(None);
             };
             let mut chunks = Vec::with_capacity(manifest.chunks);
             for index in 0..manifest.chunks {
                 let account = chunk_account(&profile, &manifest, index);
-                let chunk = keyring_entry(&account)?.get_password().map_err(|error| {
-                    if matches!(error, keyring::v1::Error::NoEntry) {
-                        "stored OAuth credential record is incomplete".to_string()
-                    } else {
-                        error.to_string()
-                    }
-                })?;
+                let chunk = keyring_entry(store.as_ref(), &account)?
+                    .get_password()
+                    .map_err(|error| {
+                        if matches!(error, keyring_core::Error::NoEntry) {
+                            "stored OAuth credential record is incomplete".to_string()
+                        } else {
+                            error.to_string()
+                        }
+                    })?;
                 chunks.push(chunk);
             }
             decode_chunks(chunks).map(Some)
@@ -183,8 +227,9 @@ impl SecretBackend for KeyringSecretBackend {
     async fn save(&self, profile: &str, secret: &str) -> Result<(), String> {
         let profile = profile.to_string();
         let secret = secret.to_string();
+        let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            let previous = read_keyring_manifest(&profile)?;
+            let previous = read_keyring_manifest(store.as_ref(), &profile)?;
             let encoded_chunks = encode_chunks(&secret);
             if encoded_chunks.is_empty() || encoded_chunks.len() > MAX_KEYRING_CHUNKS {
                 return Err("OAuth credential record is too large for the secure store".to_string());
@@ -195,25 +240,28 @@ impl SecretBackend for KeyringSecretBackend {
             };
             for (index, chunk) in encoded_chunks.iter().enumerate() {
                 let account = chunk_account(&profile, &manifest, index);
-                if let Err(error) = keyring_entry(&account)
+                if let Err(error) = keyring_entry(store.as_ref(), &account)
                     .and_then(|entry| entry.set_password(chunk).map_err(|error| error.to_string()))
                 {
                     for cleanup in 0..index {
-                        let _ = delete_keyring_entry(&chunk_account(&profile, &manifest, cleanup));
+                        let _ = delete_keyring_entry(
+                            store.as_ref(),
+                            &chunk_account(&profile, &manifest, cleanup),
+                        );
                     }
                     return Err(error);
                 }
             }
-            if let Err(error) = keyring_entry(&profile).and_then(|entry| {
+            if let Err(error) = keyring_entry(store.as_ref(), &profile).and_then(|entry| {
                 entry
                     .set_password(&manifest.encode())
                     .map_err(|error| error.to_string())
             }) {
-                let _ = delete_keyring_generation(&profile, &manifest);
+                let _ = delete_keyring_generation(store.as_ref(), &profile, &manifest);
                 return Err(error);
             }
             if let Some(previous) = previous {
-                delete_keyring_generation(&profile, &previous)?;
+                delete_keyring_generation(store.as_ref(), &profile, &previous)?;
             }
             Ok(())
         })
@@ -223,11 +271,12 @@ impl SecretBackend for KeyringSecretBackend {
 
     async fn remove(&self, profile: &str) -> Result<(), String> {
         let profile = profile.to_string();
+        let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            if let Some(manifest) = read_keyring_manifest(&profile)? {
-                delete_keyring_generation(&profile, &manifest)?;
+            if let Some(manifest) = read_keyring_manifest(store.as_ref(), &profile)? {
+                delete_keyring_generation(store.as_ref(), &profile, &manifest)?;
             }
-            delete_keyring_entry(&profile)
+            delete_keyring_entry(store.as_ref(), &profile)
         })
         .await
         .map_err(|error| format!("credential-store worker failed: {error}"))?
@@ -275,8 +324,8 @@ impl std::fmt::Debug for CredentialStore {
 impl CredentialStore {
     pub fn keyring(profile: &str) -> Result<Self, String> {
         validate_name(profile)?;
-        KeyringSecretBackend::check()?;
-        Ok(Self::with_backend(profile, Arc::new(KeyringSecretBackend)))
+        let backend = KeyringSecretBackend::from_store(platform_store())?;
+        Ok(Self::with_backend(profile, Arc::new(backend)))
     }
 
     fn with_backend(profile: &str, backend: Arc<dyn SecretBackend>) -> Self {
@@ -656,6 +705,226 @@ mod tests {
         assert!(validate_name("work-prod_1.example").is_ok());
         assert!(validate_name(&"a".repeat(65)).is_err());
         assert!(validate_name("contains/slash").is_err());
+    }
+
+    fn mock_keyring() -> (Arc<keyring_core::mock::Store>, KeyringSecretBackend) {
+        let store = keyring_core::mock::Store::new().unwrap();
+        let backend = KeyringSecretBackend::from_store(Ok(store.clone())).unwrap();
+        (store, backend)
+    }
+
+    #[test]
+    fn store_initialization_failure_keeps_headless_guidance() {
+        let error =
+            KeyringSecretBackend::from_store(Err(keyring_core::Error::NoDefaultStore)).unwrap_err();
+        assert!(error.contains("credential store is unavailable"));
+        assert!(error.contains("will not fall back to plaintext"));
+        assert!(error.contains("MCP_BEARER"));
+    }
+
+    fn seed_legacy_record(store: &keyring_core::CredentialStore) {
+        // Literal identifiers/format from the old v1 API, not the new helpers.
+        store
+            .build("mcp-repl/oauth", "work", None)
+            .unwrap()
+            .set_password("v1:01abcdef:2")
+            .unwrap();
+        store
+            .build("mcp-repl/oauth", "work:01abcdef:0", None)
+            .unwrap()
+            .set_password("bGVnYWN5IA==")
+            .unwrap();
+        store
+            .build("mcp-repl/oauth", "work:01abcdef:1", None)
+            .unwrap()
+            .set_password("c2VjcmV0")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_store_reads_replaces_and_removes_legacy_chunks() {
+        let (store, backend) = mock_keyring();
+        seed_legacy_record(store.as_ref());
+        assert_eq!(
+            backend.load("work").await.unwrap().as_deref(),
+            Some("legacy secret")
+        );
+
+        let secret = "🔐".repeat(700);
+        backend.save("work", &secret).await.unwrap();
+        assert_eq!(backend.load("work").await.unwrap(), Some(secret));
+        let manifest = read_keyring_manifest(store.as_ref(), "work")
+            .unwrap()
+            .unwrap();
+        assert_ne!(manifest.generation, "01abcdef");
+        assert!(manifest.chunks > 1);
+        for index in 0..manifest.chunks {
+            let chunk = keyring_entry(store.as_ref(), &chunk_account("work", &manifest, index))
+                .unwrap()
+                .get_password()
+                .unwrap();
+            assert!(chunk.len() <= 1024);
+        }
+        for account in ["work:01abcdef:0", "work:01abcdef:1"] {
+            assert!(matches!(
+                keyring_entry(store.as_ref(), account)
+                    .unwrap()
+                    .get_password(),
+                Err(keyring_core::Error::NoEntry)
+            ));
+        }
+
+        backend.remove("work").await.unwrap();
+        backend.remove("work").await.unwrap();
+        assert_eq!(backend.load("work").await.unwrap(), None);
+        for index in 0..manifest.chunks {
+            assert!(matches!(
+                keyring_entry(store.as_ref(), &chunk_account("work", &manifest, index))
+                    .unwrap()
+                    .get_password(),
+                Err(keyring_core::Error::NoEntry)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_corrupt_and_inaccessible_records_remain_distinct() {
+        let (store, backend) = mock_keyring();
+        assert_eq!(backend.load("work").await.unwrap(), None);
+        let entry = keyring_entry(store.as_ref(), "work").unwrap();
+        entry.set_password("not a manifest").unwrap();
+        assert!(
+            backend
+                .load("work")
+                .await
+                .unwrap_err()
+                .contains("manifest is invalid")
+        );
+        entry.set_password("v1:01abcdef:1").unwrap();
+        assert!(
+            backend
+                .load("work")
+                .await
+                .unwrap_err()
+                .contains("record is incomplete")
+        );
+        entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap()
+            .set_error(keyring_core::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("test store locked"),
+            )));
+        assert!(
+            backend
+                .load("work")
+                .await
+                .unwrap_err()
+                .contains("test store locked")
+        );
+    }
+
+    // Fail one entry construction after a chosen number of successful calls.
+    // The underlying store is entirely in memory, including cleanup checks.
+    struct FailingStore {
+        inner: Arc<keyring_core::mock::Store>,
+        calls: AtomicUsize,
+        fail_on: usize,
+    }
+
+    impl keyring_core::api::CredentialStoreApi for FailingStore {
+        fn vendor(&self) -> String {
+            "mcp-repl test".to_string()
+        }
+        fn id(&self) -> String {
+            "isolated".to_string()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn build(
+            &self,
+            service: &str,
+            account: &str,
+            modifiers: Option<&HashMap<&str, &str>>,
+        ) -> keyring_core::Result<keyring_core::Entry> {
+            assert_eq!(service, "mcp-repl/oauth");
+            assert!(modifiers.is_none());
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_on {
+                return Err(keyring_core::Error::NoStorageAccess(Box::new(
+                    std::io::Error::other("injected build failure"),
+                )));
+            }
+            self.inner.build(service, account, modifiers)
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_or_manifest_write_preserves_previous_generation() {
+        use keyring_core::api::CredentialStoreApi;
+        // Read old manifest, write two chunks, publish manifest. Fail the
+        // second chunk or the publication, exercising both rollback paths.
+        for fail_on in [3, 4] {
+            let inner = keyring_core::mock::Store::new().unwrap();
+            seed_legacy_record(inner.as_ref());
+            let store = Arc::new(FailingStore {
+                inner: inner.clone(),
+                calls: AtomicUsize::new(0),
+                fail_on,
+            });
+            let backend = KeyringSecretBackend::from_store(Ok(store)).unwrap();
+            assert!(
+                backend
+                    .save("work", &"x".repeat(KEYRING_CHUNK_BYTES + 1))
+                    .await
+                    .unwrap_err()
+                    .contains("injected build failure")
+            );
+            assert_eq!(
+                backend.load("work").await.unwrap().as_deref(),
+                Some("legacy secret")
+            );
+            for entry in inner
+                .search(&HashMap::from([("service", "mcp-repl/oauth")]))
+                .unwrap()
+            {
+                let (_, account) = entry.get_specifiers().unwrap();
+                if account != "work" && !account.starts_with("work:01abcdef:") {
+                    assert!(matches!(
+                        entry.get_password(),
+                        Err(keyring_core::Error::NoEntry)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_deletion_can_be_retried_without_losing_manifest() {
+        let (store, backend) = mock_keyring();
+        seed_legacy_record(store.as_ref());
+        let chunk = keyring_entry(store.as_ref(), "work:01abcdef:0").unwrap();
+        chunk
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap()
+            .set_error(keyring_core::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("test store locked"),
+            )));
+        assert!(
+            backend
+                .remove("work")
+                .await
+                .unwrap_err()
+                .contains("test store locked")
+        );
+        assert!(
+            read_keyring_manifest(store.as_ref(), "work")
+                .unwrap()
+                .is_some()
+        );
+        backend.remove("work").await.unwrap();
+        assert_eq!(backend.load("work").await.unwrap(), None);
     }
 
     fn token(access_token: &str) -> OAuthStoredToken {

@@ -27,7 +27,9 @@ runner or script suite.
 The native target list and artifact policy live in `dist-workspace.toml`.
 `cargo dist generate` owns `.github/workflows/release.yml`; this repository
 keeps the generated workflow's default permission read-only and grants write
-permissions only to its host job.
+permissions only to its host job. Preserve the ARM64 musl credential-store
+link check when regenerating: it builds a library consumer without opening a
+credential store and verifies that both binaries remain static.
 
 ## Repository setup
 
