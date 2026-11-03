@@ -109,6 +109,10 @@ dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rus
 # ownership, but not the validating `fcntl(F_GETFD)` probe.
 libc = "0.2"
 
+# Detect the C compiler/runtime used by vendored native dependencies.
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's
 # server-side features and the fixture's own HTTP dependencies.
