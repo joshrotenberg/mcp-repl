@@ -624,6 +624,23 @@ mod tests {
         }
     }
 
+    struct RemoveFailingBackend(MemoryBackend);
+
+    #[async_trait]
+    impl SecretBackend for RemoveFailingBackend {
+        async fn load(&self, profile: &str) -> Result<Option<String>, String> {
+            self.0.load(profile).await
+        }
+
+        async fn save(&self, profile: &str, secret: &str) -> Result<(), String> {
+            self.0.save(profile, secret).await
+        }
+
+        async fn remove(&self, _profile: &str) -> Result<(), String> {
+            Err("the test credential store is locked".to_string())
+        }
+    }
+
     fn binding(resource: &str) -> OAuthTokenBinding {
         OAuthTokenBinding {
             resource: resource.to_string(),
@@ -718,11 +735,55 @@ mod tests {
     async fn clear_removes_every_secret_for_profile() {
         let backend = Arc::new(MemoryBackend::default());
         let store = CredentialStore::with_backend("work", backend.clone());
+        let other = CredentialStore::with_backend("personal", backend.clone());
         OAuthTokenStore::save(&store, &binding("https://one/mcp"), &token("one"))
             .await
             .unwrap();
+        OAuthClientRegistrationStore::save(
+            &store,
+            "https://auth.example",
+            &OAuthClientRegistration::dynamically_registered(
+                "https://auth.example",
+                "client",
+                Some("client-secret".to_string()),
+            ),
+        )
+        .await
+        .unwrap();
+        OAuthTokenStore::save(&other, &binding("https://other/mcp"), &token("other"))
+            .await
+            .unwrap();
+
+        // Logout clears tokens and registration secrets only for the selected
+        // profile, and repeating it is safe when that profile is already gone.
         store.clear().await.unwrap();
-        assert!(backend.0.read().unwrap().is_empty());
+        store.clear().await.unwrap();
+        assert!(!store.has_tokens().await.unwrap());
+        assert!(
+            OAuthClientRegistrationStore::load(&store, "https://auth.example")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(other.has_tokens().await.unwrap());
+        assert_eq!(backend.0.read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_reports_store_failure_and_preserves_secrets() {
+        let backend = Arc::new(RemoveFailingBackend(MemoryBackend::default()));
+        let store = CredentialStore::with_backend("work", backend.clone());
+        OAuthTokenStore::save(&store, &binding("https://one/mcp"), &token("one"))
+            .await
+            .unwrap();
+        let before = backend.0.0.read().unwrap()["work"].clone();
+
+        assert_eq!(
+            store.clear().await.unwrap_err(),
+            "the test credential store is locked"
+        );
+        assert_eq!(backend.0.0.read().unwrap()["work"], before);
+        assert!(store.has_tokens().await.unwrap());
     }
 
     #[tokio::test]

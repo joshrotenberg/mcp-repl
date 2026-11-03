@@ -1,4 +1,6 @@
 /target
+# Trusted current policy checkout used by publication workflows.
+/.release-policy/
 __pycache__/
 *.py[cod]
 # VHS scratch recordings; the committed assets are the Screenshot stills.
