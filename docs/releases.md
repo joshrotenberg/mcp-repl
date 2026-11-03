@@ -59,10 +59,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo package --locked
+python3 scripts/check_advisory_expiry.py
 cargo deny check -D unmatched-skip -D unnecessary-skip \
   advisories licenses bans sources
 cargo dist plan
 ```
+
+The temporary exceptions for the three unmaintained dependencies in [#309](https://github.com/joshrotenberg/mcp-repl/issues/309)
+expire on November 16, 2026 at midnight Pacific (08:00 UTC). The same fixed
+deadline guard runs immediately before release-plz publication, so an older
+green CI result cannot authorize publishing with expired exceptions.
 
 For container changes, build and smoke the image:
 

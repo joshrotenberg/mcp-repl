@@ -80,6 +80,7 @@ percentage.
 Adding or updating a dependency also needs:
 
 ```bash
+python3 scripts/check_advisory_expiry.py
 cargo deny check \
   -D unmatched-skip \
   -D unnecessary-skip \
@@ -93,6 +94,16 @@ resolved or unmatched baseline entry also fails so the allowlist cannot become
 stale. CI runs it on every pull request and `main` push, and daily, since an
 advisory can be published against a dependency that has not changed. Install
 it with `cargo install cargo-deny`.
+
+The three temporary unmaintained-dependency exceptions tracked in [#309](https://github.com/joshrotenberg/mcp-repl/issues/309)
+expire at **2026-11-16 00:00 America/Los_Angeles (08:00 UTC)**. The Python 3.11+
+guard enforces the exact scope and fixed deadline before CI's dependency check
+and crate publication. Removing all three exceptions removes the deadline
+block; extending it requires a new maintainer decision. Existing green checks
+do not change retroactively: every execution at or after the cutoff fails
+while any exception remains, including the next daily run at November 17
+06:17 UTC. Run the boundary tests with
+`python3 -m unittest discover -s scripts -p 'test_advisory_expiry.py'`.
 
 ## Commit Messages
 

@@ -12,8 +12,16 @@ all-features = true
 
 [advisories]
 version = 2
-# Nothing ignored. An entry here needs a comment saying why and when it goes.
-ignore = []
+# Approved two-week maintenance exception while #309 finds a safe replacement.
+# The proposed libdbus backend has a cryptographic RNG regression; keep the
+# established encrypted Secret Service backend. Only these unmaintained crates
+# are excepted, never vulnerabilities or yanked crates. Expiry is enforced by
+# scripts/check_advisory_expiry.py in CI and immediately before publication.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained zvariant; #309 https://github.com/joshrotenberg/mcp-repl/issues/309; expires 2026-11-16 00:00 PST (08:00 UTC)" },
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained zbus_names; #309 https://github.com/joshrotenberg/mcp-repl/issues/309; expires 2026-11-16 00:00 PST (08:00 UTC)" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained zvariant_derive; #309 https://github.com/joshrotenberg/mcp-repl/issues/309; expires 2026-11-16 00:00 PST (08:00 UTC)" },
+]
 
 [licenses]
 version = 2
