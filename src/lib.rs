@@ -3815,6 +3815,21 @@ fn load_config(explicit: Option<&str>) -> config::Config {
     }
 }
 
+// Inject only the credential operation so logout's ordering and CLI result can
+// be tested without initializing an operating-system credential store.
+async fn logout_profile(
+    name: &str,
+    path: &std::path::Path,
+    clear: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<serde_json::Value, (ExitStatus, String)> {
+    clear.await.map_err(|error| (ExitStatus::Auth, error))?;
+    oauth_profile::remove_metadata(path, name).map_err(|error| (ExitStatus::Usage, error))?;
+    Ok(serde_json::json!({
+        "profile": name,
+        "removed": true,
+    }))
+}
+
 async fn handle_oauth_profile_action(
     args: &Args,
     profiles: &config::Config,
@@ -3859,19 +3874,13 @@ async fn handle_oauth_profile_action(
     });
 
     if args.logout.is_some() {
-        let store = oauth_profile::CredentialStore::keyring(name)
-            .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
-        store
-            .clear()
-            .await
-            .unwrap_or_else(|error| exit_with_error(ExitStatus::Auth, &error));
-        oauth_profile::remove_metadata(path, name)
-            .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+        let result = logout_profile(name, path, async {
+            oauth_profile::CredentialStore::keyring(name)?.clear().await
+        })
+        .await
+        .unwrap_or_else(|(status, error)| exit_with_error(status, &error));
         if json_output() {
-            print_json(&serde_json::json!({
-                "profile": name,
-                "removed": true,
-            }));
+            print_json(&result);
         } else {
             println!("removed OAuth profile {name:?} and its stored credentials");
         }
@@ -8313,6 +8322,98 @@ mod tests {
         let surface = surface.read().unwrap();
         assert_eq!(describe_value(&surface, "wait").unwrap()["kind"], "tool");
         assert_eq!(describe_value(&surface, "jobs").unwrap()["kind"], "builtin");
+    }
+
+    #[tokio::test]
+    async fn logout_profile_clears_credentials_before_metadata_and_reports_success() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[oauth.work]\nurl = \"https://work.example/mcp\"\n\
+             [oauth.personal]\nurl = \"https://personal.example/mcp\"\n",
+        )
+        .unwrap();
+        let mut clear_calls = 0;
+        let result = logout_profile("work", &path, async {
+            clear_calls += 1;
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("oauth.work")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(clear_calls, 1);
+        assert_eq!(
+            result,
+            serde_json::json!({"profile": "work", "removed": true})
+        );
+        let source = std::fs::read_to_string(&path).unwrap();
+        let remaining = config::Config::parse(&source).unwrap();
+        assert!(!remaining.oauth.contains_key("work"));
+        assert!(remaining.oauth.contains_key("personal"));
+
+        // As with the production credential backend, a repeated logout of a
+        // missing profile succeeds and retains the same script-facing shape.
+        assert_eq!(
+            logout_profile("work", &path, std::future::ready(Ok(())))
+                .await
+                .unwrap(),
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_profile_reports_auth_failure_without_removing_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        let source = "[oauth.work]\nurl = \"https://work.example/mcp\"\n";
+        std::fs::write(&path, source).unwrap();
+        let (status, message) = logout_profile(
+            "work",
+            &path,
+            std::future::ready(Err("the test credential store is locked".to_string())),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, ExitStatus::Auth);
+        assert_eq!(
+            error_json(status, &message),
+            serde_json::json!({
+                "error": "the test credential store is locked",
+                "kind": "auth",
+                "exitStatus": 5,
+            })
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn logout_profile_reports_metadata_failure_as_usage_after_clearing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        let invalid = "[oauth.work";
+        std::fs::write(&path, invalid).unwrap();
+        let mut cleared = false;
+        let (status, message) = logout_profile("work", &path, async {
+            cleared = true;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(cleared);
+        assert_eq!(status, ExitStatus::Usage);
+        let error = error_json(status, &message);
+        assert_eq!(error["kind"], "usage");
+        assert_eq!(error["exitStatus"], 2);
+        assert!(message.contains(path.to_str().unwrap()));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
     }
 
     #[test]
