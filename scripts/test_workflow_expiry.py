@@ -17,6 +17,15 @@ def job(file, name):
 
 
 class WorkflowExpiryTests(unittest.TestCase):
+    def test_release_source_cannot_write_workflow_caches(self):
+        for file in ["release.yml", "container-build.yml"]:
+            with self.subTest(file=file):
+                source = (WORKFLOWS / file).read_text()
+                # Enforce the native token restriction with no job override.
+                self.assertEqual(re.findall(r"^[ \t]*cache-mode:.*$", source, re.M),
+                                 ["cache-mode: read"])
+        self.assertIn("save-if: false", job("release.yml", "build-local-artifacts"))
+
     def test_each_publication_command_has_a_fresh_guard(self):
         for file, name, command, root in [
             ("release.yml", "plan", "          dist ${{", "."),
