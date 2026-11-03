@@ -234,8 +234,13 @@ discovery advertises several.
 Only non-secret routing metadata is written to `config.toml`. Access tokens,
 refresh tokens, and dynamically registered client secrets are kept in macOS
 Keychain, Windows Credential Manager, or the Linux Secret Service through the
-platform credential store. If no secure store is available, mcp-repl fails
-closed; it never writes a plaintext credential fallback. A saved expired token
+platform credential store. Linux/*nix uses libdbus Secret Service with an encrypted
+D-Bus session, preserving existing profile entries and the default collection.
+The native stores are selected explicitly; no session-only kernel keyring is used.
+If no secure store is available, mcp-repl fails
+closed; it never writes a plaintext credential fallback. In headless environments
+without a Secret Service session, supply `MCP_BEARER` instead of an OAuth profile.
+A saved expired token
 is refreshed automatically. A failed refresh tells you to run `--login` again;
 an explicit login discards the unusable token while retaining reusable DCR
 registration.

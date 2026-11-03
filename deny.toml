@@ -59,12 +59,11 @@ skip = [
     { crate = "digest@0.10.7", reason = "blocked on secret-service and the WebSocket sha1 stack adopting digest 0.11" },
     # Platform keyring support and rand/tungstenite are on older getrandom
     # generations than mcp-repl, tempfile, uuid, and tower-mcp.
-    { crate = "getrandom@0.2.17", reason = "blocked on secret-service moving off getrandom 0.2" },
     { crate = "getrandom@0.3.4", reason = "blocked on rand 0.9 and tungstenite moving to getrandom 0.4" },
     { crate = "r-efi@5.3.0", reason = "blocked on the getrandom 0.3 dependency line" },
     { crate = "sha2@0.10.9", reason = "blocked on secret-service moving to sha2 0.11" },
     # The proc-macro ecosystem is midway through the syn 3 transition.
-    { crate = "syn@2.0.119", reason = "blocked on futures, zbus, tracing, and platform macro crates adopting syn 3" },
+    { crate = "syn@2.0.119", reason = "blocked on futures, tracing, and platform macro crates adopting syn 3" },
     # reedline reaches windows-sys 0.59 through fd-lock; the rest of the graph
     # has moved to windows-sys 0.61.
     { crate = "windows-sys@0.59.0", reason = "blocked on fd-lock and reedline adopting windows-sys 0.61" },
