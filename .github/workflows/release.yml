@@ -156,6 +156,20 @@ jobs:
           # shellcheck disable=SC2086
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Verify ARM64 musl credential-store linkage
+        if: contains(matrix.targets, 'aarch64-unknown-linux-musl')
+        shell: bash
+        run: |
+          # Link a library consumer without executing credential-store code.
+          cargo build --locked --profile dist --target aarch64-unknown-linux-musl --example credential_store_link
+          for binary in target/aarch64-unknown-linux-musl/dist/mcp-repl target/aarch64-unknown-linux-musl/dist/examples/credential_store_link; do
+            headers=$(readelf --program-headers --dynamic "$binary")
+            if grep -Eq 'INTERP|\(NEEDED\)' <<< "$headers"; then
+              echo "Expected a static musl binary: $binary" >&2
+              exit 1
+            fi
+            echo "Verified static linkage: $binary"
+          done
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
