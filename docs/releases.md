@@ -33,6 +33,12 @@ permissions only to its host job.
 Preserve the source-SHA wiring and publication deadline checks when regenerating
 the workflow; `allow-dirty = ["ci"]` permits these reviewed patches.
 
+Default GitHub attestations identify the workflow's `main` ref and SHA; they
+do not independently attest the checked-out release-tag source. The plan
+records the tag's resolved source SHA separately and passes it to each build
+and publication job. When rebuilding an older tag, do not treat the attested
+workflow SHA as the release source SHA.
+
 ## Repository setup
 
 GitHub Actions' default workflow permission stays read-only. The repository
