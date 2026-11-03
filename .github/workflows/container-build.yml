@@ -55,11 +55,16 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          context: git
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}},value=${{ inputs.tag }}
             type=raw,value=latest
+          labels: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          annotations: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
       - name: Build OCI image
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -81,6 +86,8 @@ jobs:
       - name: Verify OCI copy preserves platforms and attestations
         env:
           EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_SHA: ${{ steps.source.outputs.sha }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
         run: |
           skopeo copy --all --preserve-digests --digestfile "$RUNNER_TEMP/verified-digest" \
             "oci-archive:$RUNNER_TEMP/mcp-repl.oci.tar" "oci:$RUNNER_TEMP/verified-oci:release"
@@ -106,7 +113,20 @@ jobs:
                   if descriptor.get("annotations", {}).get("vnd.docker.reference.digest") == image["digest"]:
                       for layer in blob(descriptor)["layers"]:
                           if layer["mediaType"] == "application/vnd.in-toto+json":
-                              predicates.add(blob(layer)["predicateType"])
+                              statement = blob(layer)
+                              kind = statement["predicateType"]
+                              predicates.add(kind)
+                              if kind.startswith("https://slsa.dev/provenance/"):
+                                  predicate = statement["predicate"]
+                                  if kind == "https://slsa.dev/provenance/v0.2":
+                                      metadata = predicate["metadata"]["https://mobyproject.org/buildkit@v1#metadata"]
+                                  elif kind == "https://slsa.dev/provenance/v1":
+                                      metadata = predicate["runDetails"]["metadata"]["buildkit_metadata"]
+                                  else:
+                                      raise ValueError(f"unsupported provenance schema: {kind}")
+                                  # Buildx reports local-context VCS metadata from the checkout.
+                                  assert metadata["vcs"]["revision"] == os.environ["EXPECTED_SHA"], "provenance commit mismatch"
+                                  assert metadata["vcs"]["source"].removesuffix(".git") == os.environ["EXPECTED_SOURCE"], "provenance repository mismatch"
               assert "https://spdx.dev/Document" in predicates, "missing platform SBOM"
               assert any(p.startswith("https://slsa.dev/provenance/") for p in predicates), "missing platform provenance"
           PY
