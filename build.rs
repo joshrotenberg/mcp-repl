@@ -38,8 +38,9 @@ fn link_gnu_atomic_runtime() {
     );
     let directory = archive.parent().expect("GCC runtime directory");
     println!("cargo::rustc-link-search=native={}", directory.display());
-    // Keep this as a linker library so it follows the transitive native
-    // archives instead of bundling it into mcp_repl's rlib too early.
-    // GCC's libgcc.a is static; its shared runtime is named libgcc_s.
-    println!("cargo::rustc-link-lib=gcc");
+    // Rust schedules static/unspecified native libraries beside this crate,
+    // before libdbus introduces the helper references. Use its late native
+    // library pass, but name the exact archive: -l:libgcc.a still links GCC
+    // statically and also propagates to downstream users of mcp_repl.
+    println!("cargo::rustc-link-lib=dylib:+verbatim=libgcc.a");
 }
