@@ -30,8 +30,15 @@ The native target list and artifact policy live in `dist-workspace.toml`.
 `cargo dist generate` owns `.github/workflows/release.yml`; this repository
 keeps the generated workflow's default permission read-only and grants write
 permissions only to its host job.
-Preserve the source-SHA wiring and publication deadline checks when regenerating
-the workflow; `allow-dirty = ["ci"]` permits these reviewed patches.
+Preserve the source-SHA wiring, cache access limits, and publication deadline
+checks when regenerating the workflow; `allow-dirty = ["ci"]` permits these
+reviewed patches.
+
+Native and container workflows use GitHub's `cache-mode: read`. This restricts
+the job's cache token so code from a release tag cannot write caches in the
+dispatch ref's scope. Release builds can restore existing caches, but do not
+save them. This limit applies independently of whether a cache action runs.
+See [GitHub's cache access documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode).
 
 Default GitHub attestations identify the workflow's `main` ref and SHA; they
 do not independently attest the checked-out release-tag source. The plan

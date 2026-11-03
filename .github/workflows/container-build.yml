@@ -18,6 +18,8 @@ on:
 
 permissions:
   contents: read
+# This also limits cache tokens when invoked by a dispatch on main.
+cache-mode: read
 
 jobs:
   prepare:
