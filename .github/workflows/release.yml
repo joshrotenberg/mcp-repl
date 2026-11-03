@@ -54,16 +54,40 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
+      source-sha: ${{ steps.source.outputs.sha }}
       tag: ${{ (inputs.tag != 'dry-run' && inputs.tag) || '' }}
       tag-flag: ${{ inputs.tag && inputs.tag != 'dry-run' && format('--tag={0}', inputs.tag) || '' }}
       publishing: ${{ inputs.tag && inputs.tag != 'dry-run' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Require current workflow for publication
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != 'dry-run' && github.ref != 'refs/heads/main'
+        run: |
+          echo 'Dispatch Release from main with the requested tag as input.' >&2
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ inputs.tag && inputs.tag != 'dry-run' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+      - name: Resolve release source once
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Checkout current publication policy
+        if: inputs.tag && inputs.tag != 'dry-run'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: joshrotenberg/mcp-repl
+          ref: main
+          path: .release-policy
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Set up policy Python
+        if: inputs.tag && inputs.tag != 'dry-run'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -80,7 +104,12 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          PUBLISHING: ${{ inputs.tag && inputs.tag != 'dry-run' }}
         run: |
+          if [[ "$PUBLISHING" == 'true' ]]; then
+            python3 .release-policy/scripts/check_advisory_expiry.py --source-root .
+          fi
           dist ${{ (inputs.tag && inputs.tag != 'dry-run' && format('host --steps=create --tag={0}', inputs.tag)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
@@ -124,6 +153,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ needs.plan.outputs.source-sha }}
       - name: Install Rust non-interactively if not already installed
         if: ${{ matrix.container }}
         run: |
@@ -193,6 +223,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ needs.plan.outputs.source-sha }}
       - name: Install cached dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -270,6 +301,19 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ needs.plan.outputs.source-sha }}
+      - name: Checkout current publication policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: joshrotenberg/mcp-repl
+          ref: main
+          path: .release-policy
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Set up policy Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
       - name: Install cached dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -286,6 +330,7 @@ jobs:
       - id: host
         shell: bash
         run: |
+          python3 .release-policy/scripts/check_advisory_expiry.py --source-root .
           dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
@@ -307,6 +352,8 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      - name: Check deadline before attestation
+        run: python3 .release-policy/scripts/check_advisory_expiry.py --source-root .
       - name: Attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
@@ -322,12 +369,13 @@ jobs:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_COMMIT: "${{ needs.plan.outputs.source-sha }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
           # PRERELEASE_FLAG is optionally one argument; artifacts must expand.
+          python3 .release-policy/scripts/check_advisory_expiry.py --source-root .
           # shellcheck disable=SC2086
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
@@ -348,6 +396,25 @@ jobs:
           persist-credentials: true
           repository: "joshrotenberg/homebrew-brew"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Checkout release source for policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: joshrotenberg/mcp-repl
+          ref: ${{ needs.plan.outputs.source-sha }}
+          path: release-source
+          persist-credentials: false
+      - name: Checkout current publication policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: joshrotenberg/mcp-repl
+          ref: main
+          path: .release-policy
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Set up policy Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
       # So we have access to the formula
       - name: Fetch homebrew formulae
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
@@ -375,6 +442,7 @@ jobs:
             git add "Formula/${filename}"
             git commit -m "${name} ${version}"
           done
+          python3 .release-policy/scripts/check_advisory_expiry.py --source-root release-source
           git push
 
   announce:
@@ -394,3 +462,4 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ needs.plan.outputs.source-sha }}

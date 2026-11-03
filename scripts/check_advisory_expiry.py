@@ -2,12 +2,14 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+import argparse
 import sys
 import tomllib
 
 
 ISSUE = "https://github.com/joshrotenberg/mcp-repl/issues/309"
 APPROVED = {"RUSTSEC-2026-0370", "RUSTSEC-2026-0371", "RUSTSEC-2026-0372"}
+AFFECTED_PACKAGES = {"zvariant", "zbus_names", "zvariant_derive"}
 # November 16, 2026 at 00:00 America/Los_Angeles (PST). Never roll forward.
 EXPIRES = datetime(2026, 11, 16, 8, tzinfo=timezone.utc)
 
@@ -33,13 +35,31 @@ def check_exceptions(ignored, now):
         )
 
 
-def main():
-    try:
-        policy = Path(__file__).resolve().parents[1] / "deny.toml"
+def check_source(root, now):
+    """Inspect the released source, not the current guard's own dependency graph."""
+    policy = root / "deny.toml"
+    ignored = []
+    if policy.exists():
         with policy.open("rb") as source:
             ignored = tomllib.load(source)["advisories"].get("ignore", [])
-        # No command-line or environment override: CI/publication must use now.
-        check_exceptions(ignored, datetime.now(timezone.utc))
+    check_exceptions(ignored, now)
+    # Older tags may predate deny.toml/the guard, or have an empty ignore list.
+    # They must not bypass expiry while still shipping the affected packages.
+    with (root / "Cargo.lock").open("rb") as source:
+        packages = {package["name"] for package in tomllib.load(source)["package"]}
+    if packages & AFFECTED_PACKAGES and now >= EXPIRES:
+        raise ValueError(f"temporary maintenance exception expired; resolve {ISSUE}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--source-root", type=Path, default=Path(__file__).resolve().parents[1]
+    )
+    args = parser.parse_args()
+    try:
+        # The source may be an old tag, but there is no time/deadline override.
+        check_source(args.source_root, datetime.now(timezone.utc))
     except (OSError, KeyError, ValueError) as error:
         print(f"advisory exception check failed: {error}", file=sys.stderr)
         return 1

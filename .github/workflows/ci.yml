@@ -108,7 +108,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Test advisory exception deadline
-        run: python3 -m unittest discover -s scripts -p 'test_advisory_expiry.py'
+        run: python3 -m unittest discover -s scripts -p 'test_*expiry.py'
       - name: Check advisory exception deadline
         run: python3 scripts/check_advisory_expiry.py
       - name: Check dependencies
