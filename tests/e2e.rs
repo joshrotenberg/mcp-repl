@@ -142,8 +142,38 @@ fn json_lines(output: &Output, label: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn test_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    // Every subprocess, including HTTP fixtures and build helpers, must start
+    // without a developer's bearer token. Authentication cases explicitly set
+    // their own synthetic credentials after this default is applied.
+    command.env_remove("MCP_BEARER");
+    command
+}
+
+#[test]
+fn subprocess_commands_drop_ambient_bearers_but_allow_explicit_test_tokens() {
+    let mut command = test_command("unused-test-program");
+    let bearer = std::ffi::OsStr::new("MCP_BEARER");
+    // get_envs inspects only the command's overrides, never the real process
+    // environment. A removal marker prevents inheritance at spawn time.
+    assert_eq!(
+        command.as_std().get_envs().find(|(key, _)| *key == bearer),
+        Some((bearer, None))
+    );
+
+    command.env("MCP_BEARER", "synthetic-http-test-token");
+    assert_eq!(
+        command.as_std().get_envs().find(|(key, _)| *key == bearer),
+        Some((
+            bearer,
+            Some(std::ffi::OsStr::new("synthetic-http-test-token"))
+        ))
+    );
+}
+
 async fn build_fixture() -> PathBuf {
-    let mut command = Command::new(env!("CARGO"));
+    let mut command = test_command(env!("CARGO"));
     command.current_dir(repo_root()).args([
         "build",
         "--quiet",
@@ -180,15 +210,12 @@ async fn build_fixture() -> PathBuf {
 }
 
 fn repl_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-repl"));
+    let mut command = test_command(env!("CARGO_BIN_EXE_mcp-repl"));
     command.current_dir(repo_root());
     // The suite pins the published process output. A developer's ambient
     // tracing filter must not add framework records to those assertions;
     // individual cases opt back in when logging is what they exercise.
     command.env_remove("RUST_LOG");
-    // HTTP fixtures must never receive a developer's ambient bearer token.
-    // Authentication cases explicitly set their own synthetic credentials.
-    command.env_remove("MCP_BEARER");
     command
 }
 
@@ -335,7 +362,7 @@ impl HttpFixture {
         let resource_subscriptions_file =
             temp.path().join(format!("{label}.resource-subscriptions"));
         let tool_calls_file = temp.path().join(format!("{label}.tool-calls"));
-        let mut command = Command::new(fixture);
+        let mut command = test_command(fixture);
         command
             .arg("--http")
             .env("MCP_REPL_FIXTURE_READY_FILE", &ready_file)
@@ -2313,7 +2340,7 @@ async fn exercise_cancellation() {
     .await
     .expect("timed out waiting for the call to reach the wire");
 
-    let signalled = Command::new("kill")
+    let signalled = test_command("kill")
         .args(["-INT", &pid.to_string()])
         .status()
         .await
