@@ -1534,6 +1534,9 @@ async fn establish_initial_connection(
         Err(error) => error,
     };
     let Some(connector) = connector.filter(|_| session::is_unsent_request_error(&first)) else {
+        // tower-mcp kills a stdio child when its transport is dropped, so a
+        // failed handshake has to close the client for an orderly shutdown.
+        let _ = client.shutdown().await;
         return Err(first);
     };
     connector(ConnectorMode::InitialRecovery)
@@ -5379,6 +5382,12 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             }
         }
     }
+    // tower-mcp kills a stdio child when its transport is dropped, so leaving
+    // without closing would deny the server an orderly shutdown.
+    drop(_surface_subscription);
+    if let Err(error) = session.close().await {
+        eprintln!("warning: closing the server failed: {error}");
+    }
     Ok(())
 }
 
@@ -8575,7 +8584,7 @@ mod tests {
     impl ClientTransport for UnsentTransport {
         async fn send(&mut self, _message: &str) -> tower_mcp::Result<()> {
             Err(tower_mcp::Error::Transport(
-                "HTTP request failed: error sending request for url (http://fixture/)".into(),
+                "HTTP request failed: request failed".into(),
             ))
         }
 

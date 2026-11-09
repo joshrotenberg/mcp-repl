@@ -124,6 +124,20 @@ impl Session {
         self.generation_tx.subscribe()
     }
 
+    /// Close the live client through a shared handle when the REPL exits.
+    ///
+    /// The line editor keeps its own handle to the session, so the interactive
+    /// path cannot take ownership the way [`Session::shutdown`] does. A client
+    /// still held by background work is left to be dropped, which kills a
+    /// stdio child.
+    pub async fn close(&self) -> Result<(), tower_mcp::Error> {
+        let client = self.client.write().unwrap().take();
+        match client.map(Arc::try_unwrap) {
+            Some(Ok(client)) => client.shutdown().await,
+            Some(Err(_)) | None => Ok(()),
+        }
+    }
+
     /// Close the live client and its transport once the session is no longer
     /// shared by command work. One-shot mode uses this before applying its
     /// process exit status so stdio children see EOF and are reaped cleanly.
@@ -297,9 +311,13 @@ pub(crate) fn is_unsent_request_error(e: &tower_mcp::Error) -> bool {
 /// there the request may already have been carried out.
 ///
 /// Matching a message is unfortunate. `tower_mcp::Error::Transport` carries a
-/// `String` and no cause, so there is nothing else to match on here.
+/// `String` and no cause, so there is nothing else to match on here. These are
+/// tower-mcp's redacted categories for a connect failure and a send failure.
+/// Matching the end of the text excludes the same category with an HTTP status
+/// appended, where the server did answer.
 fn is_unsent_request(message: &str) -> bool {
-    message.contains("error sending request")
+    message.ends_with("HTTP request failed: connection failed")
+        || message.ends_with("HTTP request failed: request failed")
 }
 
 fn status_after<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
@@ -328,9 +346,10 @@ mod tests {
     #[test]
     fn a_connection_that_died_before_sending_is_reconnectable() {
         for message in [
-            "HTTP request failed: error sending request for url (http://127.0.0.1:8080/)",
+            "HTTP request failed: request failed",
+            "HTTP request failed: connection failed",
             "failed to deliver notifications/initialized: Transport error: HTTP request \
-             failed: error sending request for url (http://127.0.0.1:37973/)",
+             failed: request failed",
         ] {
             assert!(
                 is_reconnectable_http_error(&tower_mcp::Error::Transport(message.to_string())),
@@ -341,8 +360,22 @@ mod tests {
         // fetch path, and should be treated the same way.
         assert!(is_reconnectable_http_error(&jsonrpc(
             -32000,
-            "HTTP request failed: error sending request for url (http://x/)"
+            "HTTP request failed: request failed"
         )));
+    }
+
+    /// The categories that mean the server answered, or may have acted, are
+    /// not unsent requests, including a send-failure category with a status.
+    #[test]
+    fn redacted_failures_with_a_response_or_timeout_are_not_unsent() {
+        for message in [
+            "HTTP request failed: request failed (HTTP 503)",
+            "HTTP request failed: timeout",
+            "HTTP request failed: response body I/O failed",
+            "HTTP request failed: response decoding failed",
+        ] {
+            assert!(!is_unsent_request(message), "{message}");
+        }
     }
 
     /// A response that failed while being read is deliberately not retried.
