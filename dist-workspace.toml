@@ -36,6 +36,10 @@ github-attestations-filters = ["*.json", "*.xml", "*.sh", "*.zip", "*.tar.gz", "
 [dist.min-glibc-version]
 "*" = "2.34"
 
+# dist's default arm64 macOS runner is macos-14, which GitHub retired on 2026-11-02.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 [dist.github-action-commits]
 "actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6"
 "actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1"
