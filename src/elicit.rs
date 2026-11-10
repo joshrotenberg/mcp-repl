@@ -41,8 +41,9 @@ use reedline::{
 use tower_mcp::client::{ClientHandler, NotificationHandler, ServerNotification};
 use tower_mcp::error::JsonRpcError;
 use tower_mcp::protocol::{
-    CreateMessageParams, CreateMessageResult, ElicitAction, ElicitFieldValue, ElicitFormParams,
-    ElicitRequestParams, ElicitResult, PrimitiveSchemaDefinition,
+    CreateMessageParams, CreateMessageResult, ElicitAction, ElicitFieldValue, ElicitFinalUrlParams,
+    ElicitFormParams, ElicitRequestParams, ElicitResult, ElicitUrlParams,
+    PrimitiveSchemaDefinition,
 };
 
 use crate::output::AsyncOutput;
@@ -200,19 +201,22 @@ impl ClientHandler for ReplClientHandler {
         }
         let server = self.server_name();
         match params {
-            ElicitRequestParams::Url(url) => {
+            // 2025-11-25 and 2026-07-28 URL requests differ only in whether
+            // they carry an elicitationId, which nothing here uses.
+            ElicitRequestParams::Url(ElicitUrlParams { message, url, .. })
+            | ElicitRequestParams::FinalUrl(ElicitFinalUrlParams { message, url, .. }) => {
                 // Only ever a link for the operator to follow by hand, so
                 // schemes that execute or read local files have no business
                 // here even as display text.
-                if !is_web_url(&url.url) {
+                if !is_web_url(&url) {
                     self.note(format!(
                         "{} declined a request to open {} (only http and https are shown)",
                         tag(Style::new().fg(Color::Purple), "elicit"),
-                        sanitize(&url.url)
+                        sanitize(&url)
                     ));
                     return Ok(ElicitResult::decline());
                 }
-                let (message, link) = (url.message.clone(), url.url.clone());
+                let link = url;
                 // Accepting says the operator completed an out-of-band flow,
                 // so it has to be the operator who says it.
                 tokio::task::spawn_blocking(move || confirm_url(&server, &message, &link))
@@ -254,19 +258,20 @@ pub async fn answer_in_foreground(server: &str, params: ElicitRequestParams) -> 
     }
     let server = server.to_string();
     let answered = match params {
-        ElicitRequestParams::Url(url) => {
+        ElicitRequestParams::Url(ElicitUrlParams { message, url, .. })
+        | ElicitRequestParams::FinalUrl(ElicitFinalUrlParams { message, url, .. }) => {
             // Same gate as the server-initiated path: terminals linkify what
             // they print, so a scheme that executes or reads local files is
             // refused rather than shown.
-            if !is_web_url(&url.url) {
+            if !is_web_url(&url) {
                 eprintln!(
                     "{} declined a request to open {} (only http and https are shown)",
                     tag(Style::new().fg(Color::Purple), "elicit"),
-                    sanitize(&url.url)
+                    sanitize(&url)
                 );
                 return ElicitResult::decline();
             }
-            let (message, link) = (url.message.clone(), url.url.clone());
+            let link = url;
             tokio::task::spawn_blocking(move || confirm_url(&server, &message, &link)).await
         }
         ElicitRequestParams::Form(form) => {
