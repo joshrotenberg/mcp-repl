@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.10] - 2026-11-10
+
+### Bug Fixes
+
+- Preserve Rust 1.90 atomic compatibility (#299)
+- **deps:** Clear advisory failures blocking required CI (#329)
+- **deps:** Update tower-mcp to 0.26.0 (#331)
+
+### Testing
+
+- **auth:** Keep tests away from the native credential store (#334)
+
+
+
 ## [0.3.9] - 2026-09-17
 
 ### Bug Fixes
