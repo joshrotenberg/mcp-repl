@@ -67,6 +67,7 @@ mod property;
 mod sampling;
 mod schema_contract;
 mod secure_file;
+mod server_stderr;
 mod session;
 mod style;
 mod subscribe;
@@ -915,6 +916,18 @@ pub(crate) const BUILTINS: Builtins = Builtins(&[
          Levels are the syslog severities the MCP spec uses, least severe \
          first: a level means that one and everything more severe. Needs \
          the server to declare the `logging` capability.",
+    },
+    Builtin {
+        name: "stderr",
+        summary: "show or silence the server's stderr",
+        usage: "stderr [<lines>|live|quiet]",
+        detail: "A stdio server's stderr is printed above the prompt with a \
+         `[stderr]` tag and kept in a buffer of the last 500 lines. With no \
+         argument, print the buffer; with a number, print that many of the \
+         most recent lines. `stderr quiet` stops printing new lines as they \
+         arrive without discarding them, and `stderr live` resumes. Color \
+         codes are removed; any other control sequence is replaced with \
+         U+FFFD. HTTP servers have no stderr to show.",
     },
     Builtin {
         name: "refresh",
@@ -3073,8 +3086,13 @@ fn forward_child_stderr(stderr: tokio::process::ChildStderr, output: AsyncOutput
         loop {
             match lines.next_line().await {
                 // The child is the MCP server; its stderr is as untrusted
-                // as its frames.
-                Ok(Some(line)) => output.line(sanitize(&line).into_owned()),
+                // as its frames. `record` sanitizes, keeps the line for
+                // `stderr`, and says whether it should also print now.
+                Ok(Some(line)) => {
+                    if let Some(line) = server_stderr::server_stderr().record(&line) {
+                        output.line(format!("{} {line}", tag(Style::new().dimmed(), "stderr")));
+                    }
+                }
                 Ok(None) => break,
                 Err(error) => {
                     output.line(format!("warning: reading server stderr failed: {error}"));
@@ -5949,6 +5967,7 @@ async fn handle_line(
             | "binds"
             | "unbind"
             | "wire"
+            | "stderr"
             | "last"
             | "history"
             | "vars"
@@ -6777,6 +6796,40 @@ async fn handle_line(
                 println!("wire tracing on (frames print to stderr)");
             } else {
                 println!("wire tracing off");
+            }
+        }
+        "stderr" => {
+            let log = server_stderr::server_stderr();
+            match server_stderr::parse_command(rest) {
+                Err(usage) => {
+                    command_error(&usage);
+                    return false;
+                }
+                Ok(server_stderr::StderrCommand::SetLive(live)) => {
+                    log.set_live(live);
+                    if json_output() {
+                        print_json(&serde_json::json!({ "live": live }));
+                    } else if live {
+                        println!("server stderr live (new lines print above the prompt)");
+                    } else {
+                        println!(
+                            "server stderr quiet (new lines are kept; `stderr` shows the last {})",
+                            server_stderr::CAPACITY
+                        );
+                    }
+                }
+                Ok(server_stderr::StderrCommand::Show(limit)) => {
+                    let lines = log.recent(limit);
+                    if json_output() {
+                        print_json(&serde_json::json!({ "live": log.is_live(), "lines": lines }));
+                    } else if lines.is_empty() {
+                        println!("no server stderr yet");
+                    } else {
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
+                }
             }
         }
         // Deliberately independent of the trace toggle: frames are recorded

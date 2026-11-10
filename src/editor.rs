@@ -533,6 +533,13 @@ impl Completer for ReplCompleter {
                     }
                 }
             }
+            "stderr" => {
+                for state in ["live", "quiet"] {
+                    if state.starts_with(word) {
+                        out.push(word_suggestion(state, None, span));
+                    }
+                }
+            }
             "wire" => {
                 for state in ["on", "off"] {
                     if state.starts_with(word) {
