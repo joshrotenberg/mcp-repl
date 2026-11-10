@@ -254,6 +254,26 @@ rather than sent a request it would only reject. Its notifications, if it
 sends any, arrive regardless. The threshold tells the server what to send;
 mcp-repl does not silently discard log notifications after receiving them.
 
+A stdio server also writes to its own stderr, outside the protocol. Those
+lines print above the prompt with a `[stderr]` tag and are kept, up to the
+last 500, for `stderr` to show again:
+
+```text
+my-server> stderr quiet
+server stderr quiet (new lines are kept; `stderr` shows the last 500)
+my-server> stderr 2
+2026-11-10T07:00:00Z  INFO mcp::tools: tool call completed
+2026-11-10T07:00:01Z  INFO mcp::tools: tool call completed
+my-server> stderr live
+server stderr live (new lines print above the prompt)
+```
+
+Color codes from the server's logger are removed rather than shown as
+replacement characters. Any other control sequence is still replaced with
+U+FFFD, the same as everywhere else server text is displayed. `stderr` works
+while disconnected, so the output of a server that failed to start can still
+be read. HTTP servers have no stderr.
+
 Progress and log notifications print inline as they arrive:
 
 ```text

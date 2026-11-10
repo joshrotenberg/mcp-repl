@@ -72,6 +72,46 @@ pub fn sanitize(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// [`sanitize`] for a server's diagnostic stream, with color removed quietly.
+///
+/// Logging libraries color their output whether or not stderr is a terminal,
+/// and `sanitize` turns each color code into a U+FFFD, so an ordinary tracing
+/// line arrives as a row of replacement glyphs. A well-formed SGR sequence
+/// (`ESC [`, parameters drawn only from digits, `;` and `:`, then `m`) can
+/// only set text attributes, so this drops those outright. Everything else,
+/// including SGR-shaped sequences with any other byte in them, still goes
+/// through `sanitize` and is replaced as usual.
+pub fn sanitize_log(text: &str) -> Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return sanitize(text);
+    }
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('\u{1b}') {
+        stripped.push_str(&rest[..start]);
+        let candidate = &rest[start..];
+        match sgr_len(candidate) {
+            Some(len) => rest = &candidate[len..],
+            None => {
+                stripped.push('\u{1b}');
+                rest = &candidate[1..];
+            }
+        }
+    }
+    stripped.push_str(rest);
+    Cow::Owned(sanitize(&stripped).into_owned())
+}
+
+/// Byte length of a well-formed SGR sequence at the start of `text`.
+fn sgr_len(text: &str) -> Option<usize> {
+    let body = text.strip_prefix("\u{1b}[")?;
+    let params = body
+        .bytes()
+        .take_while(|b| b.is_ascii_digit() || *b == b';' || *b == b':')
+        .count();
+    (body.as_bytes().get(params) == Some(&b'm')).then_some(2 + params + 1)
+}
+
 fn consume_escape_sequence(chars: &mut Peekable<Chars>) {
     match chars.peek() {
         Some('[') => {
@@ -192,5 +232,41 @@ mod tests {
     #[test]
     fn newlines_and_tabs_survive() {
         assert_eq!(sanitize("a\u{1b}[31mb\nc\td"), "a\u{FFFD}b\nc\td");
+    }
+
+    #[test]
+    fn log_sanitizer_drops_color_quietly() {
+        // A typical tracing-subscriber line with ANSI colors on.
+        let line = "\u{1b}[2m2026-11-10T07:00:00Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+                    \u{1b}[2mmcp::tools\u{1b}[0m\u{1b}[2m:\u{1b}[0m tool call completed";
+        assert_eq!(
+            sanitize_log(line),
+            "2026-11-10T07:00:00Z  INFO mcp::tools: tool call completed"
+        );
+        assert_eq!(sanitize_log("\u{1b}[38;5;208morange\u{1b}[m"), "orange");
+        assert_eq!(sanitize_log("\u{1b}[38:2::255:0:0mred"), "red");
+    }
+
+    #[test]
+    fn log_sanitizer_still_replaces_everything_else() {
+        // Cursor movement, screen clears, OSC 52, and SGR-shaped sequences with
+        // a byte outside digits and separators are not color.
+        assert_eq!(sanitize_log("a\u{1b}[2Jb"), "a\u{FFFD}b");
+        assert_eq!(sanitize_log("a\u{1b}[1Ab"), "a\u{FFFD}b");
+        assert_eq!(sanitize_log("a\u{1b}]52;c;Zm9v\u{07}b"), "a\u{FFFD}b");
+        assert_eq!(sanitize_log("a\u{1b}[?25mb"), "a\u{FFFD}b");
+        assert_eq!(sanitize_log("a\u{1b}[31"), "a\u{FFFD}");
+        assert_eq!(sanitize_log("a\u{1b}"), "a\u{FFFD}");
+        assert_eq!(sanitize_log("one\rtwo"), "one\u{FFFD}two");
+        // Color next to a hostile sequence: only the color goes quietly.
+        assert_eq!(
+            sanitize_log("\u{1b}[31mred\u{1b}[2K\u{1b}[0m"),
+            "red\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn log_sanitizer_borrows_plain_text() {
+        assert!(matches!(sanitize_log("plain line"), Cow::Borrowed(_)));
     }
 }
