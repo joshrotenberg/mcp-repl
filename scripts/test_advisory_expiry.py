@@ -10,7 +10,7 @@ from check_advisory_expiry import check_exceptions, check_source
 
 class AdvisoryExpiryTests(unittest.TestCase):
     # Use the approved local calendar date independently of the UTC constant.
-    cutoff = datetime(2026, 11, 16, tzinfo=timezone(timedelta(hours=-8)))
+    cutoff = datetime(2026, 12, 14, tzinfo=timezone(timedelta(hours=-8)))
     approved = ["RUSTSEC-2026-0370", "RUSTSEC-2026-0371", "RUSTSEC-2026-0372"]
 
     def test_valid_before_cutoff(self):
@@ -21,7 +21,7 @@ class AdvisoryExpiryTests(unittest.TestCase):
             self.cutoff,
             self.cutoff.astimezone(timezone.utc),
             self.cutoff + timedelta(microseconds=1),
-            datetime(2026, 11, 17, 4, 21, tzinfo=timezone.utc),
+            datetime(2026, 12, 15, 4, 21, tzinfo=timezone.utc),
         ]:
             with self.subTest(now=now), self.assertRaisesRegex(ValueError, "expired"):
                 check_exceptions(self.approved, now)
@@ -47,7 +47,7 @@ class AdvisoryExpiryTests(unittest.TestCase):
 
     def test_rejects_naive_time(self):
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
-            check_exceptions(self.approved, datetime(2026, 11, 15))
+            check_exceptions(self.approved, datetime(2026, 12, 13))
 
     def test_old_tags_cannot_bypass_expiry_without_ignores_or_guard(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -10,8 +10,9 @@ import tomllib
 ISSUE = "https://github.com/joshrotenberg/mcp-repl/issues/309"
 APPROVED = {"RUSTSEC-2026-0370", "RUSTSEC-2026-0371", "RUSTSEC-2026-0372"}
 AFFECTED_PACKAGES = {"zvariant", "zbus_names", "zvariant_derive"}
-# November 16, 2026 at 00:00 America/Los_Angeles (PST). Never roll forward.
-EXPIRES = datetime(2026, 11, 16, 8, tzinfo=timezone.utc)
+# December 14, 2026 at 00:00 America/Los_Angeles (PST). Extended once from
+# November 16 by maintainer decision on #309; any further change needs a new one.
+EXPIRES = datetime(2026, 12, 14, 8, tzinfo=timezone.utc)
 
 
 def check_exceptions(ignored, now):
@@ -30,7 +31,7 @@ def check_exceptions(ignored, now):
         seen.add(advisory)
     if seen and now >= EXPIRES:
         raise ValueError(
-            "temporary advisory exceptions expired at 2026-11-16 00:00 PST "
+            "temporary advisory exceptions expired at 2026-12-14 00:00 PST "
             f"(08:00 UTC); remove them and resolve {ISSUE}"
         )
 
