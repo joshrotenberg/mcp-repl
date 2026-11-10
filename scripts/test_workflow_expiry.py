@@ -62,6 +62,16 @@ class WorkflowExpiryTests(unittest.TestCase):
         self.assertIn('RELEASE_COMMIT: "${{ needs.plan.outputs.source-sha }}"', job("release.yml", "host"))
         self.assertIn('--ref main --field "tag=$RELEASE_TAG"', job("release-plz.yml", "release"))
 
+    def test_pull_requests_keep_the_fast_required_verify_check(self):
+        # "Verify image" is a required status check on main. Renaming the job
+        # or moving the multiarch release build onto pull requests breaks it.
+        verify = job("container-build.yml", "verify")
+        self.assertIn("    name: Verify image\n", verify)
+        self.assertIn("if: github.event_name == 'pull_request'", verify)
+        self.assertNotIn("platforms:", verify)
+        prepare = job("container-build.yml", "prepare")
+        self.assertIn("if: github.event_name != 'pull_request'", prepare)
+
     def test_container_build_is_read_only_and_publication_checks_each_tag(self):
         prepare = job("container-build.yml", "prepare")
         self.assertIn("push: false", prepare)
