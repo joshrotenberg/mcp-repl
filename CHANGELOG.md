@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.11] - 2026-11-10
+
+### Features
+
+- Label, buffer, and toggle server stderr (#337)
+
+
+
 ## [0.3.10] - 2026-11-10
 
 ### Bug Fixes
