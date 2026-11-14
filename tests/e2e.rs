@@ -314,7 +314,12 @@ struct HttpFixture {
     subscription_file: PathBuf,
     resource_subscriptions_file: PathBuf,
     tool_calls_file: PathBuf,
+    trace_file: PathBuf,
 }
+
+/// Lines of a fixture trace printed when a case fails. Enough to cover the
+/// requests around a reconnect without burying the panic message.
+const FIXTURE_TRACE_TAIL: usize = 200;
 
 #[derive(Clone, Copy)]
 enum HttpFailure {
@@ -362,6 +367,7 @@ impl HttpFixture {
         let resource_subscriptions_file =
             temp.path().join(format!("{label}.resource-subscriptions"));
         let tool_calls_file = temp.path().join(format!("{label}.tool-calls"));
+        let trace_file = temp.path().join(format!("{label}.trace"));
         let mut command = test_command(fixture);
         command
             .arg("--http")
@@ -372,6 +378,7 @@ impl HttpFixture {
                 &resource_subscriptions_file,
             )
             .env("MCP_REPL_FIXTURE_TOOL_CALLS_FILE", &tool_calls_file)
+            .env("MCP_REPL_FIXTURE_TRACE_FILE", &trace_file)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -399,6 +406,7 @@ impl HttpFixture {
             subscription_file,
             resource_subscriptions_file,
             tool_calls_file,
+            trace_file,
         }
     }
 
@@ -474,6 +482,24 @@ impl Drop for HttpFixture {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
+        }
+        // A failing case unwinds through every live fixture. Print the
+        // server's side of the exchange so a CI failure that does not
+        // reproduce locally still shows whether each request arrived and how
+        // long the fixture took to answer it.
+        if std::thread::panicking() {
+            let trace = std::fs::read_to_string(&self.trace_file).unwrap_or_else(|error| {
+                format!("(no trace at {}: {error})", self.trace_file.display())
+            });
+            let lines: Vec<&str> = trace.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(FIXTURE_TRACE_TAIL)..];
+            eprintln!(
+                "--- HTTP fixture trace {} (last {} of {} lines) ---\n{}\n--- end fixture trace ---",
+                self.url,
+                tail.len(),
+                lines.len(),
+                tail.join("\n")
+            );
         }
     }
 }
@@ -561,6 +587,21 @@ impl DropFirstRequestProxy {
 async fn run_http(url: &str, case: &str, repl_args: &[&str]) -> Output {
     let mut command = repl_command();
     command.args(repl_args).args(["--http", url]);
+    run(command, case, CASE_TIMEOUT).await
+}
+
+/// `run_http` with the client's transport debug log on stderr.
+///
+/// For the reconnect cases, whose rare macOS CI failures have not reproduced
+/// locally: a failure's panic message then carries the client's request
+/// timeline next to the fixture trace. Use it only where the case asserts
+/// what stderr contains, not that it is empty or exact.
+async fn run_http_traced(url: &str, case: &str, repl_args: &[&str]) -> Output {
+    let mut command = repl_command();
+    command
+        .args(repl_args)
+        .args(["--http", url])
+        .env("RUST_LOG", "tower_mcp=debug,mcp_repl=debug");
     run(command, case, CASE_TIMEOUT).await
 }
 
@@ -2617,7 +2658,7 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
 async fn exercise_http(fixture: &Path, temp: &TempDir) {
     let http = HttpFixture::start(fixture, temp).await;
     let first_request = DropFirstRequestProxy::start(&http.url).await;
-    let recovered = run_http(
+    let recovered = run_http_traced(
         &first_request.url,
         "first HTTP handshake request dropped",
         &["--json", "--exec", "add a=20 b=22"],
@@ -2644,7 +2685,7 @@ async fn exercise_http(fixture: &Path, temp: &TempDir) {
     first_request.shutdown().await;
 
     let reconnecting = HttpFixture::start_with_reconnect(fixture, temp).await;
-    let restored = run_http(
+    let restored = run_http_traced(
         &reconnecting.url,
         "resource subscription reconnect",
         &[
@@ -2684,7 +2725,7 @@ async fn exercise_http(fixture: &Path, temp: &TempDir) {
     reconnecting.shutdown().await;
 
     let unavailable = HttpFixture::start_always_unavailable(fixture, temp).await;
-    let failed = run_http(
+    let failed = run_http_traced(
         &unavailable.url,
         "persistent HTTP 503",
         &["--json", "--exec", "add a=20 b=22"],

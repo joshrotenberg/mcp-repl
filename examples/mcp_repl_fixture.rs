@@ -213,6 +213,52 @@ fn claim_marker(name: &str) -> bool {
     }
 }
 
+/// Write a server-side trace to `MCP_REPL_FIXTURE_TRACE_FILE`, when set.
+///
+/// The tests discard the fixture's stdout and stderr (stdio mode speaks the
+/// protocol on stdout), so a CI failure otherwise carries only the client's
+/// view. The file never receives ANSI codes and stdout is never touched.
+fn init_trace_file() {
+    let Some(path) = env_path("MCP_REPL_FIXTURE_TRACE_FILE") else {
+        return;
+    };
+    let file = std::fs::File::create(&path).expect("create fixture trace file");
+    tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "tower_mcp=debug,mcp_repl_fixture=debug",
+        ))
+        .init();
+}
+
+/// Log each HTTP request on arrival and again when its response is ready.
+///
+/// Outermost layer, so the timing covers the fault-injection and bearer
+/// layers as well as the MCP transport. The arrival line is what answers
+/// whether a request the client timed out on ever reached the fixture.
+async fn trace_requests(request: Request, next: Next) -> Response {
+    let method = request
+        .headers()
+        .get("mcp-method")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let session = request.headers().contains_key("mcp-session-id");
+    let http_method = request.method().clone();
+    tracing::debug!(%http_method, mcp_method = %method, session, "request arrived");
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    tracing::debug!(
+        %http_method,
+        mcp_method = %method,
+        status = response.status().as_u16(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "response ready"
+    );
+    response
+}
+
 async fn observe_subscription(request: Request, next: Next) -> Response {
     let method = request
         .headers()
@@ -437,6 +483,7 @@ fn serve_raw_tools_only(
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {
     eprintln!("mcp-repl fixture ready");
+    init_trace_file();
     // Not a router: this mode speaks JSON-RPC by hand so it can reject the
     // methods it never advertised, the way a server from another SDK does.
     if std::env::args().any(|arg| arg == "--tools-only") {
@@ -460,7 +507,8 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             .disable_origin_validation()
             .into_router()
             .layer(axum::middleware::from_fn(require_bearer))
-            .layer(axum::middleware::from_fn(observe_subscription));
+            .layer(axum::middleware::from_fn(observe_subscription))
+            .layer(axum::middleware::from_fn(trace_requests));
         axum::serve(listener, app).await?;
     } else {
         StdioTransport::new(router)
