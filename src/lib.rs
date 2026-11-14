@@ -7,21 +7,32 @@
 //! (`completion/complete`), and `list_changed` notifications refresh the
 //! command table live mid-session.
 //!
+//! This crate is primarily the `mcp-repl` binary. Install it with
+//! `cargo install --locked mcp-repl`; the
+//! [README](https://github.com/joshrotenberg/mcp-repl#readme) covers
+//! Homebrew, prebuilt archives, and the container image.
+//!
 //! Usage:
 //!
 //! ```text
+//! # The bundled demo server; no config, network, or separate server:
+//! mcp-repl --demo
+//!
 //! # Spawn a stdio server as a child process:
-//! cargo run -p mcp-repl -- cargo run --example getting_started
+//! mcp-repl -- ./my-server --stdio
 //!
 //! # Connect to a streamable HTTP server:
-//! cargo run -p mcp-repl -- --http http://127.0.0.1:3001/mcp
+//! mcp-repl --http http://127.0.0.1:3001/mcp
 //!
 //! # Authorize once, then reuse a secure OAuth profile:
-//! cargo run -p mcp-repl -- --login work --http https://mcp.example.com/mcp
-//! cargo run -p mcp-repl -- --oauth work --http https://mcp.example.com/mcp
+//! mcp-repl --login work --http https://mcp.example.com/mcp
+//! mcp-repl --oauth work --http https://mcp.example.com/mcp
 //!
 //! # Connect to a named profile from the platform config directory:
-//! cargo run -p mcp-repl -- --server cratesio
+//! mcp-repl --server cratesio
+//!
+//! # Run one command and exit, with NDJSON on stdout:
+//! mcp-repl --demo --json -e 'convert value=100 from=celsius to=fahrenheit'
 //! ```
 //!
 //! Inside the REPL, `help` lists the built-ins and the server's tools,
@@ -4372,22 +4383,18 @@ fn program_is_runnable(program: &str) -> bool {
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| {
                 let candidate = dir.join(program);
-                if candidate.is_file() {
-                    return true;
-                }
                 #[cfg(windows)]
                 {
-                    if candidate.extension().is_some() {
-                        return false;
-                    }
-                    executable_extensions.iter().any(|extension| {
-                        let mut candidate = candidate.clone().into_os_string();
-                        candidate.push(extension);
-                        std::path::Path::new(&candidate).is_file()
-                    })
+                    candidate.is_file()
+                        || (candidate.extension().is_none()
+                            && executable_extensions.iter().any(|extension| {
+                                let mut candidate = candidate.clone().into_os_string();
+                                candidate.push(extension);
+                                std::path::Path::new(&candidate).is_file()
+                            }))
                 }
                 #[cfg(not(windows))]
-                false
+                candidate.is_file()
             })
         })
         .unwrap_or(false)
