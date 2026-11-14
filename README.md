@@ -32,7 +32,9 @@ platform:
 cargo install --locked mcp-repl
 ```
 
-Or, on macOS or Linux, run the installer attached to each release:
+### Other install options
+
+On macOS or Linux, the installer attached to each release:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/joshrotenberg/mcp-repl/releases/latest/download/mcp-repl-installer.sh | sh
@@ -47,7 +49,7 @@ Prebuilt macOS, Linux, and Windows archives are also attached to the
 Download the archive for your platform, extract it, and place `mcp-repl` (or
 `mcp-repl.exe`) on `PATH`.
 
-Or run it without installing anything:
+Or run it in a container without installing anything:
 
 ```bash
 docker run --rm -it ghcr.io/joshrotenberg/mcp-repl --demo
@@ -58,6 +60,8 @@ inside it, and OAuth has no credential store there. See
 [the connecting guide](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/connecting.md#in-a-container)
 for what differs.
 
+### Completions and man page
+
 Completions and a man page come from the binary itself. The man page includes
 both startup options and the same REPL built-in reference shown by
 `help <command>`:
@@ -66,6 +70,8 @@ both startup options and the same REPL built-in reference shown by
 mcp-repl --completions zsh > ~/.zfunc/_mcp-repl
 mcp-repl --man > /usr/local/share/man/man1/mcp-repl.1
 ```
+
+### Verifying a release
 
 Every release also publishes SHA-256 checksums, an SBOM, GitHub artifact
 attestations, and BuildKit provenance and SBOM attestations for the container.
@@ -201,12 +207,10 @@ workflows against one session.
 experimental generated command, elicitation and sampling both default to
 `decline`, so a server that asks a question gets an immediate refusal instead
 of hanging the caller. `--timeout` bounds everything else, and exit statuses
-are typed, so a tool error (3) is
-distinguishable from an empty result.
+are typed, so a tool error (3) is distinguishable from an empty result.
 
 See [the scripting guide](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/scripting.md)
-for tasks, waiting on them, and
-schema contracts.
+for tasks, waiting on them, and schema contracts.
 
 ## What it is good at
 
@@ -335,11 +339,10 @@ over stdio and localhost HTTP, on both lifecycles. See
 [the contributing guide](https://github.com/joshrotenberg/mcp-repl/blob/main/CONTRIBUTING.md).
 
 The recordings above are generated with
-[vhs](https://github.com/charmbracelet/vhs) from the tapes in
-[the recording tapes](https://github.com/joshrotenberg/mcp-repl/tree/main/docs/tapes):
-
-Build the release binary with `cargo build --release`, then run the desired
-tape with `vhs docs/tapes/hero.tape` (or another tape from that directory).
+[vhs](https://github.com/charmbracelet/vhs) from
+[`docs/tapes`](https://github.com/joshrotenberg/mcp-repl/tree/main/docs/tapes).
+Build the release binary with `cargo build --release`, then run a tape, for
+example `vhs docs/tapes/hero.tape`.
 
 ## License
 
