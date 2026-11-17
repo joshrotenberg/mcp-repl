@@ -94,6 +94,18 @@ stale. CI runs it on every pull request and `main` push, and daily, since an
 advisory can be published against a dependency that has not changed. Install
 it with `cargo install cargo-deny`.
 
+Dependabot checks Cargo dependencies every weekday, including lockfile-only
+transitive dependencies. Patch proposals share a PR; minor and major proposals
+stay separate because a pre-1.0 minor can break Rust APIs. Proposed updates still
+need the checks above and the existing Rust 1.90.0 MSRV gate. A newer release
+requiring a newer compiler needs a separate MSRV decision; do not bypass its
+`rust-version` check or add an advisory exception to make an update pass.
+
+The authenticated [Dependabot update dashboard](https://github.com/joshrotenberg/mcp-repl/network/updates)
+shows version-update job logs. Check those logs when an expected PR is missing;
+enabled security updates and an empty alert list do not prove that version
+updates succeeded or that cargo-deny has no unmaintained-dependency advisory.
+
 The three temporary unmaintained-dependency exceptions tracked in [#309](https://github.com/joshrotenberg/mcp-repl/issues/309)
 expire at **2026-12-14 00:00 America/Los_Angeles (08:00 UTC)**. The Python 3.11+
 guard enforces the exact scope and fixed deadline before CI's dependency check
