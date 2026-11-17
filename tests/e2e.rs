@@ -3320,6 +3320,72 @@ async fn exercise_generated_cli(fixture: &Path, temp: &TempDir) {
         "generated tool error",
     );
     http.shutdown().await;
+
+    // A lone positional native profile after --http is a documented auth
+    // retarget, even with -e. It must not become a same-named tool call.
+    let http = HttpFixture::start_configured(
+        fixture,
+        temp,
+        Some("synthetic-generated-token"),
+        None,
+        Some("generated-native-retarget"),
+    )
+    .await;
+    let config = temp.path().join("generated-http.toml");
+    std::fs::write(&config, "[servers.add]\ntransport = \"http\"\nurl = \"http://127.0.0.1:1/mcp\"\nbearer_env = \"GENERATED_RETARGET_TOKEN\"\n").unwrap();
+    let config = config.display().to_string();
+    let mut command = repl_command();
+    command
+        .args([
+            "--config",
+            &config,
+            "--http",
+            &http.url,
+            "--json",
+            "-e",
+            "add a=20 b=22",
+            "add",
+        ])
+        .env("GENERATED_RETARGET_TOKEN", "synthetic-generated-token");
+    let output = run(
+        command,
+        "positional native HTTP retarget with exec",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, "positional native HTTP retarget with exec");
+    assert_eq!(
+        json_lines(&output, "positional native HTTP retarget with exec")[0]
+            .pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+    let before = std::fs::read_to_string(&http.tool_calls_file).unwrap();
+    let mut command = repl_command();
+    command
+        .args([
+            "--config",
+            &config,
+            "--http",
+            &http.url,
+            "--no-history",
+            "--json",
+            "add",
+        ])
+        .env("GENERATED_RETARGET_TOKEN", "synthetic-generated-token");
+    let output = run_with_input(
+        command,
+        "quit\n",
+        "positional native HTTP retarget stays interactive",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, "positional native HTTP retarget stays interactive");
+    assert_eq!(
+        std::fs::read_to_string(&http.tool_calls_file).unwrap(),
+        before,
+        "same-named profile was executed as a tool"
+    );
+    http.shutdown().await;
 }
 
 /// `bind`/`binds`/`unbind`: a default value for a tool parameter, applied

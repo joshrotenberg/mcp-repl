@@ -4570,8 +4570,8 @@ pub fn run_cli() {
 }
 
 /// Reserve an explicit target's positional tail for the surface-driven CLI.
-fn take_generated_argv(args: &mut Args, imported_target: bool) -> Vec<String> {
-    if args.demo || args.server.is_some() || (args.http.is_some() && !imported_target) {
+fn take_generated_argv(args: &mut Args, positional_target: bool) -> Vec<String> {
+    if args.demo || args.server.is_some() || (args.http.is_some() && !positional_target) {
         std::mem::take(&mut args.command)
     } else {
         Vec::new()
@@ -4627,17 +4627,18 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     if args.scan {
         std::process::exit(print_scan().code());
     }
-    // Resolve imports before borrowing the positional tail: `--http URL
-    // path.json:entry` is an existing way to retarget an imported HTTP entry
-    // while retaining its auth, so that lone selector is part of the target,
-    // not a generated command.
+    // Lone positional native profiles and imports can retarget an HTTP URL
+    // while retaining profile auth. Recognize both before borrowing the tail:
+    // they select the connection rather than a generated command.
     let imported = resolve_import(&args);
     // An explicit connection selector makes the positional tail unambiguous:
     // it cannot be a stdio child command, so reserve it for a second clap
     // pass after the surface fetch. A raw positional target stays untouched
     // because there is no reliable boundary between its process arguments and
     // a tool invocation; --exec remains available for that case.
-    let dynamic_argv = take_generated_argv(&mut args, imported.is_some());
+    let positional_target = imported.is_some()
+        || matches!(args.command.as_slice(), [name] if profiles.servers.contains_key(name));
+    let dynamic_argv = take_generated_argv(&mut args, positional_target);
     if !dynamic_argv.is_empty() && !args.exec.is_empty() {
         exit_with_error(
             ExitStatus::Usage,
@@ -8219,6 +8220,13 @@ fn render_value(value: &serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use tower_mcp::client::ClientTransport;
+
     #[test]
     fn generated_tail_requires_an_explicit_selector_and_preserves_child_argv() {
         for (argv, imported, expected) in [
@@ -8247,6 +8255,11 @@ mod tests {
                 true,
                 vec![],
             ),
+            (
+                vec!["--http", "http://localhost/mcp", "profile"],
+                true,
+                vec![],
+            ),
             (vec!["profile"], false, vec![]),
             (vec!["config.json:local"], true, vec![]),
             (
@@ -8268,13 +8281,6 @@ mod tests {
             );
         }
     }
-
-    use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    use async_trait::async_trait;
-    use tower_mcp::client::ClientTransport;
 
     fn surface_with_a_task_capable_tool() -> Arc<RwLock<Surface>> {
         let tool = |name: &str, task: bool| -> ToolDefinition {

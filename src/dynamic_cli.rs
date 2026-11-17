@@ -103,14 +103,19 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
             .iter()
             .find(|spec| spec.command == *first && crate::is_builtin(&spec.name))
     {
+        let builtin_form = if ONE_SHOT_BUILTINS.contains(&spec.name.as_str()) {
+            format!("builtin {} ...", clean_text(&spec.name))
+        } else {
+            format!("-e '{} ...'", clean_text(&spec.name))
+        };
         return Err(root.error(
             ErrorKind::InvalidSubcommand,
             format!(
                 "ambiguous command `{}`: both a server tool and a built-in use that name; \
-                 use `tool {} ...` for the server tool or `builtin {} ...` for the built-in",
+                 use `tool {} ...` for the server tool or `{}` for the built-in",
                 clean_text(&spec.name),
                 clean_text(&spec.command),
-                clean_text(&spec.name),
+                builtin_form,
             ),
         ));
     }
@@ -410,7 +415,9 @@ fn surface_arguments(
     matches: &ArgMatches,
 ) -> Result<Vec<String>, clap::Error> {
     if spec.arguments.iter().any(|argument| {
-        (argument.property.is_empty() || argument.property.contains('='))
+        (argument.property.is_empty()
+            || argument.property.contains('=')
+            || argument.property.starts_with('{'))
             && matches.get_one::<String>(&argument.id).is_some()
     }) {
         return Err(clap::Error::raw(
@@ -745,6 +752,16 @@ mod tests {
         assert_eq!(reserved.parsed().words, ["tool", "tool!"]);
     }
     #[test]
+    fn ambiguity_hints_use_exec_for_stateful_builtins() {
+        let tools = [tool("wait", json!({"type":"object"}))];
+        let error = parse(&tools, &[], &["wait".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("-e 'wait ...'"));
+        assert!(!error.contains("builtin wait"));
+    }
+
+    #[test]
     fn names_and_flags_are_independent_of_discovery_order() {
         let names = [
             "odd/name",
@@ -857,10 +874,16 @@ mod tests {
     fn malformed_property_names_require_raw_json_instead_of_wrong_arguments() {
         let tools = [tool(
             "odd",
-            json!({"type":"object", "properties": {"a=b": {"type":"string"}}}),
+            json!({"type":"object", "properties": {"a=b": {"type":"string"}, "{x": {"type":"string"}}}),
         )];
         assert!(
             parse(&tools, &[], &["odd", "--a-b=text"].map(String::from))
+                .unwrap_err()
+                .to_string()
+                .contains("call")
+        );
+        assert!(
+            parse(&tools, &[], &["odd", "--x=1"].map(String::from))
                 .unwrap_err()
                 .to_string()
                 .contains("call")

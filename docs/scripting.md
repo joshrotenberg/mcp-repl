@@ -41,8 +41,9 @@ Use explicit `--demo`, `--server NAME` (native profile or imported entry), or
 `--http URL`. With no command, these still open the interactive prompt. Lone
 positional profile/import selectors retain their connection meaning; they do
 not introduce generated commands. Raw stdio invocations preserve every child
-argument after the executable; use `-e` for that form. An imported positional
-selector following `--http URL` retains its existing HTTP retargeting meaning.
+argument after the executable; use `-e` for that form. A lone native-profile or imported positional
+selector following `--http URL` retains its existing HTTP retargeting meaning
+and authentication, even if its name matches a discovered tool.
 Import approval is required before connecting, including for generated help.
 
 Global flags belong **before the command**; everything after its first word
@@ -71,7 +72,7 @@ nullable string that looks like a number, use `--value='"123"'` to send a string
 `--value=null` sends null. Enums appear in help as guidance; the server validates
 their values and other schema constraints. Prompt flag values remain strings.
 `call <raw-name> '<JSON object>'` bypasses flag coercion when exact types or
-unusual property names are needed. Properties containing `=` or an empty name
+unusual property names are needed. Properties containing `=`, starting with `{`, or with an empty name
 cannot use generated tool flags and must use `call`.
 
 Ordinary names (ASCII letters, digits, underscores, internal hyphens) keep
