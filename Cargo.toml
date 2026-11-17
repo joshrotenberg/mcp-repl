@@ -48,9 +48,8 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Experimental two-stage clap parser built from a connected server's surface.
-# Kept off by default until its command grammar has had real-world use.
-unstable-dynamic-cli = ["clap/string"]
+# Compatibility alias: generated commands are now included in every build.
+unstable-dynamic-cli = []
 
 [dependencies]
 # `dynamic-tools` carries no dependencies of its own; it compiles the registry
@@ -70,7 +69,7 @@ base64 = "0.23.0"
 getrandom = "0.4"
 toml = "1"
 toml_edit = "0.25"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
 # `regex` rather than `regex-lite` for `find -E`. The intuition is backwards
 # here: the engine is already linked, since tracing-subscriber's env-filter
 # reaches regex-automata through matchers, and tower-mcp depends on regex

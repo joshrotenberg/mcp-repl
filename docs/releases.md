@@ -27,6 +27,10 @@ runner or script suite.
    and SBOM attestations.
 
 The native target list and artifact policy live in `dist-workspace.toml`.
+Generated one-shot commands are unconditional, so default cargo install,
+source packages, native archives and container builds include them without
+release-specific feature flags. The former `unstable-dynamic-cli` feature
+remains a no-op compatibility alias.
 `cargo dist generate` owns `.github/workflows/release.yml`; this repository
 keeps the generated workflow's default permission read-only and grants write
 permissions only to its host job.

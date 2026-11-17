@@ -44,6 +44,7 @@ fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::V
     let ty = schema
         .get("properties")
         .and_then(|properties| properties.get(key))
+        .map(|property| crate::command_set::resolve_ref(schema, property))
         .and_then(|property| property.get("type"))
         .and_then(|kind| kind.as_str());
     match ty {

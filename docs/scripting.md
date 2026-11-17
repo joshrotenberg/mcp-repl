@@ -26,6 +26,78 @@ mcp-repl --demo --json -e "tools" -e "echo message=hi" | jq -c .
 mcp-repl --demo -e "echo message=hi" -e "about"
 ```
 
+## Generated commands
+
+Normal builds include a one-command CLI discovered from the live server:
+
+```bash
+mcp-repl --demo --json echo --message='hello world'
+mcp-repl --server local --json tool add --a -3 --b=5
+mcp-repl --trust-import --server path/to/.mcp.json:local tool --help
+mcp-repl --http https://example/mcp call raw_tool '{"nested":{"items":[1,null]}}'
+```
+
+Use explicit `--demo`, `--server NAME` (native profile or imported entry), or
+`--http URL`. With no command, these still open the interactive prompt. Lone
+positional profile/import selectors retain their connection meaning; they do
+not introduce generated commands. Raw stdio invocations preserve every child
+argument after the executable; use `-e` for that form. An imported positional
+selector following `--http URL` retains its existing HTTP retargeting meaning.
+Import approval is required before connecting, including for generated help.
+
+Global flags belong **before the command**; everything after its first word
+belongs to the generated parser. `--json` after a tool name is a tool flag only
+if the schema declares that property. `tool <name>` and `builtin <name>`
+resolve namespace collisions explicitly. A bare name shared by a tool and a
+built-in is rejected. The generated built-ins are listings (`tools`, `prompts`,
+`resources`, `templates`), `find`, `describe`, `snapshot`, `validate`, `read`,
+`prompt`, and `call`. Use `-e` for other built-ins and stateful or multi-command
+workflows. Combining a generated command with `-e` is a usage error.
+
+Flags come from top-level schema properties; use raw JSON `call` for schemas
+that require other JSON Schema composition. Every schema flag takes one value, including booleans (`--enabled=true` or
+`--enabled=false`); bare booleans and repeated flags are usage errors. Required
+properties are required flags. Optional properties stay absent when omitted;
+schema defaults are left to the server. Empty strings use `--text=`. Values
+starting with `-` use `--text=-literal`; negative numbers also accept the
+separate form `--count -3`.
+
+Tools use the same coercion as REPL `key=value` arguments: string properties
+preserve JSON-looking text, integer/number/boolean properties parse scalars,
+and object/array properties parse JSON. A same-document `$ref` is resolved one
+level, including references into `$defs`. Unresolved/remote references, union
+and nullable schemas use JSON-literal parsing with a string fallback. For a
+nullable string that looks like a number, use `--value='"123"'` to send a string;
+`--value=null` sends null. Enums appear in help as guidance; the server validates
+their values and other schema constraints. Prompt flag values remain strings.
+`call <raw-name> '<JSON object>'` bypasses flag coercion when exact types or
+unusual property names are needed. Properties containing `=` or an empty name
+cannot use generated tool flags and must use `call`.
+
+Ordinary names (ASCII letters, digits, underscores, internal hyphens) keep
+their spelling. Other characters become hyphens and leading/trailing hyphens
+are removed. Empty names use a fallback. Collisions get numeric suffixes after
+all ordinary names have been reserved, in raw-name sort order. This mapping is
+independent of discovery order for a fixed surface; a changed surface can add
+collisions, so inspect help or use raw-name `call` in scripts. `--help` and
+`--version` are reserved flag names; corresponding properties receive suffixes.
+Tool/prompt help shows the raw MCP name when its command spelling changes.
+
+Arguments are literal argv, with no alias expansion, variable substitution,
+result routing or background operator. Quotes, backslashes, newlines, dollar
+signs and shell-like strings stay data; your invoking shell still applies its
+normal quoting rules before starting mcp-repl. Dispatch, output, schema
+contracts, HTTP reconnect policy and tool-error status (3) are shared with
+`-e`. Generated parser errors use status 2 and stderr even under `--json`,
+without issuing a tool call. Help uses status 0 and stdout without invoking a
+tool. Discovery itself requires a connection: generated help can start a stdio
+child and fetch server metadata, then closes the session. Root `--help`,
+`--man`, and `--completions` stay offline. One-shot elicitation and sampling
+default to decline on both command paths.
+
+The previous `unstable-dynamic-cli` Cargo feature is a compatibility alias;
+all builds, including `--no-default-features`, now include generated commands.
+
 ## Waiting for background tasks
 
 A tool that requires task-augmented execution has to be started with a

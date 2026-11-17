@@ -3002,8 +3002,7 @@ async fn exercise_generators() {
 
 /// Explicit connection selectors reserve their positional tail for a second,
 /// surface-driven clap pass whose vocabulary mirrors the REPL.
-#[cfg(feature = "unstable-dynamic-cli")]
-async fn exercise_generated_cli() {
+async fn exercise_generated_cli(fixture: &Path, temp: &TempDir) {
     let mut command = repl_command();
     command.args([
         "--demo",
@@ -3054,6 +3053,273 @@ async fn exercise_generated_cli() {
         json_lines(&output, "generated prompt")[0].pointer("/messages/0/content/text"),
         Some(&serde_json::json!("Please greet Ada warmly."))
     );
+    // Generated arguments are literal argv, including characters with meaning
+    // in the REPL and actual control characters, not JSON-escaped source text.
+    let literal = "true 123 null \"' \\ \n\t $unbound | .text && fail ; &";
+    let mut command = repl_command();
+    command.args(["--demo", "--json", "echo", "--message", literal]);
+    let output = run(command, "generated literal input", CASE_TIMEOUT).await;
+    assert_success(&output, "generated literal input");
+    let values = json_lines(&output, "generated literal input");
+    assert_eq!(values.len(), 1);
+    assert_eq!(
+        values[0].pointer("/content/0/text"),
+        Some(&serde_json::json!(literal))
+    );
+
+    let config = temp.path().join("generated.toml");
+    std::fs::write(&config, format!(
+        "[servers.generated]\ntransport = \"stdio\"\ncommand = [{}]\n[servers.generated.aliases]\nadd = \"fail\"\n",
+        serde_json::to_string(&fixture.display().to_string()).unwrap()
+    )).unwrap();
+    let config = config.display().to_string();
+    let imported = temp.path().join("generated.json");
+    std::fs::write(
+        &imported,
+        serde_json::json!({"mcpServers": {"fixture": {"command": fixture}}}).to_string(),
+    )
+    .unwrap();
+    let selector = format!("{}:fixture", imported.display());
+
+    // Explicit profiles and imports can generate commands. Profile aliases
+    // cannot silently replace a discovered tool. Each child shuts down cleanly.
+    for (label, selector, trust) in [
+        ("generated profile", "generated", false),
+        ("generated import", selector.as_str(), true),
+    ] {
+        let exit_file = temp.path().join(format!("{label}.exit"));
+        let mut command = repl_command();
+        command.args(["--config", &config, "--server", selector, "--json"]);
+        if trust {
+            command.arg("--trust-import");
+        }
+        command
+            .args(["add", "--a", "-3", "--b=5"])
+            .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+        let output = run(command, label, CASE_TIMEOUT).await;
+        assert_success(&output, label);
+        assert_eq!(
+            json_lines(&output, label)[0].pointer("/content/0/text"),
+            Some(&serde_json::json!("2"))
+        );
+        assert_eq!(wait_for_file(&exit_file, label).await, "clean");
+    }
+    let mut refused = repl_command();
+    refused.args(["--server", &selector, "--json", "add", "--a=1", "--b=2"]);
+    let output = run(refused, "generated untrusted import", CASE_TIMEOUT).await;
+    assert_status(&output, 2, "generated untrusted import");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--trust-import"));
+
+    // No command still means interactive mode with an explicit selector.
+    let mut interactive = repl_command();
+    interactive.args([
+        "--config",
+        &config,
+        "--server",
+        "generated",
+        "--no-history",
+        "--color",
+        "never",
+    ]);
+    let output = run_with_input(
+        interactive,
+        "tool add a=2 b=3\nquit\n",
+        "generated profile interactive",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, "generated profile interactive");
+    assert!(String::from_utf8_lossy(&output.stdout).contains('5'));
+
+    // Offline help cannot connect to even an invalid explicit target.
+    let mut offline = repl_command();
+    offline.args(["--http", "http://127.0.0.1:1/mcp", "--help"]);
+    assert_success(
+        &run(offline, "offline root help", CASE_TIMEOUT).await,
+        "offline root help",
+    );
+    let exit_file = temp.path().join("generated-help.exit");
+    let mut help = repl_command();
+    help.args([
+        "--config",
+        &config,
+        "--server",
+        "generated",
+        "add",
+        "--help",
+    ])
+    .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    assert_success(
+        &run(help, "generated connected help", CASE_TIMEOUT).await,
+        "generated connected help",
+    );
+    assert_eq!(
+        wait_for_file(&exit_file, "generated help shutdown").await,
+        "clean"
+    );
+
+    // Raw child arguments retain their original boundaries, including values
+    // that look like generated commands or global mcp-repl flags.
+    let raw = ["echo", "--message=child value", "--demo", "--json"];
+    let mut command = repl_command();
+    command
+        .args(["--json", "-e", "process_info", "--"])
+        .arg(fixture)
+        .args(raw);
+    let output = run(command, "raw stdio argv", CASE_TIMEOUT).await;
+    assert_success(&output, "raw stdio argv");
+    let values = json_lines(&output, "raw stdio argv");
+    let process: serde_json::Value =
+        serde_json::from_str(values[0]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(process["argv"], serde_json::json!(raw));
+
+    let http =
+        HttpFixture::start_configured(fixture, temp, None, None, Some("generated-http")).await;
+    let mut command = repl_command();
+    command.args([
+        "--http",
+        &http.url,
+        "--json",
+        "inspect_args",
+        "--text",
+        literal,
+        "--enabled=false",
+        "--nested={\"items\":[1,null]}",
+    ]);
+    let output = run(command, "generated HTTP literal object", CASE_TIMEOUT).await;
+    assert_success(&output, "generated HTTP literal object");
+    let values = json_lines(&output, "generated HTTP literal object");
+    let args: serde_json::Value =
+        serde_json::from_str(values[0]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        args,
+        serde_json::json!({"text":literal, "enabled":false, "nested":{"items":[1,null]}})
+    );
+    let imported_http = temp.path().join("generated-http.json");
+    std::fs::write(
+        &imported_http,
+        serde_json::json!({"mcpServers": {"remote": {
+            "type":"http", "url":"http://127.0.0.1:1/mcp"
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let selector = format!("{}:remote", imported_http.display());
+    let mut command = repl_command();
+    command.args([
+        "--trust-import",
+        "--server",
+        &selector,
+        "--http",
+        &http.url,
+        "--json",
+        "add",
+        "--a=20",
+        "--b=22",
+    ]);
+    let output = run(command, "generated retargeted HTTP import", CASE_TIMEOUT).await;
+    assert_success(&output, "generated retargeted HTTP import");
+    assert_eq!(
+        json_lines(&output, "generated retargeted HTTP import")[0].pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+
+    // Explicit namespaces and raw JSON use the same dispatch as -e.
+    for (tail, text) in [
+        (vec!["tool", "wait", "--a=1", "--b=2"], "server wait: 3"),
+        (vec!["tool", "tool"], "server tool: tool"),
+        (vec!["call", "add", "{\"a\":20,\"b\":22}"], "42"),
+    ] {
+        let mut command = repl_command();
+        command.args(["--http", &http.url, "--json"]).args(tail);
+        let output = run(command, "generated explicit dispatch", CASE_TIMEOUT).await;
+        assert_success(&output, "generated explicit dispatch");
+        assert_eq!(
+            json_lines(&output, "generated explicit dispatch")[0].pointer("/content/0/text"),
+            Some(&serde_json::json!(text))
+        );
+    }
+    let snapshot = temp.path().join("generated-add.schema.json");
+    let snapshot_string = snapshot.display().to_string();
+    let mut command = repl_command();
+    command.args([
+        "--http",
+        &http.url,
+        "--json",
+        "snapshot",
+        "add",
+        &snapshot_string,
+    ]);
+    assert_success(
+        &run(command, "generated snapshot", CASE_TIMEOUT).await,
+        "generated snapshot",
+    );
+    let mut contract: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&snapshot).unwrap()).unwrap();
+    contract["inputSchema"]["properties"]["a"]["type"] = serde_json::json!("string");
+    std::fs::write(&snapshot, contract.to_string()).unwrap();
+    let before = std::fs::read_to_string(&http.tool_calls_file).unwrap();
+    for tail in [
+        vec!["add", "--help"],
+        vec!["add", "--a=1"],
+        vec!["add", "--a=1", "--a=2", "--b=3"],
+        vec!["add", "--a=1", "--b=2", "--json"],
+        vec!["add", "--unknown=1"],
+        vec!["not-a-tool"],
+        vec!["call", "add", "{invalid json"],
+        vec!["builtin", "wait"],
+        vec!["wait", "--a=1", "--b=2"],
+    ] {
+        let expected = if tail.contains(&"--help") { 0 } else { 2 };
+        let mut command = repl_command();
+        command.args(["--http", &http.url, "--json"]).args(tail);
+        let output = run(command, "generated HTTP help or rejection", CASE_TIMEOUT).await;
+        assert_status(&output, expected, "generated HTTP help or rejection");
+        assert_eq!(
+            std::fs::read_to_string(&http.tool_calls_file).unwrap(),
+            before,
+            "help or invalid argv called a tool"
+        );
+    }
+    let mut guarded = repl_command();
+    guarded.args([
+        "--http",
+        &http.url,
+        "--json",
+        "--schema-contract",
+        &snapshot_string,
+        "add",
+        "--a=1",
+        "--b=2",
+    ]);
+    assert_status(
+        &run(guarded, "generated schema contract guard", CASE_TIMEOUT).await,
+        1,
+        "generated schema contract guard",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&http.tool_calls_file).unwrap(),
+        before
+    );
+    let mut mixed = repl_command();
+    mixed.args(["--http", &http.url, "-e", "fail", "add", "--a=1", "--b=2"]);
+    assert_status(
+        &run(mixed, "generated and exec conflict", CASE_TIMEOUT).await,
+        2,
+        "generated and exec conflict",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&http.tool_calls_file).unwrap(),
+        before
+    );
+    let mut failed = repl_command();
+    failed.args(["--http", &http.url, "--json", "fail"]);
+    assert_status(
+        &run(failed, "generated tool error", CASE_TIMEOUT).await,
+        3,
+        "generated tool error",
+    );
+    http.shutdown().await;
 }
 
 /// `bind`/`binds`/`unbind`: a default value for a tool parameter, applied
@@ -3236,8 +3502,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_generators().await;
-        #[cfg(feature = "unstable-dynamic-cli")]
-        exercise_generated_cli().await;
+        exercise_generated_cli(&fixture, &temp).await;
         exercise_connection_failure_output().await;
         exercise_initialization_timeout(&fixture, &temp).await;
         exercise_elicitation_field_order().await;
