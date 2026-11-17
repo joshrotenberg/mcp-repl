@@ -106,7 +106,7 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
         let builtin_form = if ONE_SHOT_BUILTINS.contains(&spec.name.as_str()) {
             format!("builtin {} ...", clean_text(&spec.name))
         } else {
-            format!("-e '{} ...'", clean_text(&spec.name))
+            format!("-e 'builtin {} ...'", clean_text(&spec.name))
         };
         return Err(root.error(
             ErrorKind::InvalidSubcommand,
@@ -757,8 +757,8 @@ mod tests {
         let error = parse(&tools, &[], &["wait".into()])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("-e 'wait ...'"));
-        assert!(!error.contains("builtin wait"));
+        assert!(error.contains("-e 'builtin wait ...'"));
+        assert!(!error.contains("or `builtin wait ...`"));
     }
 
     #[test]
