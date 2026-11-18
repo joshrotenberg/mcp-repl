@@ -45,6 +45,8 @@ argument after the executable; use `-e` for that form. A lone native-profile or 
 selector following `--http URL` retains its existing HTTP retargeting meaning
 and authentication, even if its name matches a discovered tool.
 Import approval is required before connecting, including for generated help.
+With `--demo`, all positional tokens are generated commands; import-looking
+tokens do not open files or resolve imported environment variables.
 
 Global flags belong **before the command**; everything after its first word
 belongs to the generated parser. `--json` after a tool name is a tool flag only
@@ -66,7 +68,8 @@ separate form `--count -3`.
 Tools use the same coercion as REPL `key=value` arguments: string properties
 preserve JSON-looking text, integer/number/boolean properties parse scalars,
 and object/array properties parse JSON. A same-document `$ref` is resolved one
-level, including references into `$defs`. Unresolved/remote references, union
+level, including references into `$defs`; a `type` beside `$ref` takes
+precedence for both coercion and help. Unresolved/remote references, union
 and nullable schemas use JSON-literal parsing with a string fallback. For a
 nullable string that looks like a number, use `--value='"123"'` to send a string;
 `--value=null` sends null. Enums appear in help as guidance; the server validates

@@ -155,8 +155,9 @@ impl CommandSet {
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string),
                             required: required.contains(name.as_str()),
-                            value_type: resolved
+                            value_type: schema
                                 .get("type")
+                                .or_else(|| resolved.get("type"))
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string),
                             choices: enum_choices(resolved),
@@ -311,11 +312,12 @@ mod tests {
                     "properties": {
                         "scale": {
                             "description": "Output scale",
-                            "$ref": "#/$defs/Scale"
+                            "$ref": "#/$defs/Scale",
+                            "type": "string"
                         }
                     },
                     "$defs": {
-                        "Scale": {"type": "string", "enum": ["c", "f"]}
+                        "Scale": {"enum": ["c", "f"]}
                     }
                 }),
                 output_schema: None,

@@ -795,7 +795,7 @@ mod tests {
     fn schema_values_reuse_common_coercion_and_keep_omissions() {
         let schema = json!({
             "type": "object",
-            "$defs": {"Text": {"type": "string"}},
+            "$defs": {"Text": {"type": "string"}, "Untyped": {}},
             "properties": {
                 "count": {"type": "integer"},
                 "enabled": {"type": "boolean"},
@@ -803,6 +803,7 @@ mod tests {
                 "nested": {"type": "object"},
                 "items": {"type": "array"},
                 "text": {"$ref": "#/$defs/Text"},
+                "local_text": {"$ref": "#/$defs/Untyped", "type": "string"},
                 "choice": {"type": "string", "enum": ["yes", "no"]},
                 "nullable": {"type": ["string", "null"]},
                 "omitted": {"type": "string", "default": "server default"}
@@ -822,6 +823,7 @@ mod tests {
                 "--nested={\"items\":[1,null]}",
                 "--items=[true,2]",
                 "--text=123",
+                "--local_text=true",
                 "--choice=yes",
                 "--nullable=null",
             ]
@@ -834,7 +836,7 @@ mod tests {
             crate::tool_args::parse_kv_args(&schema, &tokens).unwrap(),
             json!({
                 "count": -3, "ratio": -0.5, "enabled": false, "nested": {"items": [1,null]},
-                "items": [true,2], "text": "123", "choice": "yes", "nullable": null
+                "items": [true,2], "text": "123", "local_text": "true", "choice": "yes", "nullable": null
             })
         );
         assert!(parse(&tools, &[], &["values", "--enabled"].map(String::from)).is_err());

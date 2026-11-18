@@ -4346,6 +4346,11 @@ fn resolve_profile(
 /// positional. Imported JSON is intentionally opt-in; ordinary commands and
 /// native profile names retain their existing interpretation.
 fn resolve_import(args: &Args) -> Option<import_config::ImportedConnection> {
+    // Demo tails belong to generated commands, even when a token resembles
+    // PATH.json:ENTRY. Do not open files or resolve their environment.
+    if args.demo {
+        return None;
+    }
     let candidate = match args.server.as_deref() {
         Some(server) => server,
         None => match args.command.as_slice() {

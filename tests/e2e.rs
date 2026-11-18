@@ -3003,6 +3003,24 @@ async fn exercise_generators() {
 /// Explicit connection selectors reserve their positional tail for a second,
 /// surface-driven clap pass whose vocabulary mirrors the REPL.
 async fn exercise_generated_cli(fixture: &Path, temp: &TempDir) {
+    // With demo selected, import-looking command names must not open a
+    // file or resolve its environment before clap rejects the command.
+    let invalid_import = temp.path().join("generated-demo-invalid.json");
+    std::fs::write(&invalid_import, "not JSON").unwrap();
+    for path in [
+        invalid_import,
+        temp.path().join("generated-demo-missing.json"),
+    ] {
+        let selector = format!("{}:entry", path.display());
+        let mut command = repl_command();
+        command.args(["--demo", "--json", &selector]);
+        let output = run(command, "demo import-looking command", CASE_TIMEOUT).await;
+        assert_status(&output, 2, "demo import-looking command");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unrecognized subcommand"), "{stderr}");
+    }
+
     let mut command = repl_command();
     command.args([
         "--demo",
