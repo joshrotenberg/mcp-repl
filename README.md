@@ -25,7 +25,7 @@ On macOS or Linux, install the latest release with Homebrew:
 brew install joshrotenberg/brew/mcp-repl
 ```
 
-Or, with Rust 1.90.0 or newer, install from crates.io on any supported
+Or, with Rust 1.95.0 or newer, install from crates.io on any supported
 platform:
 
 ```bash

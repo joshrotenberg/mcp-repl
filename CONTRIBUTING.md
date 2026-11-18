@@ -61,6 +61,20 @@ The generated case count and seed live in `src/property.rs`. A fixed seed
 keeps CI time and failures reproducible; add the smallest reproducer to the
 matching regression corpus whenever one of these boundaries is fixed.
 
+The POSIX terminal smoke check uses a real PTY (completion, Ctrl-C without
+invocation, and asynchronous output preserving the typed line):
+`python3 scripts/check_terminal.py target/debug/mcp-repl` after building. It runs
+in Linux/macOS CI; Windows retains its unit and black-box process coverage.
+
+The minimum supported compiler is Rust 1.95.0. Check it explicitly with
+`cargo +1.95.0 check --locked --all-targets --all-features`; the CI job is named
+`Minimum Rust 1.95.0`. Branch protection still requires the historical context
+`Minimum Rust 1.90.0`, so a small compatibility job forwards the real 1.95
+job's result. It succeeds only when that job succeeds, and fails for failure,
+cancellation or a skipped job. The old context does not promise Rust 1.90
+support. This preserves the required gate without changing repository settings;
+its legacy name can be removed only in a separately authorized ruleset migration.
+
 ## Coverage
 
 Install `cargo-llvm-cov`, then generate the navigable report with:
