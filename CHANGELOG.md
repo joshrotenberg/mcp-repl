@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.12] - 2026-11-18
+
+### Documentation
+
+- Polish README and crate docs (#339)
+
+### Features
+
+- Upgrade reedline and dependencies on Rust 1.95 (#347)
+- Stabilize generated one-shot CLI in normal builds (#343)
+
+
+
 ## [0.3.11] - 2026-11-10
 
 ### Features
