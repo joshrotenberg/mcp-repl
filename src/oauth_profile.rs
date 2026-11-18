@@ -680,6 +680,7 @@ mod tests {
             access_token: access_token.to_string(),
             refresh_token: Some("refresh-secret".to_string()),
             expires_at: u64::MAX,
+            expires_in: None,
             scopes: vec!["openid".to_string()],
         }
     }

@@ -986,8 +986,9 @@ mod tests {
         let mut completer = DefaultCompleter::new_with_wordlen(completion_words(&field, None), 1);
         let suggestions: Vec<String> = completer
             .complete("s", 1)
-            .into_iter()
-            .map(|s| s.value)
+            .suggestions()
+            .iter()
+            .map(|s| s.value.clone())
             .collect();
         assert_eq!(suggestions, vec!["staging"]);
     }
@@ -998,10 +999,17 @@ mod tests {
         let mut completer = DefaultCompleter::new_with_wordlen(completion_words(&field, None), 1);
         let mut suggestions: Vec<String> = completer
             .complete("t", 1)
-            .into_iter()
-            .map(|s| s.value)
+            .suggestions()
+            .iter()
+            .map(|s| s.value.clone())
             .collect();
-        suggestions.extend(completer.complete("f", 1).into_iter().map(|s| s.value));
+        suggestions.extend(
+            completer
+                .complete("f", 1)
+                .suggestions()
+                .iter()
+                .map(|s| s.value.clone()),
+        );
         assert!(suggestions.contains(&"true".to_string()), "{suggestions:?}");
         assert!(
             suggestions.contains(&"false".to_string()),

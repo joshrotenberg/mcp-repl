@@ -61,6 +61,20 @@ The generated case count and seed live in `src/property.rs`. A fixed seed
 keeps CI time and failures reproducible; add the smallest reproducer to the
 matching regression corpus whenever one of these boundaries is fixed.
 
+The POSIX terminal smoke check uses a real PTY (completion, Ctrl-C without
+invocation, and asynchronous output preserving the typed line):
+`python3 scripts/check_terminal.py target/debug/mcp-repl` after building. It runs
+in Linux/macOS CI; Windows retains its unit and black-box process coverage.
+
+The minimum supported compiler is Rust 1.95.0. Check it explicitly with
+`cargo +1.95.0 check --locked --all-targets --all-features`; the CI job is named
+`Minimum Rust 1.95.0`. Branch protection still requires the historical context
+`Minimum Rust 1.90.0`, so a small compatibility job forwards the real 1.95
+job's result. It succeeds only when that job succeeds, and fails for failure,
+cancellation or a skipped job. The old context does not promise Rust 1.90
+support. This preserves the required gate without changing repository settings;
+its legacy name can be removed only in a separately authorized ruleset migration.
+
 ## Coverage
 
 Install `cargo-llvm-cov`, then generate the navigable report with:
@@ -93,6 +107,18 @@ resolved or unmatched baseline entry also fails so the allowlist cannot become
 stale. CI runs it on every pull request and `main` push, and daily, since an
 advisory can be published against a dependency that has not changed. Install
 it with `cargo install cargo-deny`.
+
+Dependabot checks Cargo dependencies every weekday, including lockfile-only
+transitive dependencies. Patch proposals share a PR; minor and major proposals
+stay separate because a pre-1.0 minor can break Rust APIs. Proposed updates still
+need the checks above and the Rust 1.95.0 MSRV gate. A newer release
+requiring a newer compiler needs an explicit baseline update; do not bypass its
+`rust-version` check or add an advisory exception to make an update pass.
+
+The authenticated [Dependabot update dashboard](https://github.com/joshrotenberg/mcp-repl/network/updates)
+shows version-update job logs. Check those logs when an expected PR is missing;
+enabled security updates and an empty alert list do not prove that version
+updates succeeded or that cargo-deny has no unmaintained-dependency advisory.
 
 The three temporary unmaintained-dependency exceptions tracked in [#309](https://github.com/joshrotenberg/mcp-repl/issues/309)
 expire at **2026-12-14 00:00 America/Los_Angeles (08:00 UTC)**. The Python 3.11+
