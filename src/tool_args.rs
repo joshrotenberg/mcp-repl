@@ -44,7 +44,11 @@ fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::V
     let ty = schema
         .get("properties")
         .and_then(|properties| properties.get(key))
-        .and_then(|property| property.get("type"))
+        .and_then(|property| {
+            property
+                .get("type")
+                .or_else(|| crate::command_set::resolve_ref(schema, property).get("type"))
+        })
         .and_then(|kind| kind.as_str());
     match ty {
         Some("string") => serde_json::Value::String(raw.to_string()),
@@ -163,6 +167,39 @@ mod tests {
             assert_eq!(parsed["text"], raw);
             assert!(parsed["text"].is_string());
         }
+    }
+
+    #[test]
+    fn a_type_beside_a_reference_wins_for_arguments_and_binds() {
+        let schema = json!({
+            "$defs": {"Untyped": {}, "Number": {"type": "integer"}},
+            "properties": {
+                "local": {"$ref": "#/$defs/Untyped", "type": "string"},
+                "sibling": {"$ref": "#/$defs/Number", "type": "string"},
+                "inherited": {"$ref": "#/$defs/Number"},
+                "nullable": {"$ref": "#/$defs/Number", "type": ["string", "null"]}
+            }
+        });
+        let parsed = parse_kv_args(
+            &schema,
+            &[
+                "local=123",
+                "sibling=true",
+                "inherited=123",
+                "nullable=null",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "local": "123", "sibling": "true", "inherited": 123, "nullable": null
+            })
+        );
+        assert_eq!(
+            apply_binds(&schema, &binds(&[("local", "123")]), json!({})),
+            json!({"local": "123"})
+        );
     }
 
     #[test]

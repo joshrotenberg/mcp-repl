@@ -61,7 +61,6 @@ mod command_set;
 pub mod config;
 mod connection_auth;
 mod directories;
-#[cfg(feature = "unstable-dynamic-cli")]
 mod dynamic_cli;
 mod editor;
 mod elicit;
@@ -187,6 +186,10 @@ EXAMPLES:
 
   mcp-repl --demo -e 'echo message=hi'   run REPL command syntax and exit
   mcp-repl --demo --json -e tools | jq   NDJSON for scripts
+  mcp-repl --demo echo --message=hi      generated one-shot flags
+  mcp-repl --demo tool --help            live help (connects to the server)
+
+Global options go before a generated command; --help here stays offline.
 
 Inside the REPL, `help` lists the built-ins and `help <command>` explains one."
 )]
@@ -208,7 +211,6 @@ struct Args {
 
     /// Serve the bundled demo router in-process (no external server needed).
     #[arg(long, conflicts_with_all = ["http", "server"])]
-    #[cfg_attr(not(feature = "unstable-dynamic-cli"), arg(conflicts_with = "command"))]
     demo: bool,
 
     /// Connect using a saved profile name, or an imported config entry.
@@ -326,11 +328,11 @@ struct Args {
 
     /// Emit one compact JSON value per command, for piping to tools like jq.
     ///
-    /// Applies in --exec mode, and the format is NDJSON.
+    /// Applies to --exec and generated one-shot commands; the format is NDJSON.
     #[arg(long)]
     json: bool,
 
-    /// In human --exec mode, still print the startup banner and surface
+    /// In human one-shot mode, still print the startup banner and surface
     /// listing. JSON stdout is always machine-only.
     #[arg(long, hide_short_help = true)]
     verbose: bool,
@@ -347,14 +349,14 @@ struct Args {
     /// How to answer a server's `sampling/createMessage` request: `prompt`
     /// shows it and reads the assistant message on stdin, `canned` answers
     /// with a fixed placeholder, `decline` refuses. Defaults to `prompt`
-    /// interactively and `decline` under --exec.
+    /// interactively and `decline` in one-shot mode.
     #[arg(long, value_enum, value_name = "STRATEGY", hide_short_help = true)]
     sampling: Option<sampling::SamplingMode>,
 
     /// How to answer a server's `elicitation/create` request: `prompt` shows
     /// what the server is asking and reads the answers on stdin, `decline`
     /// refuses every request. Defaults to `prompt` interactively and
-    /// `decline` under --exec.
+    /// `decline` in one-shot mode.
     #[arg(long, value_enum, value_name = "STRATEGY", hide_short_help = true)]
     elicitation: Option<elicit::ElicitationMode>,
 
@@ -389,11 +391,12 @@ struct Args {
     #[arg(long, value_name = "SECONDS", hide_short_help = true)]
     timeout: Option<u64>,
 
-    /// Command (and arguments) of a stdio MCP server to spawn.
+    /// Stdio child command and arguments; with an explicit --demo/--http/--server,
+    /// a generated one-shot command instead.
     command: Vec<String>,
 }
 
-/// Set in `--exec` mode by `--json`: render raw JSON instead of pretty output.
+/// Set in one-shot mode by `--json`: render raw JSON instead of pretty output.
 static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 fn json_output() -> bool {
@@ -4343,6 +4346,11 @@ fn resolve_profile(
 /// positional. Imported JSON is intentionally opt-in; ordinary commands and
 /// native profile names retain their existing interpretation.
 fn resolve_import(args: &Args) -> Option<import_config::ImportedConnection> {
+    // Demo tails belong to generated commands, even when a token resembles
+    // PATH.json:ENTRY. Do not open files or resolve their environment.
+    if args.demo {
+        return None;
+    }
     let candidate = match args.server.as_deref() {
         Some(server) => server,
         None => match args.command.as_slice() {
@@ -4566,21 +4574,13 @@ pub fn run_cli() {
     }
 }
 
-/// Reserve an explicit target's positional tail for the experimental
-/// surface-driven CLI. The default build deliberately leaves startup parsing
-/// untouched.
-#[cfg(feature = "unstable-dynamic-cli")]
-fn take_generated_argv(args: &mut Args, imported_target: bool) -> Vec<String> {
-    if args.demo || args.server.is_some() || (args.http.is_some() && !imported_target) {
+/// Reserve an explicit target's positional tail for the surface-driven CLI.
+fn take_generated_argv(args: &mut Args, positional_target: bool) -> Vec<String> {
+    if args.demo || args.server.is_some() || (args.http.is_some() && !positional_target) {
         std::mem::take(&mut args.command)
     } else {
         Vec::new()
     }
-}
-
-#[cfg(not(feature = "unstable-dynamic-cli"))]
-fn take_generated_argv(_args: &mut Args, _imported_target: bool) -> Vec<String> {
-    Vec::new()
 }
 
 async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()> {
@@ -4632,17 +4632,18 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     if args.scan {
         std::process::exit(print_scan().code());
     }
-    // Resolve imports before borrowing the positional tail: `--http URL
-    // path.json:entry` is an existing way to retarget an imported HTTP entry
-    // while retaining its auth, so that lone selector is part of the target,
-    // not a generated command.
+    // Lone positional native profiles and imports can retarget an HTTP URL
+    // while retaining profile auth. Recognize both before borrowing the tail:
+    // they select the connection rather than a generated command.
     let imported = resolve_import(&args);
     // An explicit connection selector makes the positional tail unambiguous:
     // it cannot be a stdio child command, so reserve it for a second clap
     // pass after the surface fetch. A raw positional target stays untouched
     // because there is no reliable boundary between its process arguments and
     // a tool invocation; --exec remains available for that case.
-    let dynamic_argv = take_generated_argv(&mut args, imported.is_some());
+    let positional_target = imported.is_some()
+        || matches!(args.command.as_slice(), [name] if profiles.servers.contains_key(name));
+    let dynamic_argv = take_generated_argv(&mut args, positional_target);
     if !dynamic_argv.is_empty() && !args.exec.is_empty() {
         exit_with_error(
             ExitStatus::Usage,
@@ -5263,7 +5264,6 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             )
         };
 
-    #[cfg(feature = "unstable-dynamic-cli")]
     let dynamic_command = if dynamic_argv.is_empty() {
         None
     } else {
@@ -5272,7 +5272,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             dynamic_cli::parse(surface.commands(), &dynamic_argv)
         };
         match parsed {
-            Ok(invocation) => Some(invocation.repl_line()),
+            Ok(invocation) => Some(invocation),
             Err(error) => {
                 let status = error.exit_code();
                 error.print().unwrap_or_else(|print_error| {
@@ -5289,8 +5289,6 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             }
         }
     };
-    #[cfg(not(feature = "unstable-dynamic-cli"))]
-    let dynamic_command: Option<String> = None;
 
     // Installed before the first command runs, for the reason in
     // `Interrupts`. Everything above this point is connection setup, where an
@@ -5302,7 +5300,12 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // exit non-zero if any errored. No editor, no event loop.
     if one_shot {
         let client = session.client();
-        for cmd in dynamic_command.iter().chain(args.exec.iter()) {
+        for input in dynamic_command
+            .as_ref()
+            .map(CommandInput::Generated)
+            .into_iter()
+            .chain(args.exec.iter().map(|line| CommandInput::Repl(line.trim())))
+        {
             match run_cancellable(
                 &session,
                 &surface,
@@ -5312,7 +5315,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 &schema_contracts,
                 &connect_runtime,
                 &mut interrupts,
-                cmd.trim(),
+                input,
             )
             .await
             {
@@ -5403,7 +5406,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                     &schema_contracts,
                     &connect_runtime,
                     &mut interrupts,
-                    line.trim(),
+                    CommandInput::Repl(line.trim()),
                 )
                 .await;
                 // The editor is parked on this ack, so it has to be sent
@@ -5423,6 +5426,14 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         eprintln!("warning: closing the server failed: {error}");
     }
     Ok(())
+}
+
+/// Both front ends share dispatch and cancellation; only REPL text needs
+/// shell parsing and substitution.
+#[derive(Clone, Copy)]
+enum CommandInput<'a> {
+    Repl(&'a str),
+    Generated(&'a dynamic_cli::Invocation),
 }
 
 /// What ended a command.
@@ -5540,7 +5551,7 @@ async fn run_cancellable(
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
     interrupts: &mut Interrupts,
-    line: &str,
+    input: CommandInput<'_>,
 ) -> Ran {
     interrupts.discard_pending();
     tokio::select! {
@@ -5553,7 +5564,7 @@ async fn run_cancellable(
             jobs,
             schema_contracts,
             connect_runtime,
-            line,
+            input,
         ) => {
             Ran::Completed(quit)
         }
@@ -5569,7 +5580,9 @@ async fn run_cancellable(
                 // backgrounded. The REPL cannot retrieve this one, since a
                 // plain call leaves no task behind to adopt, but it can say
                 // what to type next time.
-                if let Some(tool) = backgroundable_tool(surface, line) {
+                if let CommandInput::Repl(line) = input
+                    && let Some(tool) = backgroundable_tool(surface, line)
+                {
                     message.push_str(&paint(
                         Style::new().dimmed(),
                         &format!("  `{tool} ... &` runs it as a task instead"),
@@ -5720,7 +5733,7 @@ async fn run_for(
             jobs,
             schema_contracts,
             connect_runtime,
-            loop_.body,
+            CommandInput::Repl(loop_.body),
         ))
         .await
         {
@@ -5746,78 +5759,88 @@ async fn handle_line(
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
     connect_runtime: &ConnectRuntime,
-    line: &str,
+    input: CommandInput<'_>,
 ) -> bool {
-    if line.is_empty() {
-        if json_output() {
-            report_error(ExitStatus::Usage, "empty command");
+    // Generated argv is already tokenized. It must not become REPL source:
+    // variables, aliases, routing and escapes would change literal tool input.
+    let (output, command, parsed) = match input {
+        CommandInput::Generated(invocation) => {
+            (vars::Output::default(), String::new(), invocation.parsed())
         }
-        return false;
-    }
-    // Aliases expand before anything else looks at the line, so an expansion
-    // can carry arguments, a trailing `&`, or another alias. An alias can
-    // never be named after a built-in, so `alias`/`unalias` stay reachable.
-    let expanded;
-    let line = match aliases.read().unwrap().expand(line) {
-        Ok(None) => line,
-        Ok(Some(text)) => {
-            expanded = text;
-            expanded.trim()
-        }
-        Err(e) => {
-            report_error(ExitStatus::Usage, &e);
-            return false;
-        }
-    };
-    // `for` is read before substitution, since its loop variable is not bound
-    // until the loop binds it and the usual `$var` pass would fail on it first.
-    if let Some(parsed) = parse_for(line) {
-        return match parsed {
-            Ok(loop_) => {
-                run_for(
-                    session,
-                    surface,
-                    aliases,
-                    binds,
-                    jobs,
-                    schema_contracts,
-                    connect_runtime,
-                    loop_,
-                )
-                .await
+        CommandInput::Repl(line) => {
+            if line.is_empty() {
+                if json_output() {
+                    report_error(ExitStatus::Usage, "empty command");
+                }
+                return false;
             }
-            Err(error) => {
+            // Aliases expand before anything else looks at the line, so an expansion
+            // can carry arguments, a trailing `&`, or another alias. An alias can
+            // never be named after a built-in, so `alias`/`unalias` stay reachable.
+            let expanded;
+            let line = match aliases.read().unwrap().expand(line) {
+                Ok(None) => line,
+                Ok(Some(text)) => {
+                    expanded = text;
+                    expanded.trim()
+                }
+                Err(e) => {
+                    report_error(ExitStatus::Usage, &e);
+                    return false;
+                }
+            };
+            // `for` is read before substitution, since its loop variable is not bound
+            // until the loop binds it and the usual `$var` pass would fail on it first.
+            if let Some(parsed) = parse_for(line) {
+                return match parsed {
+                    Ok(loop_) => {
+                        run_for(
+                            session,
+                            surface,
+                            aliases,
+                            binds,
+                            jobs,
+                            schema_contracts,
+                            connect_runtime,
+                            loop_,
+                        )
+                        .await
+                    }
+                    Err(error) => {
+                        report_error(ExitStatus::Usage, &error);
+                        false
+                    }
+                };
+            }
+            // Capture (`name = cmd`), pipe (`cmd | path`), and `$var` references make
+            // the REPL a small shell: routing and substitution run before dispatch so
+            // every command sees resolved arguments. Capture and pipe act on tool
+            // results.
+            let (output, routed) = vars::route(line);
+            if let Some(path) = &output.filter
+                && let Err(error) = vars::validate_path(path)
+            {
                 report_error(ExitStatus::Usage, &error);
-                false
+                return false;
             }
-        };
-    }
-    // Capture (`name = cmd`), pipe (`cmd | path`), and `$var` references make
-    // the REPL a small shell: routing and substitution run before dispatch so
-    // every command sees resolved arguments. Capture and pipe act on tool
-    // results.
-    let (output, routed) = vars::route(line);
-    if let Some(path) = &output.filter
-        && let Err(error) = vars::validate_path(path)
-    {
-        report_error(ExitStatus::Usage, &error);
-        return false;
-    }
-    let command = match vars::substitute(routed) {
-        Ok(c) => c,
-        Err(e) => {
-            report_error(ExitStatus::Usage, &e);
-            return false;
+            let command = match vars::substitute(routed) {
+                Ok(c) => c,
+                Err(e) => {
+                    report_error(ExitStatus::Usage, &e);
+                    return false;
+                }
+            };
+            let parsed = match command::parse(&command) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    report_error(ExitStatus::Usage, &e);
+                    return false;
+                }
+            };
+            (output, command, parsed)
         }
     };
     let line = command.as_str();
-    let parsed = match command::parse(line) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            report_error(ExitStatus::Usage, &e);
-            return false;
-        }
-    };
     let background = parsed.background;
     let tokens: Vec<&str> = parsed.words.iter().map(String::as_str).collect();
     if tokens.is_empty() {
@@ -8208,6 +8231,61 @@ mod tests {
 
     use async_trait::async_trait;
     use tower_mcp::client::ClientTransport;
+
+    #[test]
+    fn generated_tail_requires_an_explicit_selector_and_preserves_child_argv() {
+        for (argv, imported, expected) in [
+            (
+                vec!["--demo", "echo", "--message=hi"],
+                false,
+                vec!["echo", "--message=hi"],
+            ),
+            (
+                vec!["--http", "http://localhost/mcp", "tools"],
+                false,
+                vec!["tools"],
+            ),
+            (
+                vec!["--server", "profile", "add", "--a=-1"],
+                false,
+                vec!["add", "--a=-1"],
+            ),
+            (
+                vec!["--server", "config.json:local", "tools"],
+                true,
+                vec!["tools"],
+            ),
+            (
+                vec!["--http", "http://localhost/mcp", "config.json:local"],
+                true,
+                vec![],
+            ),
+            (
+                vec!["--http", "http://localhost/mcp", "profile"],
+                true,
+                vec![],
+            ),
+            (vec!["profile"], false, vec![]),
+            (vec!["config.json:local"], true, vec![]),
+            (
+                vec!["--", "server", "--demo", "echo", "--message=child"],
+                false,
+                vec![],
+            ),
+        ] {
+            let mut args = Args::try_parse_from(std::iter::once("mcp-repl").chain(argv)).unwrap();
+            let original = args.command.clone();
+            assert_eq!(take_generated_argv(&mut args, imported), expected);
+            assert_eq!(
+                args.command,
+                if expected.is_empty() {
+                    original
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
 
     fn surface_with_a_task_capable_tool() -> Arc<RwLock<Surface>> {
         let tool = |name: &str, task: bool| -> ToolDefinition {

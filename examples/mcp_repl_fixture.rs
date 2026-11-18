@@ -43,6 +43,22 @@ fn fixture_router() -> McpRouter {
                 })
                 .build(),
         )
+        .tool(
+            ToolBuilder::new("inspect_args")
+                .description("Return literal arguments for generated CLI boundary tests")
+                .input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "nested": {"type": "object"}
+                    }
+                }))
+                .extractor_handler((), |_ctx: Context, RawArgs(args): RawArgs| async move {
+                    Ok(CallToolResult::text(args.to_string()))
+                })
+                .build(),
+        )
         // Deliberately collide with a REPL built-in. The black-box suite uses
         // this to prove that neither namespace can silently win.
         .tool(
@@ -141,6 +157,7 @@ fn fixture_router() -> McpRouter {
                             "cwd": cwd,
                             "imported": imported,
                             "bearer": bearer,
+                            "argv": std::env::args().skip(1).collect::<Vec<_>>(),
                         })
                         .to_string(),
                     ))

@@ -158,16 +158,10 @@ $ mcp-repl --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
 212.00
 ```
 
-### Experimental generated CLI
+### Generated one-shot CLI
 
-The `unstable-dynamic-cli` Cargo feature tries a more conventional one-shot
-form while its command grammar is evaluated. It is off by default:
-
-```bash
-cargo install --locked mcp-repl --features unstable-dynamic-cli
-```
-
-With the feature enabled and an explicit connection selector, mcp-repl
+Generated commands are included in normal builds and installations. With an
+explicit connection selector, mcp-repl
 discovers the server first and projects the REPL's one-shot vocabulary into a
 CLI. Tool and prompt schemas become flags; resources keep the same
 `read <uri>` shape they have at the prompt:
@@ -203,8 +197,21 @@ no reliable boundary between its own arguments and a following command, so use
 `-e` there. `-e` also remains the way to run several commands or stateful REPL
 workflows against one session.
 
-**A one-shot run cannot block waiting for a person.** Under `-e` or an
-experimental generated command, elicitation and sampling both default to
+Put global flags such as `--json`, `--config`, and `--timeout` before the
+command. Use `--flag=value` for values beginning with `-`; negative numbers
+also work as separate values. Boolean flags take a value (`--enabled=false`).
+Arguments are literal: dollar signs, newlines, quotes and shell operators are
+passed as data. Use `call <raw-tool-name> '<JSON object>'` when a schema needs
+exact JSON types or property names unsuitable for `key=value` dispatch.
+
+Root `--help` stays offline. `echo --help` or `tool --help` after an explicit
+selector discovers the live surface and may start a configured stdio child.
+See the [generated CLI contract](docs/scripting.md#generated-commands) for
+schema coercion, collision names and help/error behavior. The old
+`unstable-dynamic-cli` feature remains an accepted compatibility alias.
+
+**A one-shot run cannot block waiting for a person.** Under `-e` or
+a generated command, elicitation and sampling both default to
 `decline`, so a server that asks a question gets an immediate refusal instead
 of hanging the caller. `--timeout` bounds everything else, and exit statuses
 are typed, so a tool error (3) is distinguishable from an empty result.

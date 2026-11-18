@@ -27,8 +27,8 @@ const ONE_SHOT_BUILTINS: &[&str] = &[
     "call",
 ];
 
-/// A generated CLI invocation translated back into the REPL's command
-/// language. Reusing that boundary keeps output, schema contracts, reconnects,
+/// A generated CLI invocation translated into the REPL's dispatch tokens.
+/// Reusing that boundary keeps output, schema contracts, reconnects,
 /// and exit statuses identical to `--exec` and interactive calls.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Invocation {
@@ -42,14 +42,11 @@ impl Invocation {
         }
     }
 
-    pub(crate) fn repl_line(&self) -> String {
-        self.words
-            .iter()
-            // JSON string quoting is accepted by the REPL tokenizer and
-            // safely preserves whitespace, quotes, backslashes, and `&`.
-            .map(|word| serde_json::to_string(word).expect("strings always serialize"))
-            .collect::<Vec<_>>()
-            .join(" ")
+    pub(crate) fn parsed(&self) -> crate::command::ParsedCommand {
+        crate::command::ParsedCommand {
+            words: self.words.clone(),
+            background: false,
+        }
     }
 }
 
@@ -99,19 +96,26 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
         root = root.subcommand(surface_command(spec));
     }
 
-    if let Some(first) = argv.first()
+    if let Some(first) = argv
+        .first()
+        .filter(|first| !matches!(first.as_str(), "tool" | "builtin"))
         && let Some(spec) = tool_specs
             .iter()
             .find(|spec| spec.command == *first && crate::is_builtin(&spec.name))
     {
+        let builtin_form = if ONE_SHOT_BUILTINS.contains(&spec.name.as_str()) {
+            format!("builtin {} ...", clean_text(&spec.name))
+        } else {
+            format!("-e 'builtin {} ...'", clean_text(&spec.name))
+        };
         return Err(root.error(
             ErrorKind::InvalidSubcommand,
             format!(
                 "ambiguous command `{}`: both a server tool and a built-in use that name; \
-                 use `tool {} ...` for the server tool or `builtin {} ...` for the built-in",
+                 use `tool {} ...` for the server tool or `{}` for the built-in",
                 clean_text(&spec.name),
                 clean_text(&spec.command),
-                clean_text(&spec.name),
+                builtin_form,
             ),
         ));
     }
@@ -128,7 +132,7 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
                 .subcommand()
                 .expect("the tool namespace requires a server tool");
             let spec = spec_named(&tool_specs, name);
-            Ok(surface_invocation(Some("tool"), spec, matches))
+            surface_invocation(Some("tool"), spec, matches)
         }
         "builtin" => {
             let (name, matches) = matches
@@ -136,15 +140,6 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
                 .expect("the builtin namespace requires a built-in");
             if ONE_SHOT_BUILTINS.contains(&name) {
                 builtin_invocation(Some("builtin"), name, matches, &prompt_specs)
-            } else if crate::is_builtin(name) {
-                let words = ["builtin".to_string(), name.to_string()].into_iter().chain(
-                    matches
-                        .get_many::<String>("")
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                );
-                Ok(Invocation::new(words))
             } else {
                 Err(clap::Error::raw(
                     ErrorKind::InvalidSubcommand,
@@ -157,7 +152,7 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
         }
         name => {
             let spec = spec_named(&tool_specs, name);
-            Ok(surface_invocation(None, spec, matches))
+            surface_invocation(None, spec, matches)
         }
     }
 }
@@ -182,12 +177,7 @@ fn builtin_namespace(prompt_specs: &[SurfaceCommandSpec]) -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true)
-        .allow_external_subcommands(true)
-        .external_subcommand_value_parser(clap::value_parser!(String))
-        .after_help(
-            "Other REPL built-ins are accepted with their REPL argument syntax; use --exec for \
-             multi-command or stateful workflows.",
-        );
+        .after_help("Use --exec for other REPL built-ins, multi-command or stateful workflows.");
     for name in ONE_SHOT_BUILTINS {
         command = command.subcommand(builtin_command(name, prompt_specs));
     }
@@ -326,7 +316,7 @@ fn builtin_invocation(
                 .expect("the prompt command requires a server prompt");
             let spec = spec_named(prompt_specs, prompt);
             words.push(spec.name.clone());
-            words.extend(surface_arguments(spec, prompt_matches));
+            words.extend(surface_arguments(spec, prompt_matches)?);
         }
         "call" => {
             words.push(required_string(matches, "tool"));
@@ -397,6 +387,7 @@ fn surface_command(spec: &SurfaceCommandSpec) -> Command {
             .value_name(argument.value_name.clone())
             .required(argument.required)
             .num_args(1)
+            .allow_negative_numbers(true)
             .action(ArgAction::Set);
         if let Some(help) = &argument.help {
             arg = arg.help(help.clone());
@@ -410,24 +401,39 @@ fn surface_invocation(
     namespace: Option<&str>,
     spec: &SurfaceCommandSpec,
     matches: &ArgMatches,
-) -> Invocation {
+) -> Result<Invocation, clap::Error> {
     let words = namespace
         .into_iter()
         .map(str::to_string)
         .chain(std::iter::once(spec.name.clone()))
-        .chain(surface_arguments(spec, matches));
-    Invocation::new(words)
+        .chain(surface_arguments(spec, matches)?);
+    Ok(Invocation::new(words))
 }
 
-fn surface_arguments(spec: &SurfaceCommandSpec, matches: &ArgMatches) -> Vec<String> {
-    spec.arguments
+fn surface_arguments(
+    spec: &SurfaceCommandSpec,
+    matches: &ArgMatches,
+) -> Result<Vec<String>, clap::Error> {
+    if spec.arguments.iter().any(|argument| {
+        (argument.property.is_empty()
+            || argument.property.contains('=')
+            || argument.property.starts_with('{'))
+            && matches.get_one::<String>(&argument.id).is_some()
+    }) {
+        return Err(clap::Error::raw(
+            ErrorKind::InvalidValue,
+            "this property name cannot use key=value dispatch; use call <raw-name> <JSON> instead",
+        ));
+    }
+    Ok(spec
+        .arguments
         .iter()
         .filter_map(|argument| {
             matches
                 .get_one::<String>(&argument.id)
                 .map(|value| format!("{}={value}", argument.property))
         })
-        .collect()
+        .collect())
 }
 
 fn spec_named<'a>(specs: &'a [SurfaceCommandSpec], command: &str) -> &'a SurfaceCommandSpec {
@@ -438,12 +444,16 @@ fn spec_named<'a>(specs: &'a [SurfaceCommandSpec], command: &str) -> &'a Surface
 }
 
 fn command_specs(commands: &[CommandSpec], fallback: &str) -> Vec<SurfaceCommandSpec> {
-    let mut used_commands = HashSet::new();
+    let names = stable_cli_names(
+        commands.iter().map(|command| command.name.as_str()),
+        fallback,
+        &[],
+    );
     commands
         .iter()
         .enumerate()
         .map(|(index, command)| SurfaceCommandSpec {
-            command: unique_cli_name(&command.name, fallback, &mut used_commands),
+            command: names[index].clone(),
             name: command.name.clone(),
             about: command.description.as_deref().map(clean_text),
             arguments: argument_specs(index, &command.arguments),
@@ -455,20 +465,21 @@ fn argument_specs(
     owner_index: usize,
     arguments: &[crate::command_set::ArgumentSpec],
 ) -> Vec<ArgumentSpec> {
-    let mut used_flags = HashSet::from(["help".to_string(), "version".to_string()]);
+    let names = stable_cli_names(
+        arguments.iter().map(|argument| argument.name.as_str()),
+        "arg",
+        &["help", "version"],
+    );
     arguments
         .iter()
         .enumerate()
         .map(|(argument_index, argument)| ArgumentSpec {
             id: format!("surface-{owner_index}-arg-{argument_index}"),
             property: argument.name.clone(),
-            flag: unique_cli_name(&argument.name, "arg", &mut used_flags),
+            flag: names[argument_index].clone(),
             required: argument.required,
             help: argument_help(argument),
-            value_name: argument
-                .value_type
-                .as_deref()
-                .unwrap_or("value")
+            value_name: clean_text(argument.value_type.as_deref().unwrap_or("value"))
                 .to_ascii_uppercase(),
         })
         .collect()
@@ -492,9 +503,31 @@ fn argument_help(argument: &crate::command_set::ArgumentSpec) -> Option<String> 
     }
 }
 
-/// Preserve normal MCP names exactly and make unusual names safe for clap.
-/// Collisions receive stable numeric suffixes rather than hiding an item.
-fn unique_cli_name(raw: &str, fallback: &str, used: &mut HashSet<String>) -> String {
+/// Allocate ordinary names first, then unusual names in raw-name order.
+/// Reserving every ordinary name before suffix allocation keeps it intact,
+/// including names such as `odd-name-2`, regardless of discovery order.
+fn stable_cli_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+    fallback: &str,
+    reserved: &[&str],
+) -> Vec<String> {
+    let names: Vec<_> = names.collect();
+    let mut order: Vec<_> = (0..names.len()).collect();
+    order.sort_by_key(|&index| {
+        (
+            reserved.contains(&names[index]) || cli_base(names[index], fallback) != names[index],
+            names[index],
+        )
+    });
+    let mut used: HashSet<String> = reserved.iter().map(|name| name.to_string()).collect();
+    let mut result = vec![String::new(); names.len()];
+    for index in order {
+        result[index] = unique_cli_name(names[index], fallback, &mut used);
+    }
+    result
+}
+
+fn cli_base(raw: &str, fallback: &str) -> String {
     let mut base = raw
         .chars()
         .map(|ch| {
@@ -514,6 +547,11 @@ fn unique_cli_name(raw: &str, fallback: &str, used: &mut HashSet<String>) -> Str
     if base.is_empty() {
         base = fallback.to_string();
     }
+    base
+}
+
+fn unique_cli_name(raw: &str, fallback: &str, used: &mut HashSet<String>) -> String {
+    let base = cli_base(raw, fallback);
     let mut candidate = base.clone();
     let mut suffix = 2;
     while !used.insert(candidate.clone()) {
@@ -608,7 +646,7 @@ mod tests {
             ],
         ] {
             let invocation = parse(&tools, &[], &argv).unwrap();
-            let parsed = crate::command::parse(&invocation.repl_line()).unwrap();
+            let parsed = invocation.parsed();
             let expected_prefix = if argv[0] == "tool" {
                 vec!["tool".to_string(), "echo".to_string()]
             } else {
@@ -635,7 +673,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            crate::command::parse(&read.repl_line()).unwrap().words,
+            read.parsed().words,
             ["read", "note://status", "--out", "result.txt", "--force"]
         );
 
@@ -645,10 +683,7 @@ mod tests {
             &["prompt".into(), "greet".into(), "--subject=world".into()],
         )
         .unwrap();
-        assert_eq!(
-            crate::command::parse(&prompt.repl_line()).unwrap().words,
-            ["prompt", "greet", "subject=world"]
-        );
+        assert_eq!(prompt.parsed().words, ["prompt", "greet", "subject=world"]);
     }
 
     #[test]
@@ -669,25 +704,27 @@ mod tests {
     }
 
     #[test]
-    fn explicit_builtin_keeps_stateful_repl_commands_reachable() {
-        let invocation = parse(
-            &[],
-            &[],
-            &[
-                "builtin".into(),
-                "wait".into(),
-                "last".into(),
-                "--timeout".into(),
-                "1".into(),
-            ],
-        )
-        .unwrap();
+    fn namespace_words_remain_reachable_when_the_server_uses_them() {
+        let tools = [
+            tool("tool", json!({"type":"object"})),
+            tool("builtin", json!({"type":"object"})),
+        ];
+        for name in ["tool", "builtin"] {
+            let invocation = parse(&tools, &[], &["tool", name].map(String::from)).unwrap();
+            assert_eq!(invocation.parsed().words, ["tool", name]);
+        }
+        assert!(parse(&tools, &[], &["builtin", "tools"].map(String::from)).is_ok());
         assert_eq!(
-            crate::command::parse(&invocation.repl_line())
-                .unwrap()
-                .words,
-            ["builtin", "wait", "last", "--timeout", "1"]
+            parse(&tools, &[], &["tool", "--help"].map(String::from))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DisplayHelp
         );
+    }
+
+    #[test]
+    fn stateful_builtins_require_exec() {
+        assert!(parse(&[], &[], &["builtin".into(), "wait".into()]).is_err());
     }
 
     #[test]
@@ -709,18 +746,159 @@ mod tests {
         ];
         let first = parse(&tools, &[], &["tool".into(), "odd-name".into()]).unwrap();
         let second = parse(&tools, &[], &["tool".into(), "odd-name-2".into()]).unwrap();
-        assert_eq!(
-            crate::command::parse(&first.repl_line()).unwrap().words,
-            ["tool", "odd/name"]
-        );
-        assert_eq!(
-            crate::command::parse(&second.repl_line()).unwrap().words,
-            ["tool", "odd-name"]
-        );
+        assert_eq!(first.parsed().words, ["tool", "odd-name"]);
+        assert_eq!(second.parsed().words, ["tool", "odd/name"]);
         let reserved = parse(&tools, &[], &["tool".into(), "tool".into()]).unwrap();
+        assert_eq!(reserved.parsed().words, ["tool", "tool!"]);
+    }
+    #[test]
+    fn ambiguity_hints_use_exec_for_stateful_builtins() {
+        let tools = [tool("wait", json!({"type":"object"}))];
+        let error = parse(&tools, &[], &["wait".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("-e 'builtin wait ...'"));
+        assert!(!error.contains("or `builtin wait ...`"));
+    }
+
+    #[test]
+    fn names_and_flags_are_independent_of_discovery_order() {
+        let names = [
+            "odd/name",
+            "odd-name",
+            "odd-name-2",
+            "odd?name",
+            "",
+            "help",
+            "help-2",
+            "version",
+        ];
+        let expected = stable_cli_names(names.iter().copied(), "arg", &["help", "version"]);
+        for shift in 0..names.len() {
+            let mut permuted = names.to_vec();
+            permuted.rotate_left(shift);
+            permuted.reverse();
+            let actual = stable_cli_names(permuted.iter().copied(), "arg", &["help", "version"]);
+            for (raw, flag) in permuted.iter().zip(actual) {
+                assert_eq!(
+                    flag,
+                    expected[names.iter().position(|name| name == raw).unwrap()]
+                );
+            }
+        }
+        assert_eq!(expected[1], "odd-name");
+        assert_eq!(expected[2], "odd-name-2");
+        assert_eq!(expected[6], "help-2");
+    }
+
+    #[test]
+    fn schema_values_reuse_common_coercion_and_keep_omissions() {
+        let schema = json!({
+            "type": "object",
+            "$defs": {"Text": {"type": "string"}, "Untyped": {}},
+            "properties": {
+                "count": {"type": "integer"},
+                "enabled": {"type": "boolean"},
+                "ratio": {"type": "number"},
+                "nested": {"type": "object"},
+                "items": {"type": "array"},
+                "text": {"$ref": "#/$defs/Text"},
+                "local_text": {"$ref": "#/$defs/Untyped", "type": "string"},
+                "choice": {"type": "string", "enum": ["yes", "no"]},
+                "nullable": {"type": ["string", "null"]},
+                "omitted": {"type": "string", "default": "server default"}
+            }
+        });
+        let tools = [tool("values", schema.clone())];
+        let invocation = parse(
+            &tools,
+            &[],
+            &[
+                "values",
+                "--count",
+                "-3",
+                "--ratio",
+                "-0.5",
+                "--enabled=false",
+                "--nested={\"items\":[1,null]}",
+                "--items=[true,2]",
+                "--text=123",
+                "--local_text=true",
+                "--choice=yes",
+                "--nullable=null",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        let parsed = invocation.parsed();
+        let tokens: Vec<_> = parsed.words[1..].iter().map(String::as_str).collect();
         assert_eq!(
-            crate::command::parse(&reserved.repl_line()).unwrap().words,
-            ["tool", "tool!"]
+            crate::tool_args::parse_kv_args(&schema, &tokens).unwrap(),
+            json!({
+                "count": -3, "ratio": -0.5, "enabled": false, "nested": {"items": [1,null]},
+                "items": [true,2], "text": "123", "local_text": "true", "choice": "yes", "nullable": null
+            })
+        );
+        assert!(parse(&tools, &[], &["values", "--enabled"].map(String::from)).is_err());
+        assert!(
+            parse(
+                &tools,
+                &[],
+                &["values", "--count=1", "--count=2"].map(String::from)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reserved_flags_and_control_text_cannot_break_help() {
+        let mut definition = tool(
+            "help",
+            json!({"type":"object", "properties": {
+                "help": {"type":"string"}, "version": {"type":"string"}, "help-2": {"type":"string"}
+            }}),
+        );
+        definition.description = Some("unsafe\u{1b}[31m description".into());
+        let tools = [definition];
+        let help = parse(&tools, &[], &["tool", "help", "--help"].map(String::from)).unwrap_err();
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        assert!(!help.to_string().contains('\u{1b}'));
+        let invocation = parse(
+            &tools,
+            &[],
+            &["tool", "help", "--help-3=text", "--version-2=x"].map(String::from),
+        )
+        .unwrap();
+        assert!(invocation.parsed().words.contains(&"help=text".to_string()));
+    }
+
+    #[test]
+    fn malformed_property_names_require_raw_json_instead_of_wrong_arguments() {
+        let tools = [tool(
+            "odd",
+            json!({"type":"object", "properties": {"a=b": {"type":"string"}, "{x": {"type":"string"}}}),
+        )];
+        assert!(
+            parse(&tools, &[], &["odd", "--a-b=text"].map(String::from))
+                .unwrap_err()
+                .to_string()
+                .contains("call")
+        );
+        assert!(
+            parse(&tools, &[], &["odd", "--x=1"].map(String::from))
+                .unwrap_err()
+                .to_string()
+                .contains("call")
+        );
+        let invocation = parse(
+            &tools,
+            &[],
+            &["call", "odd", "{\"a=b\":\"text\"}"].map(String::from),
+        )
+        .unwrap();
+        assert_eq!(
+            invocation.parsed().words,
+            ["call", "odd", "{\"a=b\":\"text\"}"]
         );
     }
 }
