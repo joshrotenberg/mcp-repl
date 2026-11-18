@@ -1,7 +1,7 @@
 # The index digests keep both base images immutable across architectures.
-ARG CARGO_AUDITABLE_VERSION=0.7.5
-ARG RUST_BASE=docker.io/library/rust:1.90.0-slim-bookworm@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9
-ARG RUNTIME_BASE=docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+ARG CARGO_AUDITABLE_VERSION=0.7.7
+ARG RUST_BASE=docker.io/library/rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
+ARG RUNTIME_BASE=docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 FROM ${RUST_BASE} AS build
 ARG CARGO_AUDITABLE_VERSION

@@ -16,10 +16,10 @@ use std::time::Duration;
 use crate::session::Session;
 use nu_ansi_term::{Color, Style};
 use reedline::{
-    ColumnarMenu, Completer, DefaultHinter, Emacs, ExternalPrinter, FileBackedHistory, Highlighter,
-    KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
-    Suggestion, ValidationResult, Validator, default_emacs_keybindings,
+    ColumnarMenu, Completer, CompletionResult, DefaultHinter, Emacs, ExternalPrinter,
+    FileBackedHistory, Highlighter, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    Span, StyledText, Suggestion, ValidationResult, Validator, default_emacs_keybindings,
 };
 
 use crate::alias::Aliases;
@@ -428,7 +428,13 @@ impl ReplCompleter {
 }
 
 impl Completer for ReplCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+        CompletionResult::fresh(self.complete_suggestions(line, pos))
+    }
+}
+
+impl ReplCompleter {
+    fn complete_suggestions(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let head = &line[..pos];
         let (word_start, word) = match head.rfind(char::is_whitespace) {
             Some(i) => (i + 1, &head[i + 1..]),
@@ -1074,7 +1080,7 @@ fn run_interactive(
                     break;
                 }
             }
-            Ok(Signal::CtrlC) => continue,
+            Ok(Signal::CtrlC(_)) => continue,
             _ => {
                 let _ = line_tx.blocking_send("quit".to_string());
                 break;

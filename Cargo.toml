@@ -2,7 +2,7 @@
 name = "mcp-repl"
 version = "0.3.11"
 edition = "2024"
-rust-version = "1.90.0"
+rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/joshrotenberg/mcp-repl"
 homepage = "https://github.com/joshrotenberg/mcp-repl"
@@ -56,7 +56,7 @@ unstable-dynamic-cli = ["clap/string"]
 # `dynamic-tools` carries no dependencies of its own; it compiles the registry
 # the demo server uses to add a tool while a client is connected, which is what
 # lets `--demo` show the command table refreshing live.
-tower-mcp = { version = "0.26.0", features = [
+tower-mcp = { version = "0.27.0", features = [
     "dynamic-tools",
     "http-client",
     "oauth-client",
@@ -80,7 +80,7 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reedline = { version = "0.49", features = ["external_printer"] }
+reedline = "0.53"
 nu-ansi-term = "0.50"
 keyring = "4.1"
 webbrowser = { version = "1.2", features = ["hardened"] }
@@ -101,6 +101,6 @@ libc = "0.2"
 [dev-dependencies]
 # The fixture example is an MCP server, so the dev graph adds tower-mcp's
 # server-side features and the fixture's own HTTP dependencies.
-tower-mcp = { version = "0.26.0", features = ["http", "protocol-2026-07-28"] }
+tower-mcp = { version = "0.27.0", features = ["http", "protocol-2026-07-28"] }
 axum = { version = "0.8", features = ["json"] }
 schemars = "1.2"

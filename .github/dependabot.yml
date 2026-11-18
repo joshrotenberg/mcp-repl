@@ -3,10 +3,22 @@ updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
+      interval: daily
+    # Keep lockfile-only transitive updates visible too, rather than waiting
+    # for a direct dependency bump or a security alert to refresh them.
+    allow:
+      - dependency-type: all
     open-pull-requests-limit: 10
     commit-message:
       prefix: "chore(deps):"
+    # Group patches to avoid filling the PR limit with individual lockfile
+    # changes. Keep minor/major updates separate: a 0.x minor can break Rust APIs.
+    groups:
+      cargo-patches:
+        patterns:
+          - "*"
+        update-types:
+          - patch
 
   - package-ecosystem: github-actions
     directory: "/"
