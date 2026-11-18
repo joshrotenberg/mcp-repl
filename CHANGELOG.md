@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-11-18
+
+### CLI behavior
+
+- Make generated one-shot commands available in normal builds for explicit
+  `--demo`, `--server` and `--http` selectors, such as
+  `mcp-repl --demo echo --message=hi`. Selector tails that default builds
+  previously rejected or ignored now execute a command. With no command,
+  startup remains interactive; use repeated `-e` for stateful or multi-command
+  sessions. Raw stdio child argument boundaries stay intact. The former
+  `unstable-dynamic-cli` feature remains an accepted no-op alias. (#343)
+- Stabilize tool/flag collision names across discovery order, preserve literal
+  argv without REPL expansion, and keep explicit `tool`/`builtin` namespaces.
+  Preserve authenticated HTTP profile retargeting and reject import-looking
+  demo commands without opening their files. (#343)
+- Support negative scalar values and one-value boolean flags, nested JSON and
+  bounded same-document references; a local `type` beside a reference takes
+  precedence in coercion and help. Generated help connects and may start a
+  stdio child; root `--help` remains offline. Global flags go before the
+  generated command. See [scripting](https://github.com/joshrotenberg/mcp-repl/blob/v0.4.0/docs/scripting.md) for the complete
+  argument, schema and help contract. (#343)
+
+### Build and dependencies
+
+- Raise the minimum source-build compiler to **Rust 1.95.0**. Prebuilt binaries
+  do not require a local Rust compiler. Upgrade reedline to 0.53 and tower-mcp
+  to 0.27, adapting completion, Ctrl-C, asynchronous printer ownership and
+  persisted OAuth token compatibility. (#347)
+- Refresh all feasible dependencies, remove chrono and RUSTSEC-2026-0543 from
+  the graph, and expand Cargo Dependabot to weekday direct/transitive checks
+  with patch grouping. No advisory exception was added or extended. (#347)
+- Keep the existing encrypted credential backend. The three existing
+  unmaintained-credential dependency exceptions in #309 expire at
+  **2026-12-14 08:00 UTC** (midnight Pacific); the publication guard continues
+  to enforce that cutoff. Safe credential migration remains tracked in #324.
+
+### Documentation and known limitations
+
+- Polish README/crate documentation and document the generated CLI contract.
+  (#339, #343)
+- Keep the intermittent macOS final HTTP task-completion timeout tracked in
+  #348 open. The isolated unchanged-code CI rerun, five local black-box
+  repetitions and final integration CI passed; its root cause is unresolved.
+- Generated `find`, `read` and `snapshot` retain the existing built-in parser's
+  handling of dash-prefixed positional values. Use the documented interfaces
+  for exact literal tool/prompt flags. Generic-array and matchit patch gaps
+  remain constrained by exact upstream pins; the safe credential migration
+  remains dependent on upstream releases.
+
+
 ## [0.3.11] - 2026-11-10
 
 ### Features
