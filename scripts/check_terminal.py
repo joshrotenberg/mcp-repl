@@ -40,10 +40,12 @@ class Terminal:
     def send(self, value):
         os.write(self.master, value)
 
-    def wait(self, text, start=0, timeout=15):
+    def wait(self, text, start=0, timeout=15, after=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             plain = ANSI.sub(b"", bytes(self.output[start:])).decode(errors="replace").replace("\r", "")
+            if after is not None:
+                plain = plain.partition(after)[2]
             if text in plain:
                 return len(self.output)
             if not select.select([self.master], [], [], min(0.1, max(0, deadline-time.monotonic())))[0]:
@@ -107,6 +109,8 @@ def exercise(binary):
             terminal.wait('"text":"PTY_COMPLETION"')
             mark = len(terminal.output)
             terminal.send(b"echo message=PTY_CANCELLED")
+            terminal.wait("mcp-repl-demo> echo message=PTY_CANCELLED", start=mark)
+            mark = len(terminal.output)
             terminal.send(b"\x03")
             terminal.wait("mcp-repl-demo>", start=mark)
             terminal.send(b"echo message=PTY_AFTER_CANCEL\r")
@@ -123,7 +127,9 @@ def exercise(binary):
             terminal.wait("mcp-repl-demo>", start=mark)
             terminal.send(b"echo message=PTY_AFTER_EVENT")
             terminal.wait("completed", start=mark)
-            # An asynchronous printer redraw must preserve the typed line.
+            terminal.wait("mcp-repl-demo> echo message=PTY_AFTER_EVENT",
+                          start=mark, after="completed")
+            # Require a redraw after the notice as well as preserving execution.
             mark = len(terminal.output)
             terminal.send(b"\r")
             terminal.wait("\nPTY_AFTER_EVENT\n", start=mark)

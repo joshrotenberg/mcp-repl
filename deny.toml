@@ -67,8 +67,8 @@ skip = [
     { crate = "cpufeatures@0.2.17", reason = "blocked on the WebSocket sha1 stack moving to the 0.3 API" },
     { crate = "crypto-common@0.1.7", reason = "blocked on the WebSocket digest 0.10 stack moving to crypto-common 0.2" },
     { crate = "digest@0.10.7", reason = "blocked on the WebSocket sha1 stack adopting digest 0.11" },
-    # Platform keyring support and rand/tungstenite are on older getrandom
-    # generations than mcp-repl, tempfile, uuid, and tower-mcp.
+    # rand/tungstenite use an older getrandom generation than mcp-repl,
+    # tempfile, uuid, and tower-mcp.
     { crate = "getrandom@0.3.4", reason = "blocked on rand 0.9 and tungstenite moving to getrandom 0.4" },
     { crate = "r-efi@5.3.0", reason = "blocked on the getrandom 0.3 dependency line" },
     # The proc-macro ecosystem is midway through the syn 3 transition.
