@@ -33,8 +33,20 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
             home.join(if claude { ".claude" } else { ".codex" })
         });
     let test_root = PathBuf::from(std::env::var_os("MCP_REPL_PLUGIN_FIXTURE").unwrap());
-    assert!(profile.starts_with(&test_root));
-    assert_ne!(std::env::current_dir()?, test_root);
+    fs::write(
+        test_root.join(if claude {
+            "claude-diagnostic"
+        } else {
+            "codex-diagnostic"
+        }),
+        format!(
+            "profile={profile:?}; root={test_root:?}; cwd={:?}",
+            std::env::current_dir()?
+        ),
+    )?;
+    let canonical_root = test_root.canonicalize()?;
+    assert!(profile.canonicalize()?.starts_with(&canonical_root));
+    assert_ne!(std::env::current_dir()?.canonicalize()?, canonical_root);
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     assert_eq!(args.pop().as_deref(), Some("--json"));
     let trace = if claude {
@@ -96,7 +108,7 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         }
         ["plugin", "marketplace", "add", path] => {
             assert!(root.is_none());
-            assert!(Path::new(path).starts_with(&test_root));
+            assert!(Path::new(path).canonicalize()?.starts_with(&canonical_root));
             fs::write(registered, path)?;
             if claude {
                 json!({"outcome":"ok", "marketplace": MARKET})

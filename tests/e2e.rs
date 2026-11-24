@@ -3089,7 +3089,12 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     let output = run(both, "partial plugin install", CASE_TIMEOUT).await;
     assert_status(&output, 3, "partial plugin install");
     let partial = &json_lines(&output, "partial plugin install")[0];
-    assert_eq!(partial["providers"][0]["outcome"], "installed");
+    assert_eq!(
+        partial["providers"][0]["outcome"],
+        "installed",
+        "report={partial}; child={}",
+        std::fs::read_to_string(root.join("claude-diagnostic")).unwrap_or_default()
+    );
     assert_eq!(partial["providers"][1]["outcome"], "error");
     let version = partial["bundle_version"].as_str().unwrap();
 
