@@ -25,14 +25,28 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
     {
         assert!(profile_override.is_none());
     }
-    let profile = profile_override
+    // The harness copies this executable into <owned root>/bin. Environment
+    // values may select a known profile, but never supply filesystem roots.
+    let executable = std::env::current_exe()?;
+    let test_root = executable.parent().unwrap().parent().unwrap().to_path_buf();
+    assert_eq!(
+        PathBuf::from(std::env::var_os("MCP_REPL_PLUGIN_FIXTURE").unwrap()).canonicalize()?,
+        test_root.canonicalize()?
+    );
+    let selected = profile_override
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-            home.join(if claude { ".claude" } else { ".codex" })
-        });
-    let test_root = PathBuf::from(std::env::var_os("MCP_REPL_PLUGIN_FIXTURE").unwrap());
+        .unwrap_or_else(|| test_root.join(if claude { ".claude" } else { ".codex" }));
+    let candidates: &[&str] = if claude {
+        &["claude-profile", ".claude"]
+    } else {
+        &[
+            "codex-profile",
+            "another-codex",
+            ".codex",
+            "deleted-profile",
+        ]
+    };
     fs::write(
         test_root.join(if claude {
             "claude-diagnostic"
@@ -40,7 +54,7 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
             "codex-diagnostic"
         }),
         format!(
-            "profile={profile:?}; root={test_root:?}; cwd={:?}",
+            "profile={selected:?}; root={test_root:?}; cwd={:?}",
             std::env::current_dir()?
         ),
     )?;
@@ -60,6 +74,16 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         "{}",
         args.join(" ")
     )?;
+    let profile = candidates
+        .iter()
+        .map(|name| test_root.join(name))
+        .find(|candidate| {
+            candidate
+                .canonicalize()
+                .ok()
+                .is_some_and(|path| selected.canonicalize().ok().as_ref() == Some(&path))
+        })
+        .ok_or("unknown fixture profile")?;
     let canonical_root = test_root.canonicalize()?;
     assert!(profile.canonicalize()?.starts_with(&canonical_root));
     assert_ne!(std::env::current_dir()?.canonicalize()?, canonical_root);
@@ -76,8 +100,25 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
     );
     let registered = profile.join("registered");
     let installed = profile.join("installed");
-    let root = fs::read_to_string(&registered).ok().map(PathBuf::from);
-    let version = fs::read_to_string(&installed).ok();
+    let state_token = read_text(&registered).ok();
+    let provider = if claude { "claude" } else { "codex" };
+    let source_for = |token: &str| -> Result<PathBuf, tower_mcp::BoxError> {
+        let state = match token {
+            "state" => "state",
+            "default-state" => "default-state",
+            "deleted-profile-state" => "deleted-profile-state",
+            _ => return Err("unknown fixture state".into()),
+        };
+        Ok(test_root
+            .join(state)
+            .join("mcp-repl/plugins")
+            .join(provider))
+    };
+    let root = state_token.as_deref().map(source_for).transpose()?;
+    let version = read_text(&installed)
+        .ok()
+        .map(checked_version)
+        .transpose()?;
     let cache = |version: &str| {
         let name = if claude {
             version.replace('+', "-")
@@ -108,8 +149,14 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         }
         ["plugin", "marketplace", "add", path] => {
             assert!(root.is_none());
-            assert!(Path::new(path).canonicalize()?.starts_with(&canonical_root));
-            fs::write(registered, path)?;
+            let selected = Path::new(path).canonicalize()?;
+            let token = ["state", "default-state", "deleted-profile-state"]
+                .into_iter()
+                .find(|token| {
+                    source_for(token).unwrap().canonicalize().ok().as_ref() == Some(&selected)
+                })
+                .ok_or("unknown fixture marketplace")?;
+            fs::write(registered, token)?;
             if claude {
                 json!({"outcome":"ok", "marketplace": MARKET})
             } else {
@@ -145,18 +192,26 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         }
         ["plugin", "install" | "add" | "update", ID] => {
             let source = root.unwrap().join("plugins/mcp-repl");
-            let manifest: Value = serde_json::from_slice(&fs::read(source.join("plugin.json"))?)?;
-            let next = manifest["version"].as_str().unwrap();
-            if let Some(previous) = version.as_deref().filter(|previous| *previous != next) {
+            let manifest: Value = serde_json::from_str(&read_text(&source.join("plugin.json"))?)?;
+            let next = checked_version(
+                manifest["version"]
+                    .as_str()
+                    .ok_or("missing version")?
+                    .to_owned(),
+            )?;
+            if let Some(previous) = version
+                .as_deref()
+                .filter(|previous| *previous != next.as_str())
+            {
                 if claude {
                     mark_orphan(&cache(previous))?;
                 } else {
                     fs::remove_dir_all(cache(previous))?;
                 }
             }
-            let path = cache(next);
-            copy_tree(&source, &path)?;
-            fs::write(installed, next)?;
+            let path = cache(&next);
+            copy_bundle(&source, &path)?;
+            fs::write(installed, &next)?;
             if std::env::var_os("MCP_REPL_PLUGIN_FIXTURE_FAIL_AFTER_INSTALL").is_some() {
                 return Err("synthetic failure after applying install".into());
             }
@@ -185,18 +240,49 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
     Ok(())
 }
 
-fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
-    fs::create_dir_all(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), target)?;
-        }
+// A fixture copies exactly the packaged plugin inventory, never arbitrary
+// directory entry names supplied by a provider or receipt.
+fn copy_bundle(from: &Path, to: &Path) -> io::Result<()> {
+    for name in [
+        "plugin.json",
+        ".claude-plugin/plugin.json",
+        "skills/mcp-repl/SKILL.md",
+    ] {
+        let target = to.join(name);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::copy(from.join(name), target)?;
     }
     Ok(())
+}
+
+fn read_text(path: &Path) -> io::Result<String> {
+    const LIMIT: u64 = 1024 * 1024;
+    let mut text = String::new();
+    fs::File::open(path)?
+        .take(LIMIT + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fixture input exceeds limit",
+        ));
+    }
+    Ok(text)
+}
+
+fn checked_version(version: String) -> Result<String, tower_mcp::BoxError> {
+    if version.is_empty()
+        || version.len() > 128
+        || version.contains("..")
+        || !version.starts_with(|c: char| c.is_ascii_digit())
+        || !version
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b".-+".contains(&c))
+        || version.ends_with('.')
+    {
+        return Err("invalid fixture version".into());
+    }
+    Ok(version)
 }
 
 fn mark_orphan(cache: &Path) -> io::Result<()> {

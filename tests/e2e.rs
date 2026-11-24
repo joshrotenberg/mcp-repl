@@ -2925,6 +2925,20 @@ async fn exercise_bearer_fd(fixture: &Path, temp: &TempDir) {
     assert!(!error.contains("fd-secret"));
 }
 
+// Receipts are local JSON, with the same explicit size bound as production.
+fn read_plugin_receipt(path: &Path) -> serde_json::Value {
+    use std::io::Read;
+    const LIMIT: u64 = 1024 * 1024;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .unwrap()
+        .take(LIMIT + 1)
+        .read_to_string(&mut text)
+        .unwrap();
+    assert!(text.len() as u64 <= LIMIT, "receipt exceeds limit");
+    serde_json::from_str(&text).unwrap()
+}
+
 // Model a receipt and provider cache created by a previous executable.
 fn simulate_older_plugin_bundle(state: &Path, profile: &Path, provider: &str, version: &str) {
     use serde_json::Value;
@@ -2942,15 +2956,29 @@ fn simulate_older_plugin_bundle(state: &Path, profile: &Path, provider: &str, ve
     std::fs::rename(cache_root.join(cache_name(version)), &old_cache).unwrap();
 
     let rewrite_snapshot = |snapshot: &mut Value, root: &Path| {
-        for (name, content) in snapshot.as_object_mut().unwrap() {
-            let old = content.as_str().unwrap().replace(version, old_version);
-            std::fs::write(root.join(name), &old).unwrap();
-            *content = old.into();
+        let files = snapshot.as_object_mut().unwrap();
+        let mut rewritten = 0;
+        for name in [
+            ".claude-plugin/marketplace.json",
+            ".agents/plugins/marketplace.json",
+            "plugins/mcp-repl/.claude-plugin/plugin.json",
+            "plugins/mcp-repl/plugin.json",
+            "plugins/mcp-repl/skills/mcp-repl/SKILL.md",
+            ".claude-plugin/plugin.json",
+            "plugin.json",
+            "skills/mcp-repl/SKILL.md",
+        ] {
+            if let Some(content) = files.get_mut(name) {
+                let old = content.as_str().unwrap().replace(version, old_version);
+                std::fs::write(root.join(name), &old).unwrap();
+                *content = old.into();
+                rewritten += 1;
+            }
         }
+        assert_eq!(rewritten, files.len(), "unexpected receipt file");
     };
     let receipt_path = state.join(format!("{provider}.json"));
-    let mut receipt: Value =
-        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    let mut receipt: Value = read_plugin_receipt(&receipt_path);
     rewrite_snapshot(&mut receipt["files"], &state.join(provider));
     let caches = receipt["caches"].as_object_mut().unwrap();
     let mut cache = caches.remove(version).unwrap();
@@ -3092,7 +3120,7 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     assert_eq!(
         partial["providers"][0]["outcome"],
         "installed",
-        "report={partial}; child={}",
+        "report={partial}; child={:?}",
         std::fs::read_to_string(root.join("claude-diagnostic")).unwrap_or_default()
     );
     assert_eq!(partial["providers"][1]["outcome"], "error");
@@ -3247,8 +3275,7 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     let output = run(install, "uncertain plugin install", CASE_TIMEOUT).await;
     assert_status(&output, 3, "uncertain plugin install");
     assert!(other_codex.join("installed").is_file());
-    let pending: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(state_root.join("codex.json")).unwrap()).unwrap();
+    let pending = read_plugin_receipt(&state_root.join("codex.json"));
     assert!(pending["files"]["plugins/mcp-repl/plugin.json"].is_string());
     std::fs::remove_file(state_root.join("codex/plugins/mcp-repl/plugin.json")).unwrap();
     let before = std::fs::read(root.join("codex-trace")).unwrap();

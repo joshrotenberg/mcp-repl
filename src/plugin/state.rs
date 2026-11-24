@@ -536,7 +536,8 @@ pub(super) fn verify_cache_root(
         if entry.file_name() != "mcp-repl" {
             return Err(format!("unexpected cache entry {}", entry.path().display()));
         }
-        let path = entry.path();
+        // Reconstruct the validated fixed name rather than trusting DirEntry's path.
+        let path = root.join("mcp-repl");
         if !metadata(&path)?.is_some_and(|entry| entry.is_dir()) {
             return Err(format!("expected cache directory {}", path.display()));
         }
