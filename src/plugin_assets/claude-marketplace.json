@@ -1,0 +1,5 @@
+{
+  "name": "mcp-repl-bundled",
+  "owner": { "name": "mcp-repl" },
+  "plugins": [{ "name": "mcp-repl", "source": "./plugins/mcp-repl" }]
+}

@@ -251,6 +251,75 @@ typed exit statuses so a failure is distinguishable from an empty result.
 
 ![two JSON invocations piped through jq, followed by a schema violation exiting with status 3](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/scripting.png)
 
+## Bundled agent skills
+
+mcp-repl embeds a skills-only plugin for Claude Code and Codex. It teaches an
+agent to discover tools, inspect their schemas, and call them through mcp-repl.
+The skill uses the executable on the agent's PATH and the MCP connection you
+authorize. The bundle ships with mcp-repl and works without a source checkout.
+
+```sh
+mcp-repl plugin --help
+mcp-repl plugin status --json
+mcp-repl plugin install --provider both --dry-run
+mcp-repl plugin install --provider claude
+mcp-repl plugin update --provider codex
+mcp-repl plugin uninstall --provider both
+```
+
+Install, update, and uninstall require `--provider claude`, `--provider codex`,
+or `--provider both`. Status defaults to both. Status and dry-run inspect
+mcp-repl's local ownership records and bundle files without launching either
+provider or connecting to an MCP server. The report reflects local ownership.
+Provider settings, enabled state, and registration are checked on an actual
+operation. `--json` emits one report with an outcome for each selected provider.
+Usage and argument errors use clap's text diagnostics on stderr and exit 2,
+including when `--json` is selected.
+Both providers are attempted when selected, and any failure makes the process
+exit nonzero even if the other provider succeeded.
+
+Actual changes require the corresponding `claude` or `codex` executable on
+PATH. The manager was designed against Claude Code 2.1.331 and Codex CLI
+0.171.0. Windows requires native `.exe` providers on PATH; npm `.cmd` shims
+are not launched. Real provider lifecycle testing has been on macOS.
+It registers separate local sources named `mcp-repl-bundled` using the
+provider CLIs and operates on user installations. It honors
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` when set. The mcp-repl state directory
+tracks one profile per provider. Install creates a missing profile directory.
+Each source stays at its registered path. To independently manage Claude
+profiles with retained caches, set a separate `XDG_STATE_HOME` (Unix) or
+`LOCALAPPDATA` (Windows) for each profile.
+Update uses Claude Code's update command or re-adds the Codex plugin. Restart
+a running provider session to load the refreshed skill. Installing
+an existing managed plugin leaves its version in place until you run update.
+
+The manager checks for edited files, symlinks, and conflicting ownership before
+making changes. It refuses a changed-bundle update of a disabled plugin because
+refresh can affect the enabled state. Claude uninstall requests that plugin data
+be kept. Providers control their caches, and mcp-repl retains ownership records
+for verified cache copies they leave behind. The current cache layout is part
+of the manager's compatibility checks. The manager lock coordinates its own
+processes. Avoid running provider plugin commands or editing the managed
+files concurrently. If a provider command fails after a
+change may have started, status and dry-run report `pending` and exit
+nonzero. Inspect the named receipt and use the suggested read-only provider
+listing commands with the same profile. For a pending install, you may remove
+only the named receipt and explicitly rerun install if all three conditions
+hold.
+
+- The receipt belongs to the exact selected profile.
+- Read-only provider listings confirm that neither the managed marketplace
+  nor its plugin exists.
+- The managed source and cache are both absent.
+
+Other pending states require inspection and reconciliation before another
+mutation. Preserve ownership records for retained caches.
+Removing their receipt makes retained caches foreign to the manager and blocks
+automatic reinstall; it does not authorize deleting those caches.
+
+With an explicit server connection, `plugin` can still be a server tool name.
+Use `mcp-repl -- plugin …` if your stdio server executable is named `plugin`.
+
 ## The shell model
 
 mcp-repl is a shell whose command set is the connected server. That is the

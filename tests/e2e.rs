@@ -2925,6 +2925,367 @@ async fn exercise_bearer_fd(fixture: &Path, temp: &TempDir) {
     assert!(!error.contains("fd-secret"));
 }
 
+// Model a receipt and provider cache created by a previous executable.
+fn simulate_older_plugin_bundle(state: &Path, profile: &Path, provider: &str, version: &str) {
+    use serde_json::Value;
+
+    let old_version = "0.0.1+bundle.old";
+    let cache_name = |version: &str| {
+        if provider == "claude" {
+            version.replace('+', "-")
+        } else {
+            version.to_owned()
+        }
+    };
+    let cache_root = profile.join("plugins/cache/mcp-repl-bundled/mcp-repl");
+    let old_cache = cache_root.join(cache_name(old_version));
+    std::fs::rename(cache_root.join(cache_name(version)), &old_cache).unwrap();
+
+    let rewrite_snapshot = |snapshot: &mut Value, root: &Path| {
+        for (name, content) in snapshot.as_object_mut().unwrap() {
+            let old = content.as_str().unwrap().replace(version, old_version);
+            std::fs::write(root.join(name), &old).unwrap();
+            *content = old.into();
+        }
+    };
+    let receipt_path = state.join(format!("{provider}.json"));
+    let mut receipt: Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    rewrite_snapshot(&mut receipt["files"], &state.join(provider));
+    let caches = receipt["caches"].as_object_mut().unwrap();
+    let mut cache = caches.remove(version).unwrap();
+    rewrite_snapshot(&mut cache, &old_cache);
+    caches.insert(old_version.into(), cache);
+    receipt["version"] = old_version.into();
+    std::fs::write(receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    std::fs::write(profile.join("installed"), old_version).unwrap();
+}
+
+async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
+    #[cfg(not(windows))]
+    let root = temp.path().canonicalize().unwrap().join("plugin workspace");
+    #[cfg(windows)]
+    let root = temp.path().join("plugin workspace");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["claude", "codex", "plugin"] {
+        std::fs::copy(
+            fixture,
+            bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
+    }
+    let state = root.join("state");
+    let claude = root.join("claude-profile");
+    let codex = root.join("codex-profile");
+    #[cfg(unix)]
+    let (selected_state, selected_claude) = {
+        // Resolve the selected state and profile roots, including missing
+        // components below a linked directory.
+        let state_link = root.join("state-link");
+        let profile_link = root.join("profile-link");
+        std::os::unix::fs::symlink(&root, &state_link).unwrap();
+        std::os::unix::fs::symlink(&root, &profile_link).unwrap();
+        (
+            state_link.join("state"),
+            profile_link.join("claude-profile"),
+        )
+    };
+    #[cfg(not(unix))]
+    let (selected_state, selected_claude) = (state.clone(), claude.clone());
+    let isolated = || {
+        let mut command = repl_command();
+        command
+            .current_dir(&root)
+            .env("PATH", &bin)
+            .env("HOME", &root)
+            .env("USERPROFILE", &root)
+            .env("APPDATA", &root)
+            .env("LOCALAPPDATA", &selected_state)
+            .env("XDG_CONFIG_HOME", &root)
+            .env("XDG_STATE_HOME", &selected_state)
+            .env("CLAUDE_CONFIG_DIR", &selected_claude)
+            .env("CODEX_HOME", &codex)
+            .env("MCP_REPL_PLUGIN_FIXTURE", &root);
+        command
+    };
+    for (args, code, output_fragment) in [
+        (&["--help"][..], 0, "plugin"),
+        (&["plugin", "--help"], 0, "uninstall"),
+        (&["plugin", "install", "--help"], 0, "--provider"),
+        (&["plugin", "invalid-action"], 2, "invalid-action"),
+        (&["plugin", "install"], 2, "require --provider"),
+        (
+            &["--bearer-fd", "999", "plugin", "status"],
+            2,
+            "--bearer-fd is not applicable",
+        ),
+        (&["--json", "plugin", "--json", "status"], 0, "unmanaged"),
+        (
+            &[
+                "plugin",
+                "install",
+                "--provider",
+                "both",
+                "--dry-run",
+                "--json",
+            ],
+            0,
+            "dry-run",
+        ),
+    ] {
+        let mut command = isolated();
+        command.args(args);
+        let output = run(command, "offline plugin route", CASE_TIMEOUT).await;
+        assert_status(&output, code, "offline plugin route");
+        let text = if code == 0 {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        assert!(
+            String::from_utf8_lossy(text).contains(output_fragment),
+            "{args:?}: {output:?}"
+        );
+    }
+    assert!(!state.exists());
+    assert!(!root.join("claude-trace").exists());
+    assert!(!root.join("codex-trace").exists());
+
+    assert!(!claude.exists());
+    assert!(!codex.exists());
+
+    let mut raw = isolated();
+    raw.args(["--", "plugin", "--help", "literal argument", "--"])
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", root.join("raw-exit"));
+    let output = run(raw, "explicit raw plugin executable", CASE_TIMEOUT).await;
+    assert_success(&output, "explicit raw plugin executable");
+    assert!(root.join("raw-exit").is_file());
+
+    let profile = root.join("profile.toml");
+    std::fs::write(
+        &profile,
+        format!(
+            "[servers.fixture]\ntransport = \"stdio\"\ncommand = [{}]\n",
+            serde_json::to_string(&fixture.display().to_string()).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut generated = isolated();
+    generated
+        .arg("--config")
+        .arg(profile)
+        .args(["--server", "fixture", "--json", "plugin"]);
+    let output = run(generated, "generated plugin tool", CASE_TIMEOUT).await;
+    assert_success(&output, "generated plugin tool");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("server tool: plugin"));
+    assert!(!root.join("claude-trace").exists());
+    assert!(!root.join("codex-trace").exists());
+
+    let mut both = isolated();
+    both.args(["plugin", "install", "--provider", "both", "--json"])
+        .env("MCP_BEARER", "synthetic-do-not-inherit")
+        .env("MCP_REPL_PLUGIN_FIXTURE_FAIL_CODEX", "1");
+    let output = run(both, "partial plugin install", CASE_TIMEOUT).await;
+    assert_status(&output, 3, "partial plugin install");
+    let partial = &json_lines(&output, "partial plugin install")[0];
+    assert_eq!(partial["providers"][0]["outcome"], "installed");
+    assert_eq!(partial["providers"][1]["outcome"], "error");
+    let version = partial["bundle_version"].as_str().unwrap();
+
+    for (action, provider, expected) in [
+        ("install", "codex", "installed"),
+        ("install", "both", "unchanged"),
+        ("update", "both", "unchanged"),
+    ] {
+        let mut command = isolated();
+        command.args(["plugin", action, "--provider", provider, "--json"]);
+        let output = run(command, action, CASE_TIMEOUT).await;
+        assert_success(&output, action);
+        let report = &json_lines(&output, action)[0];
+        for row in report["providers"].as_array().unwrap() {
+            assert_eq!(row["outcome"], expected);
+        }
+    }
+
+    let state_root = state.join("mcp-repl/plugins");
+    simulate_older_plugin_bundle(&state_root, &claude, "claude", version);
+    simulate_older_plugin_bundle(&state_root, &codex, "codex", version);
+    let mut update = isolated();
+    update.args(["plugin", "update", "--provider", "both", "--json"]);
+    let output = run(update, "refresh from an older bundle", CASE_TIMEOUT).await;
+    assert_success(&output, "refresh from an older bundle");
+    let refreshed = &json_lines(&output, "refresh from an older bundle")[0];
+    assert_eq!(refreshed["providers"][0]["outcome"], "updated");
+    assert_eq!(refreshed["providers"][1]["outcome"], "updated");
+    assert!(
+        std::fs::read_to_string(root.join("claude-trace"))
+            .unwrap()
+            .contains("plugin update mcp-repl@mcp-repl-bundled --scope user")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("codex-trace"))
+            .unwrap()
+            .matches("plugin add mcp-repl@mcp-repl-bundled")
+            .count(),
+        2
+    );
+
+    let cache_skill = codex
+        .join("plugins/cache/mcp-repl-bundled/mcp-repl")
+        .join(version)
+        .join("skills/mcp-repl/SKILL.md");
+    let original = std::fs::read(&cache_skill).unwrap();
+    std::fs::write(&cache_skill, "user edit").unwrap();
+    let unrelated = claude.join("keep-me");
+    std::fs::write(&unrelated, "unrelated data").unwrap();
+    let mut uninstall = isolated();
+    uninstall.args(["plugin", "uninstall", "--provider", "both", "--json"]);
+    let output = run(uninstall, "partial plugin uninstall", CASE_TIMEOUT).await;
+    assert_status(&output, 3, "partial plugin uninstall");
+    let report = &json_lines(&output, "partial plugin uninstall")[0];
+    assert_eq!(report["providers"][0]["outcome"], "uninstalled");
+    assert_eq!(report["providers"][1]["outcome"], "error");
+    assert_eq!(std::fs::read_to_string(&cache_skill).unwrap(), "user edit");
+    std::fs::write(&cache_skill, original).unwrap();
+
+    let mut uninstall = isolated();
+    uninstall.args(["plugin", "uninstall", "--provider", "both", "--json"]);
+    let output = run(uninstall, "finish plugin uninstall", CASE_TIMEOUT).await;
+    assert_success(&output, "finish plugin uninstall");
+    let report = &json_lines(&output, "finish plugin uninstall")[0];
+    assert_eq!(report["providers"][0]["outcome"], "unchanged");
+    assert_eq!(report["providers"][1]["outcome"], "uninstalled");
+    assert_eq!(
+        std::fs::read_to_string(unrelated).unwrap(),
+        "unrelated data"
+    );
+    assert!(!state.join("mcp-repl/plugins/claude").exists());
+    assert!(!state.join("mcp-repl/plugins/codex").exists());
+
+    let claude_cache = claude.join("plugins/cache/mcp-repl-bundled/mcp-repl");
+    let current = claude_cache.join(version.replace('+', "-"));
+    let old_marker = claude_cache.join("0.0.1-bundle.old/.orphaned_at");
+    let current_marker = current.join(".orphaned_at");
+    assert!(old_marker.is_file());
+    assert!(current_marker.is_file());
+    assert!(!codex.join("plugins/cache/mcp-repl-bundled").exists());
+
+    let mut status = isolated();
+    status.args(["plugin", "status", "--json"]);
+    let output = run(status, "status with retained cache", CASE_TIMEOUT).await;
+    assert_success(&output, "status with retained cache");
+    for row in json_lines(&output, "status with retained cache")[0]["providers"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(row["outcome"], "unmanaged");
+    }
+
+    // Verify retained bundled bytes before they can be reused during install.
+    let retained_skill = current.join("skills/mcp-repl/SKILL.md");
+    let retained = std::fs::read(&retained_skill).unwrap();
+    std::fs::write(&retained_skill, "user edit in retained cache").unwrap();
+    let before_calls = std::fs::read(root.join("claude-trace")).unwrap();
+    let mut reinstall = isolated();
+    reinstall.args(["plugin", "install", "--provider", "claude", "--json"]);
+    let output = run(reinstall, "reject edited retained cache", CASE_TIMEOUT).await;
+    assert_status(&output, 3, "reject edited retained cache");
+    assert_eq!(
+        std::fs::read(root.join("claude-trace")).unwrap(),
+        before_calls
+    );
+    assert_eq!(
+        std::fs::read_to_string(&retained_skill).unwrap(),
+        "user edit in retained cache"
+    );
+    std::fs::write(retained_skill, retained).unwrap();
+
+    // Claude may retain cache data. A second install can use the verified
+    // ownership record after the source and registration were removed.
+    let mut reinstall = isolated();
+    reinstall.args(["plugin", "install", "--provider", "claude", "--json"]);
+    let output = run(reinstall, "reinstall with retained cache", CASE_TIMEOUT).await;
+    assert_success(&output, "reinstall with retained cache");
+    assert_eq!(
+        json_lines(&output, "reinstall with retained cache")[0]["providers"][0]["outcome"],
+        "installed"
+    );
+
+    // Codex removed its cache and ownership receipt. The same state home can
+    // manage another profile, even if that profile directory is still absent.
+    assert!(!state_root.join("codex.json").exists());
+    assert!(state_root.join("codex.lock").is_file());
+    let other_codex = root.join("another-codex");
+    let mut install = isolated();
+    install
+        .env("CODEX_HOME", &other_codex)
+        .env("MCP_REPL_PLUGIN_FIXTURE_FAIL_AFTER_INSTALL", "1")
+        .args(["plugin", "install", "--provider", "codex", "--json"]);
+    let output = run(install, "uncertain plugin install", CASE_TIMEOUT).await;
+    assert_status(&output, 3, "uncertain plugin install");
+    assert!(other_codex.join("installed").is_file());
+    std::fs::remove_file(state_root.join("codex/plugins/mcp-repl/plugin.json")).unwrap();
+    let before = std::fs::read(root.join("codex-trace")).unwrap();
+
+    for (args, outcome) in [
+        (&["plugin", "status"][..], "pending"),
+        (&["plugin", "update", "--dry-run"], "pending"),
+        (&["plugin", "install"], "error"),
+    ] {
+        let mut command = isolated();
+        command
+            .env("CODEX_HOME", &other_codex)
+            .args(args)
+            .args(["--provider", "codex", "--json"]);
+        let output = run(command, "pending plugin operation", CASE_TIMEOUT).await;
+        assert_status(&output, 3, "pending plugin operation");
+        let report = &json_lines(&output, "pending plugin operation")[0]["providers"][0];
+        assert_eq!(report["outcome"], outcome);
+        let message = report["message"].as_str().unwrap();
+        assert!(message.contains("previous operation (install)"));
+        assert!(message.contains(&*state_root.join("codex.json").to_string_lossy()));
+    }
+    assert_eq!(std::fs::read(root.join("codex-trace")).unwrap(), before);
+
+    let default_state = root.join("default-state");
+    #[cfg(unix)]
+    {
+        let real_profile = root.join("linked-default-claude");
+        std::fs::create_dir(&real_profile).unwrap();
+        std::os::unix::fs::symlink(&real_profile, root.join(".claude")).unwrap();
+    }
+    for (action, claude_default, expected) in [
+        ("install", "unset", "installed"),
+        ("install", "empty", "unchanged"),
+        ("uninstall", "unset", "uninstalled"),
+    ] {
+        let mut command = isolated();
+        command
+            .env("XDG_STATE_HOME", &default_state)
+            .env("LOCALAPPDATA", &default_state)
+            .env_remove("CODEX_HOME")
+            .env("MCP_REPL_PLUGIN_FIXTURE_CLAUDE_DEFAULT", claude_default)
+            .args(["plugin", action, "--provider", "both", "--json"]);
+        if claude_default == "empty" {
+            command.env("CLAUDE_CONFIG_DIR", "");
+        } else {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
+        let output = run(
+            command,
+            "plugin lifecycle with default profiles",
+            CASE_TIMEOUT,
+        )
+        .await;
+        assert_success(&output, "plugin lifecycle with default profiles");
+        let results =
+            &json_lines(&output, "plugin lifecycle with default profiles")[0]["providers"];
+        assert_eq!(results[0]["outcome"], expected);
+        assert_eq!(results[1]["outcome"], expected);
+    }
+}
+
 /// The generators run before anything connects, so they need no server, no
 /// config file, and no terminal. That is the property a packaging script
 /// depends on, and it only holds at the process boundary.
@@ -2962,6 +3323,7 @@ async fn exercise_generators() {
             script.contains(demo_flag),
             "{shell} completion lost {demo_flag}"
         );
+        assert!(script.contains("plugin"), "{shell} completion lost plugin");
         assert!(
             String::from_utf8_lossy(&output.stderr).is_empty(),
             "a generator must leave stdout clean and say nothing on stderr"
@@ -2979,6 +3341,7 @@ async fn exercise_generators() {
         ".SH DESCRIPTION",
         ".SH OPTIONS",
         ".SH \"REPL BUILT-INS\"",
+        ".SH \"PLUGIN MANAGEMENT\"",
     ] {
         assert!(roff.contains(section), "man page has no {section}");
     }
@@ -3214,6 +3577,15 @@ async fn exercise_generated_cli(fixture: &Path, temp: &TempDir) {
         args,
         serde_json::json!({"text":literal, "enabled":false, "nested":{"items":[1,null]}})
     );
+    let mut command = repl_command();
+    command.args(["--http", &http.url, "--json", "plugin"]);
+    let output = run(command, "generated HTTP plugin tool", CASE_TIMEOUT).await;
+    assert_success(&output, "generated HTTP plugin tool");
+    assert_eq!(
+        json_lines(&output, "generated HTTP plugin tool")[0]["content"][0]["text"],
+        "server tool: plugin"
+    );
+
     let imported_http = temp.path().join("generated-http.json");
     std::fs::write(
         &imported_http,
@@ -3587,6 +3959,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
         exercise_generators().await;
+        exercise_plugin_manager(&fixture, &temp).await;
         exercise_generated_cli(&fixture, &temp).await;
         exercise_connection_failure_output().await;
         exercise_initialization_timeout(&fixture, &temp).await;

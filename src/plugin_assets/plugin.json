@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "mcp-repl",
+  "version": "@VERSION@",
+  "description": "Discover, inspect, and call MCP tools with mcp-repl."
+}
