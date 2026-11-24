@@ -19,11 +19,11 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         "CODEX_HOME"
     };
     let profile_override = std::env::var_os(profile_var);
-    if claude {
-        match std::env::var("MCP_REPL_PLUGIN_FIXTURE_CLAUDE_DEFAULT").as_deref() {
-            Ok("unset" | "empty") => assert!(profile_override.is_none()),
-            _ => {}
-        }
+    if claude
+        && let Ok("unset" | "empty") =
+            std::env::var("MCP_REPL_PLUGIN_FIXTURE_CLAUDE_DEFAULT").as_deref()
+    {
+        assert!(profile_override.is_none());
     }
     let profile = profile_override
         .filter(|value| !value.is_empty())
