@@ -44,9 +44,6 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
             std::env::current_dir()?
         ),
     )?;
-    let canonical_root = test_root.canonicalize()?;
-    assert!(profile.canonicalize()?.starts_with(&canonical_root));
-    assert_ne!(std::env::current_dir()?.canonicalize()?, canonical_root);
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     assert_eq!(args.pop().as_deref(), Some("--json"));
     let trace = if claude {
@@ -63,6 +60,9 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         "{}",
         args.join(" ")
     )?;
+    let canonical_root = test_root.canonicalize()?;
+    assert!(profile.canonicalize()?.starts_with(&canonical_root));
+    assert_ne!(std::env::current_dir()?.canonicalize()?, canonical_root);
     if !claude && std::env::var_os("MCP_REPL_PLUGIN_FIXTURE_FAIL_CODEX").is_some() {
         return Err("synthetic Codex failure".into());
     }
