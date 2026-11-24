@@ -102,6 +102,10 @@ impl Directories {
         Some(self.state.as_ref()?.join("mcp-repl").join("history"))
     }
 
+    pub(crate) fn state_home(&self) -> Option<&Path> {
+        self.state.as_deref()
+    }
+
     pub(crate) fn legacy_history_file(&self) -> Option<PathBuf> {
         Some(self.home.as_ref()?.join(".mcp-repl_history"))
     }

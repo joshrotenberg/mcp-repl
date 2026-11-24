@@ -1,0 +1,9 @@
+{
+  "name": "mcp-repl-bundled",
+  "interface": { "displayName": "mcp-repl" },
+  "plugins": [{
+    "name": "mcp-repl",
+    "source": { "source": "local", "path": "./plugins/mcp-repl" },
+    "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" }
+  }]
+}

@@ -72,6 +72,7 @@ mod jobs;
 pub mod lifecycle;
 pub mod oauth_profile;
 mod output;
+mod plugin;
 #[cfg(test)]
 mod property;
 mod sampling;
@@ -183,6 +184,7 @@ EXAMPLES:
   mcp-repl -- ./my-server --stdio        spawn a stdio server
   mcp-repl .mcp.json:local               an entry from a client config
   mcp-repl --server prod                 a saved profile
+  mcp-repl plugin status                 inspect bundled plugin ownership
 
   mcp-repl --demo -e 'echo message=hi'   run REPL command syntax and exit
   mcp-repl --demo --json -e tools | jq   NDJSON for scripts
@@ -4039,9 +4041,58 @@ fn program_name() -> String {
         .to_string()
 }
 
+/// Advertise offline commands separately from the raw stdio parser.
+fn root_command() -> clap::Command {
+    <Args as clap::CommandFactory>::command()
+        .disable_help_subcommand(true)
+        .subcommand_precedence_over_arg(true)
+        .subcommand(plugin::command())
+}
+
+fn plugin_candidate(args: &Args) -> bool {
+    args.command.first().is_some_and(|word| word == "plugin")
+        && !args.demo
+        && args.http.is_none()
+        && args.server.is_none()
+        && args.exec.is_empty()
+        && !args.list_servers
+        && !args.scan
+        && args.completions.is_none()
+        && !args.man
+}
+
+fn plugin_matches(
+    argv: &[std::ffi::OsString],
+    args: &Args,
+) -> Result<Option<clap::ArgMatches>, clap::Error> {
+    if !plugin_candidate(args) {
+        return Ok(None);
+    }
+    // A positional after the root `--` stays positional in both parsers.
+    let matches = root_command().try_get_matches_from(argv)?;
+    if matches.subcommand_name() != Some("plugin") {
+        return Ok(None);
+    }
+    let root = root_command();
+    for arg in root.get_arguments() {
+        let id = arg.get_id();
+        if id != "json"
+            && matches.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine)
+        {
+            let option = arg.get_long().unwrap_or(id.as_str());
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("--{option} is not applicable to plugin management"),
+            )
+            .with_cmd(&root));
+        }
+    }
+    Ok(Some(matches))
+}
+
 /// `--completions <shell>`: a completion script on stdout.
 fn print_completions(shell: clap_complete::Shell) {
-    let mut command = <Args as clap::CommandFactory>::command();
+    let mut command = root_command();
     let name = program_name();
     clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
 }
@@ -4054,13 +4105,24 @@ fn roff_escape(text: &str) -> String {
 /// latter is deliberately sourced from [`BUILTINS`] rather than copied into a
 /// packaging template.
 fn render_man_page() -> Result<Vec<u8>, String> {
-    let command = <Args as clap::CommandFactory>::command();
+    let command = root_command();
     let mut page = Vec::new();
     clap_mangen::Man::new(command)
         .render(&mut page)
         .map_err(|error| format!("could not render the man page: {error}"))?;
 
     use std::io::Write;
+    writeln!(page, ".SH \"PLUGIN MANAGEMENT\"").map_err(|error| error.to_string())?;
+    writeln!(
+        page,
+        "mcp-repl plugin <install|update|uninstall|status> [\\-\\-provider <claude|codex|both>] [\\-\\-json] [\\-\\-dry\\-run]"
+    )
+    .map_err(|error| error.to_string())?;
+    writeln!(
+        page,
+        "Install, update, and uninstall require an explicit provider. Status and dry run inspect local ownership without contacting a provider or MCP server."
+    )
+    .map_err(|error| error.to_string())?;
     writeln!(page, ".SH \"REPL BUILT-INS\"").map_err(|error| error.to_string())?;
     writeln!(
         page,
@@ -4510,7 +4572,24 @@ pub fn run_cli() {
     // Parsed first: the subscriber has to know what --color decided, and
     // building it beforehand meant `--color never` still emitted escape
     // sequences into a stderr a script was told would be plain.
-    let args = Args::parse();
+    let argv: Vec<_> = std::env::args_os().collect();
+    let args = Args::try_parse_from(&argv).unwrap_or_else(|error| {
+        if error.kind() == clap::error::ErrorKind::DisplayHelp {
+            match root_command().try_get_matches_from(&argv) {
+                Err(help) if help.kind() == clap::error::ErrorKind::DisplayHelp => help.exit(),
+                _ => error.exit(),
+            }
+        }
+        error.exit()
+    });
+    if let Some(matches) = plugin_matches(&argv, &args).unwrap_or_else(|error| error.exit()) {
+        let plugin = matches.subcommand_matches("plugin").expect("plugin route");
+        let status = plugin::run(plugin, args.json);
+        if status != ExitStatus::Success {
+            std::process::exit(status.code());
+        }
+        return;
+    }
     init_tracing(&args);
 
     // Generators write to stdout and exit. They are checked before anything
@@ -4806,7 +4885,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         // profile or an import, so a real server of either name still wins.
         (None, None) if matches!(args.command.as_slice(), [only] if only == "help" || only == "version") =>
         {
-            let mut command = <Args as clap::CommandFactory>::command();
+            let mut command = root_command();
             if args.command[0] == "version" {
                 print!("{}", command.render_version());
             } else {
@@ -10796,5 +10875,53 @@ world",
 
         assert!(matches!(err, tower_mcp::Error::SessionExpired));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod plugin_routing_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_routing_preserves_connection_selectors_and_raw_argv() {
+        for words in [
+            vec!["--demo", "plugin", "--help"],
+            vec!["--server", "fixture", "plugin", "--help"],
+            vec!["--http", "https://example.test/mcp", "plugin", "--help"],
+            vec!["-e", "tools", "plugin", "--help"],
+            vec!["--list-servers", "plugin"],
+            vec!["--", "plugin", "--help", "literal argument", "--"],
+            vec!["fixture", "plugin", "--help"],
+        ] {
+            let argv: Vec<_> = std::iter::once("mcp-repl")
+                .chain(words)
+                .map(std::ffi::OsString::from)
+                .collect();
+            let args = Args::try_parse_from(&argv).unwrap();
+            assert!(plugin_matches(&argv, &args).unwrap().is_none(), "{argv:?}");
+            if argv[1] == "--" {
+                assert_eq!(args.command, ["plugin", "--help", "literal argument", "--"]);
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_routing_rejects_mcp_options_before_reading_any_secrets() {
+        let argv =
+            ["mcp-repl", "--bearer-fd", "999", "plugin", "status"].map(std::ffi::OsString::from);
+        let args = Args::try_parse_from(&argv).unwrap();
+        let error = plugin_matches(&argv, &args).unwrap_err();
+        assert!(error.to_string().contains("--bearer-fd is not applicable"));
+        let argv =
+            ["mcp-repl", "--json", "plugin", "status", "--json"].map(std::ffi::OsString::from);
+        let args = Args::try_parse_from(&argv).unwrap();
+        let matches = plugin_matches(&argv, &args).unwrap().unwrap();
+        assert!(args.json);
+        let action = matches
+            .subcommand_matches("plugin")
+            .unwrap()
+            .subcommand_matches("status")
+            .unwrap();
+        assert!(action.get_flag("plugin-json"));
     }
 }

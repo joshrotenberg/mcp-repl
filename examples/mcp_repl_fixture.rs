@@ -6,6 +6,9 @@
 //! arguments it serves stdio. `--http` binds an ephemeral localhost port and
 //! writes the resulting URL to `MCP_REPL_FIXTURE_READY_FILE`.
 
+#[path = "fixtures/plugin_provider.rs"]
+mod plugin_provider;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -35,6 +38,14 @@ fn fixture_router() -> McpRouter {
     McpRouter::new()
         .server_info("mcp-repl-fixture", "1.0.0")
         .with_tasks()
+        .tool(
+            ToolBuilder::new("plugin")
+                .description("A server tool named plugin")
+                .extractor_handler((), |_ctx: Context, RawArgs(_): RawArgs| async move {
+                    Ok(CallToolResult::text("server tool: plugin"))
+                })
+                .build(),
+        )
         .tool(
             ToolBuilder::new("add")
                 .description("Add two integers")
@@ -499,6 +510,18 @@ fn serve_raw_tools_only(
 
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {
+    if std::env::var_os("MCP_REPL_PLUGIN_FIXTURE").is_some() {
+        let executable = std::env::current_exe()?;
+        match executable.file_stem().and_then(|stem| stem.to_str()) {
+            Some("claude") => return plugin_provider::run(true),
+            Some("codex") => return plugin_provider::run(false),
+            Some("plugin") => assert_eq!(
+                std::env::args().skip(1).collect::<Vec<_>>(),
+                ["--help", "literal argument", "--"]
+            ),
+            _ => {}
+        }
+    }
     eprintln!("mcp-repl fixture ready");
     init_trace_file();
     // Not a router: this mode speaks JSON-RPC by hand so it can reject the

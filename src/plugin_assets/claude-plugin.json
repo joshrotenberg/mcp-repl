@@ -1,0 +1,5 @@
+{
+  "name": "mcp-repl",
+  "version": "@VERSION@",
+  "description": "Discover, inspect, and call MCP tools with mcp-repl."
+}
