@@ -28,11 +28,23 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
     // The harness copies this executable into <owned root>/bin. Environment
     // values may select a known profile, but never supply filesystem roots.
     let executable = std::env::current_exe()?;
-    let test_root = executable.parent().unwrap().parent().unwrap().to_path_buf();
+    let test_root = executable
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .canonicalize()?;
     assert_eq!(
         PathBuf::from(std::env::var_os("MCP_REPL_PLUGIN_FIXTURE").unwrap()).canonicalize()?,
-        test_root.canonicalize()?
+        test_root
     );
+    for variable in ["HOME", "USERPROFILE"] {
+        assert_eq!(
+            PathBuf::from(std::env::var_os(variable).ok_or("missing fixture home")?)
+                .canonicalize()?,
+            test_root
+        );
+    }
     let selected = profile_override
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
