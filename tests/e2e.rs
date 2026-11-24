@@ -3269,7 +3269,15 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
         assert_eq!(report["outcome"], outcome);
         let message = report["message"].as_str().unwrap();
         assert!(message.contains("previous operation (install)"));
-        assert!(message.contains(&*state_root.join("codex.json").to_string_lossy()));
+        let reported_receipt = message
+            .split_once("Inspect receipt ")
+            .and_then(|(_, rest)| rest.rsplit_once(". Inspect the same profile with "))
+            .map(|(path, _)| Path::new(path))
+            .unwrap_or_else(|| panic!("missing receipt path in {message:?}"));
+        assert_eq!(
+            reported_receipt.canonicalize().unwrap(),
+            state_root.join("codex.json").canonicalize().unwrap()
+        );
     }
     assert_eq!(std::fs::read(root.join("codex-trace")).unwrap(), before);
 
