@@ -43,6 +43,8 @@ impl Client<'_> {
             .args(args);
         if let Some(profile) = self.profile_override {
             command.env(self.provider.profile_env(), profile);
+        } else {
+            command.env_remove(self.provider.profile_env());
         }
         if let Some(path) = path {
             command.arg(path);

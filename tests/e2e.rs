@@ -3109,6 +3109,20 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     }
 
     let state_root = state.join("mcp-repl/plugins");
+    #[cfg(unix)]
+    {
+        let foreign = state_root.join("codex").join("\u{1b}[2Juntrusted\u{7}");
+        std::fs::write(&foreign, "preserve").unwrap();
+        let mut status = isolated();
+        status.args(["plugin", "status", "--provider", "codex"]);
+        let output = run(status, "sanitize plugin diagnostics", CASE_TIMEOUT).await;
+        assert_status(&output, 3, "sanitize plugin diagnostics");
+        assert!(!output.stdout.contains(&0x1b));
+        assert!(!output.stdout.contains(&0x07));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("unexpected entry"));
+        assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "preserve");
+        std::fs::remove_file(foreign).unwrap();
+    }
     simulate_older_plugin_bundle(&state_root, &claude, "claude", version);
     simulate_older_plugin_bundle(&state_root, &codex, "codex", version);
     let mut update = isolated();
@@ -3225,6 +3239,9 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     let output = run(install, "uncertain plugin install", CASE_TIMEOUT).await;
     assert_status(&output, 3, "uncertain plugin install");
     assert!(other_codex.join("installed").is_file());
+    let pending: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state_root.join("codex.json")).unwrap()).unwrap();
+    assert!(pending["files"]["plugins/mcp-repl/plugin.json"].is_string());
     std::fs::remove_file(state_root.join("codex/plugins/mcp-repl/plugin.json")).unwrap();
     let before = std::fs::read(root.join("codex-trace")).unwrap();
 

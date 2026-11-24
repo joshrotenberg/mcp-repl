@@ -309,7 +309,7 @@ fn directories(files: &Files) -> Result<std::collections::BTreeSet<PathBuf>> {
     Ok(dirs)
 }
 
-fn verify_tree(root: &Path, expected: &Files) -> Result<()> {
+pub(super) fn verify_tree(root: &Path, expected: &Files) -> Result<()> {
     verify_files(root, expected, false)
 }
 

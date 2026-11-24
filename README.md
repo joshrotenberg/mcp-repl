@@ -314,8 +314,13 @@ hold.
 
 Other pending states require inspection and reconciliation before another
 mutation. Preserve ownership records for retained caches.
+Pending installs retain the expected source files in the receipt, including
+when marketplace registration fails after source publication; preserve both
+the source and receipt for inspection in that case.
 Removing their receipt makes retained caches foreign to the manager and blocks
 automatic reinstall; it does not authorize deleting those caches.
+After a provider removes all orphaned caches, run uninstall with the original
+profile to discard its inactive receipt before selecting another profile.
 
 With an explicit server connection, `plugin` can still be a server tool name.
 Use `mcp-repl -- plugin …` if your stdio server executable is named `plugin`.

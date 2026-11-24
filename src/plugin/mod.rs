@@ -241,7 +241,7 @@ pub(super) fn run(matches: &ArgMatches, root_json: bool) -> crate::ExitStatus {
                 "{}: {} - {}",
                 row.provider.program(),
                 row.outcome,
-                row.message
+                crate::untrusted::sanitize(&row.message)
             );
         }
     }
@@ -374,7 +374,16 @@ async fn manage(
     }
 
     let mut record = match (operation, active, receipt) {
-        (Operation::Uninstall, false, _) => {
+        (Operation::Uninstall, false, Some(mut record)) => {
+            prune_caches(provider, &profile, &mut record)?;
+            if record.caches.is_empty() {
+                state.discard_receipt()?;
+            } else {
+                state.save(&record)?;
+            }
+            return Ok(("unchanged", "no managed plugin to uninstall".into()));
+        }
+        (Operation::Uninstall, false, None) => {
             return Ok(("unchanged", "no managed plugin to uninstall".into()));
         }
         (Operation::Uninstall, true, Some(mut record)) => {
@@ -445,6 +454,7 @@ async fn manage(
         state.save(&record)?;
         state.replace_source(&record.files, &bundle)?;
     } else {
+        record.files = bundle.clone();
         state.install_source(&record, &bundle)?;
         client.register(&state.source).await?;
         if !client.marketplace(&state.source).await? {
