@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-11-24
+
+### Bug Fixes
+
+- Update url and preserve transitive advisory checks (#358)
+- Name both qualifiers in collision banner (#356)
+
+
+
 ## [0.4.0] - 2026-11-18
 
 ### CLI behavior
