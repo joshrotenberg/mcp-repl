@@ -12,6 +12,11 @@ all-features = true
 
 [advisories]
 version = 2
+# Keep transitive maintenance and unsoundness advisories in scope. cargo-deny
+# 0.22 changed its defaults to workspace-only, silently hiding these findings.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
 # Approved maintenance exception while #309 waits on the upstream zbus 6 move
 # (secret-service 6.0.0 and zbus-secret-service-keyring-store#39). Extended once,
 # from 2026-11-16 to 2026-12-14.

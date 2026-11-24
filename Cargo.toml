@@ -89,7 +89,9 @@ schemars = "1.2"
 clap_complete = "4"
 clap_mangen = "0.3"
 crossterm = { version = "0.29", default-features = false }
-url = "2"
+# 2.5.9 fixes RUSTSEC-2026-0592 in Url::origin; keep source consumers on
+# the patched line as well as the application's locked dependency graph.
+url = "2.5.9"
 
 [target.'cfg(unix)'.dependencies]
 # `--bearer-fd` has to validate that an inherited descriptor is open before
