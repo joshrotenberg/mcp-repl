@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 const MARKET: &str = "mcp-repl-bundled";
 const ID: &str = "mcp-repl@mcp-repl-bundled";
@@ -34,6 +34,13 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         .parent()
         .unwrap()
         .canonicalize()?;
+    // This double only runs below the harness's fixed workspace. Reject
+    // parent traversal lexically as well as resolving its filesystem identity.
+    let root_text = test_root.to_str().ok_or("non-UTF-8 fixture root")?;
+    if root_text.contains("..") || test_root.file_name() != Some("plugin workspace".as_ref()) {
+        return Err("invalid fixture root".into());
+    }
+    let test_root = PathBuf::from(root_text);
     assert_eq!(
         PathBuf::from(std::env::var_os("MCP_REPL_PLUGIN_FIXTURE").unwrap()).canonicalize()?,
         test_root
@@ -59,17 +66,6 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
             "deleted-profile",
         ]
     };
-    fs::write(
-        test_root.join(if claude {
-            "claude-diagnostic"
-        } else {
-            "codex-diagnostic"
-        }),
-        format!(
-            "profile={selected:?}; root={test_root:?}; cwd={:?}",
-            std::env::current_dir()?
-        ),
-    )?;
     let mut args: Vec<_> = std::env::args().skip(1).collect();
     assert_eq!(args.pop().as_deref(), Some("--json"));
     let trace = if claude {
@@ -204,11 +200,17 @@ pub fn run(claude: bool) -> Result<(), tower_mcp::BoxError> {
         }
         ["plugin", "install" | "add" | "update", ID] => {
             let source = root.unwrap().join("plugins/mcp-repl");
-            let manifest: Value = serde_json::from_str(&read_text(&source.join("plugin.json"))?)?;
+            // This fixture accepts exactly the bundled manifest template, with
+            // a validated version substituted. It need not deserialize arbitrary JSON.
+            let manifest = read_text(&source.join("plugin.json"))?;
+            let (prefix, suffix) = include_str!("../../src/plugin_assets/plugin.json")
+                .split_once("@VERSION@")
+                .unwrap();
             let next = checked_version(
-                manifest["version"]
-                    .as_str()
-                    .ok_or("missing version")?
+                manifest
+                    .strip_prefix(prefix)
+                    .and_then(|text| text.strip_suffix(suffix))
+                    .ok_or("unexpected fixture manifest")?
                     .to_owned(),
             )?;
             if let Some(previous) = version

@@ -2925,8 +2925,10 @@ async fn exercise_bearer_fd(fixture: &Path, temp: &TempDir) {
     assert!(!error.contains("fd-secret"));
 }
 
-// Receipts are local JSON, with the same explicit size bound as production.
-fn read_plugin_receipt(path: &Path) -> serde_json::Value {
+// Fixture inputs have the same explicit size bound as production. The older
+// bundle setup only substitutes a known version in known text files; it does
+// not need a general receipt parser or receipt-controlled filesystem paths.
+fn read_plugin_text(path: &Path) -> String {
     use std::io::Read;
     const LIMIT: u64 = 1024 * 1024;
     let mut text = String::new();
@@ -2935,14 +2937,12 @@ fn read_plugin_receipt(path: &Path) -> serde_json::Value {
         .take(LIMIT + 1)
         .read_to_string(&mut text)
         .unwrap();
-    assert!(text.len() as u64 <= LIMIT, "receipt exceeds limit");
-    serde_json::from_str(&text).unwrap()
+    assert!(text.len() as u64 <= LIMIT, "fixture input exceeds limit");
+    text
 }
 
 // Model a receipt and provider cache created by a previous executable.
 fn simulate_older_plugin_bundle(state: &Path, profile: &Path, provider: &str, version: &str) {
-    use serde_json::Value;
-
     let old_version = "0.0.1+bundle.old";
     let cache_name = |version: &str| {
         if provider == "claude" {
@@ -2954,38 +2954,32 @@ fn simulate_older_plugin_bundle(state: &Path, profile: &Path, provider: &str, ve
     let cache_root = profile.join("plugins/cache/mcp-repl-bundled/mcp-repl");
     let old_cache = cache_root.join(cache_name(old_version));
     std::fs::rename(cache_root.join(cache_name(version)), &old_cache).unwrap();
-
-    let rewrite_snapshot = |snapshot: &mut Value, root: &Path| {
-        let files = snapshot.as_object_mut().unwrap();
-        let mut rewritten = 0;
-        for name in [
-            ".claude-plugin/marketplace.json",
-            ".agents/plugins/marketplace.json",
-            "plugins/mcp-repl/.claude-plugin/plugin.json",
-            "plugins/mcp-repl/plugin.json",
-            "plugins/mcp-repl/skills/mcp-repl/SKILL.md",
-            ".claude-plugin/plugin.json",
-            "plugin.json",
-            "skills/mcp-repl/SKILL.md",
-        ] {
-            if let Some(content) = files.get_mut(name) {
-                let old = content.as_str().unwrap().replace(version, old_version);
-                std::fs::write(root.join(name), &old).unwrap();
-                *content = old.into();
-                rewritten += 1;
-            }
-        }
-        assert_eq!(rewritten, files.len(), "unexpected receipt file");
+    let source = state.join(provider);
+    let catalog = if provider == "claude" {
+        ".claude-plugin/marketplace.json"
+    } else {
+        ".agents/plugins/marketplace.json"
     };
-    let receipt_path = state.join(format!("{provider}.json"));
-    let mut receipt: Value = read_plugin_receipt(&receipt_path);
-    rewrite_snapshot(&mut receipt["files"], &state.join(provider));
-    let caches = receipt["caches"].as_object_mut().unwrap();
-    let mut cache = caches.remove(version).unwrap();
-    rewrite_snapshot(&mut cache, &old_cache);
-    caches.insert(old_version.into(), cache);
-    receipt["version"] = old_version.into();
-    std::fs::write(receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    for path in [
+        source.join(catalog),
+        source.join("plugins/mcp-repl/.claude-plugin/plugin.json"),
+        source.join("plugins/mcp-repl/plugin.json"),
+        source.join("plugins/mcp-repl/skills/mcp-repl/SKILL.md"),
+        old_cache.join(".claude-plugin/plugin.json"),
+        old_cache.join("plugin.json"),
+        old_cache.join("skills/mcp-repl/SKILL.md"),
+        state.join(format!("{provider}.json")),
+    ] {
+        let text = read_plugin_text(&path);
+        // Skills/catalogs have no version; plugin manifests/receipt must contain it.
+        if !matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("SKILL.md" | "marketplace.json")
+        ) {
+            assert!(text.contains(version), "fixture version missing");
+        }
+        std::fs::write(path, text.replace(version, old_version)).unwrap();
+    }
     std::fs::write(profile.join("installed"), old_version).unwrap();
 }
 
@@ -3118,10 +3112,8 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     assert_status(&output, 3, "partial plugin install");
     let partial = &json_lines(&output, "partial plugin install")[0];
     assert_eq!(
-        partial["providers"][0]["outcome"],
-        "installed",
-        "report={partial}; child={:?}",
-        std::fs::read_to_string(root.join("claude-diagnostic")).unwrap_or_default()
+        partial["providers"][0]["outcome"], "installed",
+        "report={partial}"
     );
     assert_eq!(partial["providers"][1]["outcome"], "error");
     let version = partial["bundle_version"].as_str().unwrap();
@@ -3275,8 +3267,8 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     let output = run(install, "uncertain plugin install", CASE_TIMEOUT).await;
     assert_status(&output, 3, "uncertain plugin install");
     assert!(other_codex.join("installed").is_file());
-    let pending = read_plugin_receipt(&state_root.join("codex.json"));
-    assert!(pending["files"]["plugins/mcp-repl/plugin.json"].is_string());
+    let pending = read_plugin_text(&state_root.join("codex.json"));
+    assert!(pending.contains("\"plugins/mcp-repl/plugin.json\":"));
     std::fs::remove_file(state_root.join("codex/plugins/mcp-repl/plugin.json")).unwrap();
     let before = std::fs::read(root.join("codex-trace")).unwrap();
 
