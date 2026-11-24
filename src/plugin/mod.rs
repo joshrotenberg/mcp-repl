@@ -242,6 +242,8 @@ pub(super) fn run(matches: &ArgMatches, root_json: bool) -> crate::ExitStatus {
                 row.provider.program(),
                 row.outcome,
                 crate::untrusted::sanitize(&row.message)
+                    .replace('\n', "\\n")
+                    .replace('\t', "\\t")
             );
         }
     }
@@ -325,8 +327,16 @@ async fn manage(
         ));
     }
 
+    let active = receipt.as_ref().is_some_and(Receipt::active);
+    let missing_profile = state::metadata(&profile)?.is_none();
+    if active && missing_profile {
+        return Err(format!(
+            "managed provider profile {} is missing; preserve ownership records and inspect provider configuration",
+            profile.display()
+        ));
+    }
     verify_cache(provider, &profile, receipt.as_ref())?;
-    if state::metadata(&profile)?.is_none() {
+    if missing_profile {
         match operation {
             Operation::Install => state::initialize_profile(&profile)?,
             Operation::Uninstall => {
@@ -340,7 +350,6 @@ async fn manage(
             }
         }
     }
-    let active = receipt.as_ref().is_some_and(Receipt::active);
     let cwd = tempfile::tempdir()
         .map_err(|error| format!("could not create neutral provider working directory: {error}"))?;
     let client = Client {

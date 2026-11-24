@@ -3111,7 +3111,9 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
     let state_root = state.join("mcp-repl/plugins");
     #[cfg(unix)]
     {
-        let foreign = state_root.join("codex").join("\u{1b}[2Juntrusted\u{7}");
+        let foreign = state_root
+            .join("codex")
+            .join("\u{1b}[2Juntrusted\u{7}\ncodex: installed - forged\t");
         std::fs::write(&foreign, "preserve").unwrap();
         let mut status = isolated();
         status.args(["plugin", "status", "--provider", "codex"]);
@@ -3119,6 +3121,7 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
         assert_status(&output, 3, "sanitize plugin diagnostics");
         assert!(!output.stdout.contains(&0x1b));
         assert!(!output.stdout.contains(&0x07));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 1);
         assert!(String::from_utf8_lossy(&output.stdout).contains("unexpected entry"));
         assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "preserve");
         std::fs::remove_file(foreign).unwrap();
@@ -3301,6 +3304,31 @@ async fn exercise_plugin_manager(fixture: &Path, temp: &TempDir) {
         assert_eq!(results[0]["outcome"], expected);
         assert_eq!(results[1]["outcome"], expected);
     }
+
+    let missing_state = root.join("deleted-profile-state");
+    let missing_profile = root.join("deleted-profile");
+    let mut install = isolated();
+    install
+        .env("XDG_STATE_HOME", &missing_state)
+        .env("LOCALAPPDATA", &missing_state)
+        .env("CODEX_HOME", &missing_profile)
+        .args(["plugin", "install", "--provider", "codex", "--json"]);
+    let output = run(install, "install before profile deletion", CASE_TIMEOUT).await;
+    assert_success(&output, "install before profile deletion");
+    std::fs::remove_dir_all(&missing_profile).unwrap();
+    let before = std::fs::read(root.join("codex-trace")).unwrap();
+    let mut uninstall = isolated();
+    uninstall
+        .env("XDG_STATE_HOME", &missing_state)
+        .env("LOCALAPPDATA", &missing_state)
+        .env("CODEX_HOME", &missing_profile)
+        .args(["plugin", "uninstall", "--provider", "codex", "--json"]);
+    let output = run(uninstall, "uninstall missing managed profile", CASE_TIMEOUT).await;
+    assert_status(&output, 3, "uninstall missing managed profile");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("missing"));
+    assert_eq!(std::fs::read(root.join("codex-trace")).unwrap(), before);
+    assert!(missing_state.join("mcp-repl/plugins/codex.json").is_file());
+    assert!(missing_state.join("mcp-repl/plugins/codex").is_dir());
 }
 
 /// The generators run before anything connects, so they need no server, no

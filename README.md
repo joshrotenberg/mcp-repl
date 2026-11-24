@@ -323,6 +323,8 @@ After a provider removes all orphaned caches, run uninstall with the original
 profile to discard its inactive receipt before selecting another profile.
 
 With an explicit server connection, `plugin` can still be a server tool name.
+The root command reserves the bare word `plugin`; select a saved profile of
+that name explicitly with `mcp-repl --server plugin`.
 Use `mcp-repl -- plugin …` if your stdio server executable is named `plugin`.
 
 ## The shell model
