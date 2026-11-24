@@ -1878,13 +1878,9 @@ fn collision_note(surface: &Surface) -> Option<String> {
         return None;
     }
     let names = and_join(&shadowed);
-    let also = if shadowed.len() == 1 {
-        "is also a built-in"
-    } else {
-        "are also built-ins"
-    };
+    let verb = if shadowed.len() == 1 { "is" } else { "are" };
     Some(format!(
-        "note: {names} {also}; reach the server's with `tool <name>`"
+        "note: {names} {verb} ambiguous without a qualifier; use `tool <name>` for the server tool or `builtin <name>` for the built-in"
     ))
 }
 
@@ -8411,14 +8407,16 @@ mod tests {
     }
 
     #[test]
-    fn the_collision_note_names_the_one_shadowed_built_in() {
+    fn the_collision_note_names_both_qualifiers_for_a_collision() {
         let surface = surface_with_a_task_capable_tool();
         let surface = surface.read().unwrap();
         // slow_add and echo are plain tool names; only `wait` is also a
         // built-in, so the note names it and nothing else.
         assert_eq!(
             collision_note(&surface).as_deref(),
-            Some("note: wait is also a built-in; reach the server's with `tool <name>`")
+            Some(
+                "note: wait is ambiguous without a qualifier; use `tool <name>` for the server tool or `builtin <name>` for the built-in"
+            )
         );
     }
 
@@ -8452,6 +8450,9 @@ mod tests {
         assert!(note.contains("connect"));
         assert!(note.contains("tool"));
         assert!(note.contains("wait"));
+        assert!(note.contains("are ambiguous without a qualifier"));
+        assert!(note.contains("`tool <name>`"));
+        assert!(note.contains("`builtin <name>`"));
     }
 
     #[test]

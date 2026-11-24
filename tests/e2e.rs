@@ -1323,7 +1323,7 @@ async fn exercise_colliding_tool_names(fixture: &Path, temp: &TempDir) {
     let stdout = String::from_utf8_lossy(&banner.stdout);
     let note_lines: Vec<&str> = stdout
         .lines()
-        .filter(|line| line.contains("also a built-in") || line.contains("also built-ins"))
+        .filter(|line| line.contains("ambiguous without a qualifier"))
         .collect();
     assert_eq!(
         note_lines.len(),
@@ -1335,6 +1335,7 @@ async fn exercise_colliding_tool_names(fixture: &Path, temp: &TempDir) {
         assert!(note.contains(shadowed), "{note}");
     }
     assert!(note.contains("`tool <name>`"), "{note}");
+    assert!(note.contains("`builtin <name>`"), "{note}");
 
     // A server whose tools do not shadow anything gets no note at all: the
     // raw-tools-only fixture mode serves exactly one tool, `add`.
@@ -1356,7 +1357,7 @@ async fn exercise_colliding_tool_names(fixture: &Path, temp: &TempDir) {
     assert_success(&no_collision, "no collision banner");
     let stdout = String::from_utf8_lossy(&no_collision.stdout);
     assert!(
-        !stdout.contains("also a built-in") && !stdout.contains("also built-ins"),
+        !stdout.contains("ambiguous without a qualifier"),
         "a server with no shadowed names gets no note:\n{stdout}"
     );
 }
