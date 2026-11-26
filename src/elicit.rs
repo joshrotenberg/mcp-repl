@@ -223,6 +223,7 @@ pub struct ReplClientHandler {
     at_prompt: Arc<AtomicBool>,
     server: ServerLabel,
     output: AsyncOutput,
+    host: Option<crate::host_input::Connection>,
 }
 
 impl ReplClientHandler {
@@ -237,7 +238,13 @@ impl ReplClientHandler {
             at_prompt,
             server,
             output,
+            host: None,
         }
+    }
+
+    pub(crate) fn with_host(mut self, host: Option<crate::host_input::Connection>) -> Self {
+        self.host = host;
+        self
     }
 
     /// The name the connected server gave, for the provenance line.
@@ -280,6 +287,11 @@ impl ClientHandler for ReplClientHandler {
         &self,
         params: CreateMessageParams,
     ) -> Result<CreateMessageResult, JsonRpcError> {
+        if let Some(host) = self.host
+            && let Some(token) = self.current_cancellation_token()
+        {
+            return host.sample(params, token).await;
+        }
         match sampling::mode() {
             SamplingMode::Decline => Err(sampling::declined("--sampling decline")),
             SamplingMode::Canned => {
@@ -305,6 +317,11 @@ impl ClientHandler for ReplClientHandler {
         &self,
         params: ElicitRequestParams,
     ) -> Result<ElicitResult, JsonRpcError> {
+        if let Some(host) = self.host
+            && let Some(token) = self.current_cancellation_token()
+        {
+            return Ok(host.elicit(params, token).await);
+        }
         if mode() == ElicitationMode::Decline {
             self.note(format!(
                 "{} declined a request from the server (--elicitation decline)",
@@ -348,6 +365,16 @@ impl ClientHandler for ReplClientHandler {
     }
 
     async fn on_notification(&self, notification: ServerNotification) {
+        if self.host.is_some()
+            && matches!(
+                notification,
+                ServerNotification::Progress(_)
+                    | ServerNotification::LogMessage(_)
+                    | ServerNotification::ResourceUpdated { .. }
+            )
+        {
+            return;
+        }
         self.notifications.on_notification(notification).await;
     }
 }
@@ -399,7 +426,7 @@ pub async fn answer_in_foreground(server: &str, params: ElicitRequestParams) -> 
 /// Whether a URL is an ordinary web link. Anything else (`javascript:`,
 /// `file:`, `data:`) is refused rather than displayed, since terminals
 /// linkify what they print.
-fn is_web_url(url: &str) -> bool {
+pub(crate) fn is_web_url(url: &str) -> bool {
     let scheme = url
         .split_once("://")
         .map(|(scheme, _)| scheme)
@@ -769,7 +796,10 @@ fn describe_field(schema: &PrimitiveSchemaDefinition) -> (String, Option<String>
 /// generous spellings are a feature of answering a prompt by hand rather than
 /// a mistake to correct.
 fn accepted_values(schema: &PrimitiveSchemaDefinition) -> Option<(Vec<String>, bool)> {
-    let raw = field_json(schema);
+    accepted_values_from_json(&field_json(schema))
+}
+
+pub(crate) fn accepted_values_from_json(raw: &serde_json::Value) -> Option<(Vec<String>, bool)> {
     let multi = raw.get("type").and_then(|t| t.as_str()) == Some("array");
     let values = raw
         .get("enum")
@@ -817,7 +847,7 @@ fn reject_answer(schema: &PrimitiveSchemaDefinition, raw: &str) -> Option<String
 /// later. It is also what kept booleans and enums working through
 /// tower-mcp 0.18, where the union was undiscriminated and every field
 /// arrived as `String`.
-fn field_json(schema: &PrimitiveSchemaDefinition) -> serde_json::Value {
+pub(crate) fn field_json(schema: &PrimitiveSchemaDefinition) -> serde_json::Value {
     serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({}))
 }
 
@@ -987,6 +1017,19 @@ mod tests {
     /// the very deserialization this guards against.
     fn field_from_wire(json: serde_json::Value) -> PrimitiveSchemaDefinition {
         serde_json::from_value(json).expect("field schema")
+    }
+
+    #[test]
+    fn interactive_titled_choices_are_passed_through_as_text() {
+        let field = field_from_wire(serde_json::json!({
+            "type": "string", "oneOf": [{"const": "a", "title": "Alpha"}]
+        }));
+        assert!(accepted_values(&field).is_none());
+        assert!(completion_words(&field, None).is_empty());
+        assert!(reject_answer(&field, "Alpha").is_none());
+        assert!(
+            matches!(coerce_field(&field, "Alpha"), ElicitFieldValue::String(text) if text == "Alpha")
+        );
     }
 
     #[test]

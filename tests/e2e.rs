@@ -16,6 +16,10 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
+#[cfg(unix)]
+#[path = "e2e/host_input.rs"]
+mod host_input;
+
 // Each process normally finishes in well under a second, but beta and Windows
 // runners can be CPU-starved while the all-target workspace job is active.
 // Keep hangs bounded without treating scheduler stalls as product failures.
@@ -4035,6 +4039,8 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
+        #[cfg(unix)]
+        host_input::exercise(&fixture, &temp).await;
         exercise_generators().await;
         exercise_plugin_manager(&fixture, &temp).await;
         exercise_generated_cli(&fixture, &temp).await;
