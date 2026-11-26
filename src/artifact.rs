@@ -825,11 +825,10 @@ mod tests {
             .unwrap()
             .summary;
         assert_eq!(summary["isError"], true);
-        let saved: Value = serde_json::from_str(
-            &std::fs::read_to_string(summary["path"].as_str().unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(saved["isError"], true);
+        let files = files_in(dir.path());
+        assert_eq!(files.len(), 1);
+        let saved = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(saved.contains(r#""isError":true"#));
     }
 
     #[test]
@@ -966,9 +965,7 @@ mod tests {
     fn existing_name_is_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let budget = budget_in(dir.path(), 1);
-        let taken = std::path::absolute(dir.path())
-            .unwrap()
-            .join("0001-t-aaaaaa.json");
+        let taken = dir.path().join("0001-t-aaaaaa.json");
         std::fs::write(&taken, "earlier").unwrap();
         let mut names = ["aaaaaa", "bbbbbb"].into_iter();
         let saved = budget

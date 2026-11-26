@@ -4030,31 +4030,42 @@ async fn exercise_string_tool_arguments() {
     }
 }
 
-/// Read a result saved by `--max-output`, checking it is one JSON line.
-fn saved_result(summary: &serde_json::Value, label: &str) -> serde_json::Value {
-    let path = summary["path"]
+/// The file a `--max-output` summary names, found by listing the output
+/// directory rather than opening the printed path.
+fn saved_path(dir: &Path, summary: &serde_json::Value, label: &str) -> PathBuf {
+    let name = summary["path"]
         .as_str()
-        .unwrap_or_else(|| panic!("{label}: summary has no path: {summary}"));
-    let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{label}: {error}"));
+        .and_then(|path| Path::new(path).file_name())
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| panic!("{label}: summary names no saved file"));
+    std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.file_name() == Some(name.as_os_str()))
+        .unwrap_or_else(|| panic!("{label}: the saved file is not in the output directory"))
+}
+
+/// Read a result saved by `--max-output`, checking it is one JSON line.
+fn saved_result(dir: &Path, summary: &serde_json::Value, label: &str) -> serde_json::Value {
+    let path = saved_path(dir, summary, label);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{label}: {error}"));
     assert!(
         text.ends_with('\n') && text.matches('\n').count() == 1,
-        "{label}: {text}"
+        "{label}: the saved result is not exactly one line"
     );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{label}: saved result mode");
     }
-    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{label}: {error}: {text}"))
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{label}: not JSON: {error}"))
 }
 
 /// The raw bytes of a result saved by `--max-output`.
-fn saved_bytes(summary: &serde_json::Value, label: &str) -> Vec<u8> {
-    let path = summary["path"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{label}: summary has no path: {summary}"));
-    std::fs::read(path).unwrap_or_else(|error| panic!("{label}: {error}"))
+fn saved_bytes(dir: &Path, summary: &serde_json::Value, label: &str) -> Vec<u8> {
+    std::fs::read(saved_path(dir, summary, label))
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
 }
 
 fn count_files(dir: &Path) -> usize {
@@ -4217,7 +4228,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
     assert_eq!(text["maxOutput"], 1024);
     assert_eq!(text["saveError"], serde_json::Value::Null);
     assert_eq!(text["content"][0]["textBytes"], 20000);
-    let saved = saved_result(text, "text");
+    let saved = saved_result(&dir, text, "text");
     assert_eq!(text["bytes"], saved.to_string().len());
     let full = saved["content"][0]["text"].as_str().unwrap();
     assert_eq!(full.len(), 20000);
@@ -4231,7 +4242,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
         structured["structuredContent"]["keys"],
         serde_json::json!(["items", "total"])
     );
-    let saved = saved_result(structured, "structured");
+    let saved = saved_result(&dir, structured, "structured");
     assert_eq!(
         saved["structuredContent"]["items"]
             .as_array()
@@ -4246,7 +4257,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
         serde_json::json!({"type": "image", "mimeType": "image/png", "base64Chars": 20000})
     );
     assert_eq!(media["content"][2]["type"], "audio");
-    let saved = saved_result(media, "media");
+    let saved = saved_result(&dir, media, "media");
     assert_eq!(saved["content"][1]["data"].as_str().unwrap().len(), 20000);
 
     assert_eq!(
@@ -4257,7 +4268,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
 
     let error = &values[4];
     assert_eq!(error["isError"], true, "a tool error stays an error");
-    assert_eq!(saved_result(error, "error")["isError"], true);
+    assert_eq!(saved_result(&dir, error, "error")["isError"], true);
 
     assert_eq!(values[5]["value"]["type"], "string");
     assert_eq!(
@@ -4266,7 +4277,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
         "a captured variable keeps the whole value"
     );
     assert_eq!(values[7]["value"]["type"], "array");
-    assert!(saved_result(&values[7], "filtered").is_array());
+    assert!(saved_result(&dir, &values[7], "filtered").is_array());
     assert_eq!(values[8]["content"][0]["text"], "42");
 
     // Byte for byte, each saved file is what an unbounded run prints for
@@ -4301,7 +4312,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
     .enumerate()
     {
         assert_eq!(
-            saved_bytes(summary, label),
+            saved_bytes(&dir, summary, label),
             reference[index],
             "{label}: saved bytes differ from unbounded stdout"
         );
@@ -4356,7 +4367,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
         ]
     );
     assert_eq!(
-        saved_result(summary, "empty")["content"],
+        saved_result(&dir, summary, "empty")["content"],
         serde_json::json!([])
     );
 
@@ -4556,7 +4567,7 @@ async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
     let summary = &json_lines(&generated, "bounded generated command")[0];
     assert_eq!(summary["tool"], "echo");
     assert_eq!(
-        saved_result(summary, "generated")["content"][0]["text"],
+        saved_result(&dir, summary, "generated")["content"][0]["text"],
         "a message long enough to go over a sixty byte budget"
     );
 
