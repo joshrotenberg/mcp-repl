@@ -42,9 +42,30 @@ mcp-repl --demo --json echo --message 'hello world'
 
 ## Settle and clean up work you own
 
-Keep dependent operations in a live REPL or one process with repeated `-e`
-arguments. That process owns the MCP connection and its jobs. Use a live REPL
-when you must inspect results before choosing the next command.
+Keep dependent operations in one process that owns the MCP connection and its
+jobs. Fixed `-e` batches continue after errors. For result-dependent stdio
+workflows, import `Session` from this skill's `scripts/session_driver.py`.
+Use a binary that supports piped JSON startup for the session driver. The
+installed helper checks for at least the mcp-repl version that bundled it.
+CI uses the runners' default Python 3 and the helper avoids features newer
+than Python 3.8.
+Pass the server executable and arguments as a list and use the session as
+a context manager. On Windows, use an executable in place of a batch
+launcher such as `npx.cmd`.
+
+Call `discover()` to inspect the tools and `call(name, args)` with a Python
+dictionary to invoke one. A successful reply exposes the raw MCP value in
+`reply.value`. Inspect each result before choosing the next call. Use
+`start_task()` and `wait_task(ref, timeout=...)` for MCP tasks when the server
+supports them. Use the server's own operations for application worker handles.
+`TaskPending` keeps the task usable after a wait timeout. Wait again or use
+`cancel_task(ref)` and inspect the state it returns. If cancellation reports
+a nonterminal state, keep waiting on the same reference. Use
+`abandon_task(ref)` to release a reference locally when you can no longer
+track it. The server may still be running the task. Use `read(uri)` for MCP
+resources. The helper rejects dollar signs in standalone URIs because the
+REPL expands variables in those tokens. The driver's request IDs are local
+correlation numbers.
 
 A tool result can contain an application-level worker handle. Use that tool's
 documented wait or status operation and read the final result using the
@@ -63,6 +84,12 @@ interruption or failure, use documented cancel or cleanup operations only for
 work, connections, and resources you created. Keep the owning session alive
 for settlement and cleanup. Report unresolved work if you cannot confirm its
 final state.
+
+A disconnect, driver deadline, or interruption closes the session and
+invalidates its handles. `SessionLost.sent` means the command was queued for
+writing. If a mutation's outcome is uncertain, report it and avoid replay.
+Check `cleanup_error` if forced shutdown left server cleanup unverified.
+On Windows a forced kill reaches only mcp-repl.
 
 ## Interpret results and diagnose failures
 

@@ -31,12 +31,21 @@ impl SurfaceSubscription {
         let task = tokio::spawn(run(session, output, shutdown_rx));
         Self { shutdown_tx, task }
     }
+
+    pub async fn stop(mut self) {
+        self.abort();
+        let _ = (&mut self.task).await;
+    }
+
+    fn abort(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.task.abort();
+    }
 }
 
 impl Drop for SurfaceSubscription {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
-        self.task.abort();
+        self.abort();
     }
 }
 

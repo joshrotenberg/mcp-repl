@@ -20,6 +20,7 @@ use tokio::process::{Child, Command};
 // runners can be CPU-starved while the all-target workspace job is active.
 // Keep hangs bounded without treating scheduler stalls as product failures.
 const CASE_TIMEOUT: Duration = Duration::from_secs(60);
+const PYTHON_HARNESS_TIMEOUT: Duration = Duration::from_secs(180);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 const SUITE_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -1554,6 +1555,87 @@ async fn exercise_multiline_piped_input() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("hello from a pipe"), "{stdout}");
     assert!(!stdout.contains("unknown command"), "{stdout}");
+}
+
+async fn exercise_json_piped_startup(fixture: &Path, temp: &TempDir) {
+    let config = temp.path().join("piped-startup.toml");
+    let path = serde_json::to_string(&fixture.to_string_lossy()).unwrap();
+    std::fs::write(
+        &config,
+        format!("[servers.piped]\ntransport = \"stdio\"\ncommand = [{path}]\n"),
+    )
+    .unwrap();
+    let mut command = repl_command();
+    command
+        .args(["--json", "--verbose", "--no-history", "--config"])
+        .arg(&config)
+        .args(["--server", "piped"]);
+    let output = run_with_input(
+        command,
+        "builtin tools\nbuiltin call add {\"a\":20,\"b\":22}\n",
+        "piped JSON startup and EOF",
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, "piped JSON startup");
+    let values = json_lines(&output, "piped JSON startup");
+    assert_eq!(values.len(), 3);
+    assert!(values[0].is_array());
+    assert_eq!(values[1]["content"][0]["text"], "42");
+    assert_eq!(values[2], serde_json::json!({"exit": true}));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("mcp-repl fixture ready"));
+
+    let mut command = repl_command();
+    command
+        .args(["--no-history", "--color", "never", "--config"])
+        .arg(config)
+        .args(["--server", "piped"]);
+    let output = run_with_input(command, "quit\n", "piped human startup", CASE_TIMEOUT).await;
+    assert_success(&output, "piped human startup");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("profile piped"), "{stdout}");
+    assert!(stdout.contains("connected: mcp-repl-fixture"), "{stdout}");
+}
+
+async fn exercise_session_driver(fixture: &Path) {
+    let candidates = if cfg!(windows) {
+        ["python", "python3"]
+    } else {
+        ["python3", "python"]
+    };
+    let mut interpreter = None;
+    for program in candidates {
+        let mut probe = test_command(program);
+        probe
+            .args(["-c", "import sys; sys.exit(sys.version_info < (3, 8))"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        if let Ok(Ok(status)) = tokio::time::timeout(CASE_TIMEOUT, probe.status()).await
+            && status.success()
+        {
+            interpreter = Some(program);
+            break;
+        }
+    }
+    let Some(python) = interpreter else {
+        assert!(
+            std::env::var("MCP_REPL_REQUIRE_PYTHON").as_deref() != Ok("1"),
+            "Python 3.8+ is required to run the session driver harness"
+        );
+        eprintln!("skipping the session driver harness: Python 3.8+ unavailable");
+        return;
+    };
+    let mut command = test_command(python);
+    command
+        .current_dir(repo_root())
+        .env_remove("RUST_LOG")
+        .args(["-B", "scripts/test_session_driver.py"])
+        .arg(env!("CARGO_BIN_EXE_mcp-repl"))
+        .arg(fixture);
+    let output = run(command, "Python session driver", PYTHON_HARNESS_TIMEOUT).await;
+    assert_success(&output, "Python session driver");
 }
 
 async fn exercise_in_repl_connect(fixture: &Path, http_url: &str, temp: &TempDir) {
@@ -4035,6 +4117,8 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
+        exercise_json_piped_startup(&fixture, &temp).await;
+        exercise_session_driver(&fixture).await;
         exercise_generators().await;
         exercise_plugin_manager(&fixture, &temp).await;
         exercise_generated_cli(&fixture, &temp).await;
