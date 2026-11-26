@@ -193,6 +193,12 @@ fn builtin_command(name: &str, prompt_specs: &[SurfaceCommandSpec]) -> Command {
                     .long("full")
                     .help("Print the complete listing")
                     .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("brief")
+                    .long("brief")
+                    .help("Under --json, only names, titles, and descriptions")
+                    .action(ArgAction::SetTrue),
             ),
         "read" => Command::new("read")
             .about("Read a resource")
@@ -299,6 +305,9 @@ fn builtin_invocation(
         name if LIST_BUILTINS.contains(&name) => {
             if matches.get_flag("full") {
                 words.push("--full".to_string());
+            }
+            if matches.get_flag("brief") {
+                words.push("--brief".to_string());
             }
         }
         "read" => {
@@ -656,6 +665,14 @@ mod tests {
             assert!(parsed.words.contains(&"message=hello world".to_string()));
             assert!(parsed.words.contains(&"repeat=2".to_string()));
         }
+    }
+
+    #[test]
+    fn list_flags_translate_to_the_repl_vocabulary() {
+        let tools = parse(&[], &[], &["tools".into(), "--brief".into()]).unwrap();
+        assert_eq!(tools.parsed().words, ["tools", "--brief"]);
+        let full = parse(&[], &[], &["resources".into(), "--full".into()]).unwrap();
+        assert_eq!(full.parsed().words, ["resources", "--full"]);
     }
 
     #[test]

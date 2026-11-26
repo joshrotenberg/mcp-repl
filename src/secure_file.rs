@@ -1,13 +1,18 @@
-//! Local files written by the REPL: the config file, and the command
-//! history.
+//! Local files written by the REPL: the config file, the command history,
+//! and tool results saved by `--max-output`.
 //!
-//! Both can hold material the user would not want readable by other
+//! All of them can hold material the user would not want readable by other
 //! accounts on the machine. The config file may carry an inline `bearer`
-//! or an `Authorization` header, and the history records every line
-//! typed, which routinely includes arguments like
-//! `call issue_create {"token": "..."}`. Neither is a credential store
-//! (OAuth secrets live in the platform keyring), but both default to
-//! owner-only permissions rather than whatever the umask allows.
+//! or an `Authorization` header, the history records every line typed,
+//! which routinely includes arguments like
+//! `call issue_create {"token": "..."}`, and a saved result is whatever a
+//! server returned. None is a credential store (OAuth secrets live in the
+//! platform keyring), but all default to owner-only permissions rather than
+//! whatever the umask allows.
+//!
+//! Owner-only modes are a unix guarantee. On Windows these files and
+//! directories inherit the access control list of the directory they are
+//! created in; nothing here changes it.
 
 use std::io::Write;
 use std::path::Path;
@@ -27,17 +32,38 @@ pub(crate) fn create_parent_dir(path: &Path) -> std::io::Result<()> {
     if parent.as_os_str().is_empty() || parent.exists() {
         return Ok(());
     }
+    create_private_dir(parent)
+}
+
+/// Create `path` and any missing parents, owner-only on unix.
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(OWNER_ONLY_DIR)
-            .create(parent)
+            .create(path)
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(parent)
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Set a directory the REPL just created to owner-only (0700) explicitly,
+/// so the umask cannot narrow or widen the mode it was created with. A
+/// no-op on non-unix platforms.
+pub(crate) fn restrict_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_ONLY_DIR))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -113,6 +139,34 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create `path` as a new owner-only file and return it open for writing.
+///
+/// Used for results saved by `--max-output`. `create_new` fails on any
+/// existing entry, including a symlink planted at that name, so an earlier
+/// file is never overwritten and a link is never followed. The caller picks
+/// another name on `AlreadyExists`. On unix the mode is set to 0600 on the
+/// open handle after creation, so the umask cannot change it.
+pub(crate) fn create_new_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(OWNER_ONLY);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(OWNER_ONLY)) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+    }
+    Ok(file)
+}
+
 /// Write bytes to a new or existing file, owner-only.
 ///
 /// Used by `read --out`: whatever a server serves is as sensitive as the
@@ -179,6 +233,28 @@ mod tests {
         assert_eq!(mode_of(&path) & 0o077, 0);
         // Tightening must not disturb what is already recorded.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo message=hi\n");
+    }
+
+    #[test]
+    fn create_new_refuses_existing_files_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.json");
+        create_new_owner_only(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o600);
+
+        let existing = dir.path().join("existing.json");
+        std::fs::write(&existing, "keep").unwrap();
+        let error = create_new_owner_only(&existing).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "keep");
+
+        let target = dir.path().join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        let link = dir.path().join("planted.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = create_new_owner_only(&link).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
     }
 
     #[test]
