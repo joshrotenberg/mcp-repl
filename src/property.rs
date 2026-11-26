@@ -128,3 +128,19 @@ pub const ALIAS_REGRESSIONS: &[(&[(&str, &str)], &str)] = &[
     (&[("w", "tool wait")], "w id=42"),
     (&[("tool", "tools")], "tool wait id=42"),
 ];
+
+/// Tool policy near misses: `(listed name, probe)`. Matching is exact, so the
+/// probe must never be treated as the listed name, whichever list holds it.
+pub const TOOL_POLICY_REGRESSIONS: &[(&str, &str)] = &[
+    ("get_issue", "Get_Issue"),
+    ("get_issue", "get_issue "),
+    ("get_issue", " get_issue"),
+    ("get_issue", "get-issue"),
+    ("get_issue", "get_issue\0"),
+    ("get_issue", "get_issue\n"),
+    // Cyrillic `е` (U+0435) in place of Latin `e`.
+    ("search", "s\u{435}arch"),
+    ("files.list", "files_list"),
+    ("files/list", "files"),
+    ("x", ""),
+];

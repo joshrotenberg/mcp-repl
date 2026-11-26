@@ -84,6 +84,7 @@ mod style;
 mod subscribe;
 mod surface_subscription;
 mod tool_args;
+mod tool_policy;
 mod untrusted;
 mod vars;
 mod wire;
@@ -348,6 +349,21 @@ struct Args {
     #[arg(long, value_enum, default_value = "compatible", hide_short_help = true)]
     schema_mode: schema_contract::ValidationMode,
 
+    /// Allow calls only to these tools, by exact raw name (repeatable).
+    ///
+    /// Also accepts a comma-separated list. Narrows a profile's
+    /// `allow_tools`; it cannot widen it. A call to any other tool is refused
+    /// locally and never sent. A client-side control, not a sandbox.
+    #[arg(long = "allow-tool", value_name = "NAME", value_delimiter = ',')]
+    allow_tools: Vec<String>,
+
+    /// Refuse calls to these tools, by exact raw name (repeatable).
+    ///
+    /// Also accepts a comma-separated list. Adds to a profile's
+    /// `deny_tools`; deny wins over allow. A refused call is never sent.
+    #[arg(long = "deny-tool", value_name = "NAME", value_delimiter = ',')]
+    deny_tools: Vec<String>,
+
     /// How to answer a server's `sampling/createMessage` request: `prompt`
     /// shows it and reads the assistant message on stdin, `canned` answers
     /// with a fixed placeholder, `decline` refuses. Defaults to `prompt`
@@ -403,6 +419,20 @@ static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 fn json_output() -> bool {
     JSON_OUTPUT.load(Ordering::Relaxed)
+}
+
+/// `println!` for connection diagnostics: the banner, tool policy line,
+/// surface counts and overview, and `connect` notes. They go to stdout in
+/// human mode and to stderr under `--json`, where stdout carries only the
+/// commands' JSON values.
+macro_rules! diag_println {
+    ($($arg:tt)*) => {
+        if json_output() {
+            eprintln!($($arg)*)
+        } else {
+            println!($($arg)*)
+        }
+    };
 }
 
 /// Whether any user command has been dispatched. Only `last` cares: before
@@ -517,11 +547,25 @@ fn report_error(status: ExitStatus, message: &str) {
 
 /// A failure plus a suggestion of what to type instead.
 fn report_error_with_hint(status: ExitStatus, message: &str, hint: Option<&str>) {
+    report_error_with_details(status, message, hint, None);
+}
+
+/// [`report_error_with_hint`] plus, for a tool policy denial, the
+/// `toolPolicy` object of the `--json` envelope.
+fn report_error_with_details(
+    status: ExitStatus,
+    message: &str,
+    hint: Option<&str>,
+    tool_policy: Option<serde_json::Value>,
+) {
     note_error(status);
     if json_output() {
         let mut value = error_json(status, message);
         if let Some(hint) = hint {
             value["didYouMean"] = serde_json::json!(hint);
+        }
+        if let Some(details) = tool_policy {
+            value["toolPolicy"] = details;
         }
         print_json(&value);
         return;
@@ -539,10 +583,34 @@ fn report_error_with_hint(status: ExitStatus, message: &str, hint: Option<&str>)
 }
 
 fn report_mcp_error(error: &tower_mcp::Error) {
-    report_error(
+    report_error_with_details(
         ExitStatus::from_mcp_error(error),
         &describe_mcp_error(error),
+        None,
+        tool_policy_error_json(error, tool_policy::current().as_deref()),
     );
+}
+
+/// The `toolPolicy` object for a denied tool call, `None` for anything else.
+///
+/// tower-mcp carries the denial as a name and a reason string. `rule` and
+/// `sources` are recovered from the connection's published policy, which is
+/// the same object the client consulted; the reason the client returned is
+/// kept verbatim alongside them.
+fn tool_policy_error_json(
+    error: &tower_mcp::Error,
+    policy: Option<&tool_policy::ToolPolicy>,
+) -> Option<serde_json::Value> {
+    let tower_mcp::Error::ToolCallDenied { name, reason } = error else {
+        return None;
+    };
+    let denial = policy.and_then(|policy| policy.decide(name));
+    Some(serde_json::json!({
+        "tool": name,
+        "rule": denial.as_ref().map(|d| d.rule.label()),
+        "sources": denial.map(|d| d.sources),
+        "reason": reason,
+    }))
 }
 
 /// Pull the human sentence out of an error a peer embedded as JSON.
@@ -619,6 +687,16 @@ fn modern_era_retry_hint(rpc: &tower_mcp::error::JsonRpcError) -> Option<String>
 /// a library is right to keep the whole value, and only the thing with a
 /// terminal knows what belongs on it.
 fn describe_mcp_error(error: &tower_mcp::Error) -> String {
+    if let tower_mcp::Error::ToolCallDenied { name, reason } = error {
+        // The name and the reason (which names profiles) are escaped so a
+        // control character cannot split the line. The `toolPolicy` object
+        // of the JSON envelope keeps the raw values.
+        return format!(
+            "tool call `{}` denied by tool policy: {}; it was not sent",
+            untrusted::sanitize_inline(name),
+            untrusted::sanitize_inline(reason)
+        );
+    }
     let tower_mcp::Error::JsonRpc(rpc) = error else {
         return collapse_repeated_label(&error.to_string()).to_string();
     };
@@ -1165,6 +1243,22 @@ fn builtin_help(name: &str) -> Option<BuiltinHelp> {
     })
 }
 
+/// Extra `help <name>` paragraphs that only apply under a tool policy. They
+/// are added only while one is active, so help without a policy is exactly
+/// what it was before the policy existed.
+fn tool_policy_help_details(name: &str) -> &'static [&'static str] {
+    match name {
+        "tools" => &[
+            "Under a tool policy, tools whose calls are refused are left out and a note counts them. `tools --all` lists every tool.",
+        ],
+        "connect" => &[
+            "The tool policy is rebuilt for each target: the profile's allow_tools and deny_tools combined with --allow-tool and --deny-tool, which can narrow a profile but not widen it. A non-profile target gets the flags alone.",
+            "Global aliases survive a switch and are checked against the new target's policy when they run. Profile-scoped aliases follow the active profile.",
+        ],
+        _ => &[],
+    }
+}
+
 fn print_builtin_help(help: BuiltinHelp) {
     println!("{}", paint(Style::new().bold(), help.usage));
     println!("  {}", help.description);
@@ -1598,8 +1692,33 @@ async fn establish_connection(
     }
 }
 
-fn client_builder(protocol: ProtocolMode) -> Result<McpClientBuilder, ProtocolSupportError> {
-    let builder = McpClient::builder()
+/// The effective tool policy for one target: the profile's lists when the
+/// target is a profile, combined with the invocation flags. Configuration
+/// that cannot mean what it says is reported on stderr. `Ok(None)` when
+/// nothing restricts, so no hook is installed.
+fn resolve_tool_policy(
+    profile: Option<(&str, &config::Profile)>,
+    flags: &tool_policy::Flags,
+) -> Result<Option<Arc<tool_policy::ToolPolicy>>, String> {
+    let policy = tool_policy::ToolPolicy::resolve(profile, flags)?;
+    if let Some(policy) = &policy {
+        for warning in policy.warnings() {
+            eprintln!("warning: {warning}");
+        }
+    }
+    Ok(policy.map(Arc::new))
+}
+
+/// Every MCP client the REPL connects through is built here, so the tool
+/// policy cannot be left off one path. `policy` is the connection's effective
+/// [`tool_policy::ToolPolicy`]; tower-mcp checks it before sending any
+/// `tools/call`, typed or raw, and sends nothing on denial. `None` installs
+/// no hook at all.
+fn client_builder(
+    protocol: ProtocolMode,
+    policy: Option<&Arc<tool_policy::ToolPolicy>>,
+) -> Result<McpClientBuilder, ProtocolSupportError> {
+    let mut builder = McpClient::builder()
         .protocol_support(protocol.support()?)
         .with_elicitation()
         .with_sampling()
@@ -1607,6 +1726,9 @@ fn client_builder(protocol: ProtocolMode) -> Result<McpClientBuilder, ProtocolSu
         // carrying a token on the request. Without this the REPL renders
         // progress lines it can never receive.
         .request_progress();
+    if let Some(policy) = policy {
+        builder = builder.tool_call_policy(policy.clone());
+    }
     Ok(match protocol {
         ProtocolMode::Stable => builder,
         ProtocolMode::Final => builder.with_tasks(),
@@ -1683,11 +1805,17 @@ where
     }
 }
 
+/// The effective tool policy, one line after the banner. Tool names and
+/// sources only: never a URL, header, or credential.
+fn print_tool_policy(policy: &tool_policy::ToolPolicy) {
+    diag_println!("{}", paint(Style::new().dimmed(), &policy.summary()));
+}
+
 /// The connection banner: server identity, negotiated protocol, and any
 /// server instructions (markdown-rendered when it looks like markdown).
 /// Printed at startup and replayed by the `info` command.
 fn print_banner(info: &ConnectionInfo) {
-    println!(
+    diag_println!(
         "connected: {} v{} {}",
         paint(Style::new().bold(), &sanitize(&info.server_info.name)),
         sanitize(&info.server_info.version),
@@ -1698,9 +1826,9 @@ fn print_banner(info: &ConnectionInfo) {
     );
     if let Some(instructions) = &info.instructions {
         if style::colors_enabled() && style::looks_like_markdown(instructions) {
-            println!("{}", style::render_markdown(instructions));
+            diag_println!("{}", style::render_markdown(instructions));
         } else {
-            println!("{}", sanitize(instructions));
+            diag_println!("{}", sanitize(instructions));
         }
     }
 }
@@ -1759,40 +1887,73 @@ fn note_truncation(shown: usize, total: usize, full: &str) {
     );
 }
 
+/// The dimmed footer for a listing that left tools out because the tool
+/// policy denies calling them.
+fn print_hidden_note(hidden: usize, all_flag: Option<&str>) {
+    if hidden > 0 {
+        diag_println!(
+            "{}",
+            paint(
+                Style::new().dimmed(),
+                &tool_policy::hidden_note(hidden, all_flag)
+            )
+        );
+    }
+}
+
 /// A compact tool listing for the startup banner: name and description, capped
 /// so a large surface does not flood the screen. The full list is always
 /// available via `tools`.
 fn print_tool_overview(surface: &Surface) {
-    if surface.tools().is_empty() {
+    let policy = tool_policy::current();
+    let (listed, hidden) = tool_policy::listed_tools(surface.tools(), policy.as_deref(), false);
+    if listed.is_empty() {
+        print_hidden_note(hidden, Some("tools --all"));
         return;
     }
     // Half the window: the banner shares the first screen with the counts,
     // the hint line, and the prompt.
-    let cap = listing_limit().map_or(surface.tools().len(), |rows| (rows / 2).max(5));
-    for t in surface.tools().iter().take(cap) {
-        println!(
+    let cap = listing_limit().map_or(listed.len(), |rows| (rows / 2).max(5));
+    for t in listed.iter().take(cap) {
+        diag_println!(
             "{} {}{}",
             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
             sanitize(t.description.as_deref().unwrap_or("")),
             tool_tag_suffix(t)
         );
     }
-    if surface.tools().len() > cap {
-        println!(
+    if listed.len() > cap {
+        diag_println!(
             "{}",
             paint(
                 Style::new().dimmed(),
-                &format!("... +{} more, type `tools`", surface.tools().len() - cap)
+                &format!("... +{} more, type `tools`", listed.len() - cap)
             )
         );
     }
+    print_hidden_note(hidden, Some("tools --all"));
 }
 
 /// The `find` built-in's output: matches grouped by kind under the heading
 /// of the list command that shows the same entries, best match first within
 /// each group.
 fn print_find(surface: &Surface, query: &find::Query, output: &vars::Output) {
-    let hits = find::search_query(surface, query);
+    // Tools the policy denies are not offered as matches. They are filtered
+    // before `-m` applies, and counted so the reply can say a match exists
+    // but is not callable here.
+    let policy = tool_policy::current();
+    let (hits, hidden) = find::search_query_where(surface, query, |hit| {
+        hit.kind != find::Kind::Tool || policy.as_ref().is_none_or(|p| p.permits(&hit.name))
+    });
+    if hidden > 0 {
+        eprintln!(
+            "{}",
+            paint(
+                Style::new().dimmed(),
+                &tool_policy::hidden_note(hidden, Some("tools --all"))
+            )
+        );
+    }
     if !output.is_plain() || json_output() {
         let v: Vec<serde_json::Value> = hits
             .iter()
@@ -1843,15 +2004,25 @@ fn print_find(surface: &Surface, query: &find::Query, output: &vars::Output) {
 
 /// The one-line surface summary.
 fn print_counts(surface: &Surface) {
-    println!(
+    let policy = tool_policy::current();
+    let (_, hidden) = tool_policy::listed_tools(surface.tools(), policy.as_deref(), false);
+    let tools = if hidden > 0 {
+        format!(
+            "{} ({hidden} denied by tool policy)",
+            plural(surface.tools().len(), "tool")
+        )
+    } else {
+        plural(surface.tools().len(), "tool")
+    };
+    diag_println!(
         "{}, {}, {}, {}. Type `help`.",
-        plural(surface.tools().len(), "tool"),
+        tools,
         plural(surface.prompts().len(), "prompt"),
         plural(surface.resources().len(), "resource"),
         plural(surface.templates().len(), "template")
     );
     if let Some(note) = collision_note(surface) {
-        println!("{}", paint(Style::new().dimmed(), &note));
+        diag_println!("{}", paint(Style::new().dimmed(), &note));
     }
 }
 
@@ -3216,12 +3387,20 @@ fn http_connector(
     oauth: Option<OAuthRuntime>,
     make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
     protocol: ProtocolMode,
+    // Captured by the recipe so a transparent reconnect rebuilds the client
+    // with the same tool policy it replaces.
+    policy: Option<Arc<tool_policy::ToolPolicy>>,
 ) -> Connector {
     Arc::new(move |mode| {
-        let (url, config, oauth, handler) =
-            (url.clone(), config.clone(), oauth.clone(), make_handler());
+        let (url, config, oauth, handler, policy) = (
+            url.clone(),
+            config.clone(),
+            oauth.clone(),
+            make_handler(),
+            policy.clone(),
+        );
         Box::pin(async move {
-            let client = client_builder(protocol)
+            let client = client_builder(protocol, policy.as_ref())
                 .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                 .connect(
                     TracingTransport::new(http_transport(url, config, oauth)),
@@ -3254,6 +3433,9 @@ struct ConnectRuntime {
     trust_import: bool,
     no_browser: bool,
     no_reconnect: bool,
+    /// `--allow-tool` and `--deny-tool`: they apply to every target this
+    /// process connects to, combined with the target profile's own lists.
+    tool_flags: tool_policy::Flags,
 }
 
 struct ConnectedTarget {
@@ -3264,6 +3446,9 @@ struct ConnectedTarget {
     profile_name: Option<String>,
     profile_aliases: std::collections::BTreeMap<String, String>,
     source_label: Option<String>,
+    /// The policy the client was built with, published for listings and
+    /// `info` once the switch succeeds.
+    policy: Option<Arc<tool_policy::ToolPolicy>>,
 }
 
 #[derive(Debug)]
@@ -3392,15 +3577,25 @@ impl ConnectRuntime {
             })
         };
 
+        // Resolved before anything connects: a malformed entry is a usage
+        // error, and the new target must never be reachable without it.
+        let profile = profile_name
+            .as_deref()
+            .and_then(|name| self.profiles.servers.get(name).map(|p| (name, p)));
+        let policy =
+            resolve_tool_policy(profile, &self.tool_flags).map_err(ConnectFailure::usage)?;
+
         let mut connector = None;
         let requested_protocol = self.protocol;
         let (client, info) = if demo {
             let connect_transport = {
                 let make_handler = self.make_handler.clone();
+                let policy = policy.clone();
                 move |protocol: ProtocolMode| {
                     let make_handler = make_handler.clone();
+                    let policy = policy.clone();
                     async move {
-                        client_builder(protocol)
+                        client_builder(protocol, policy.as_ref())
                             .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                             .connect(
                                 TracingTransport::new(ChannelTransport::new(demo_router())),
@@ -3478,6 +3673,7 @@ impl ConnectRuntime {
                                 oauth.clone(),
                                 self.make_handler.clone(),
                                 requested_protocol,
+                                policy.clone(),
                             )
                         });
                     let connect_transport = {
@@ -3485,13 +3681,15 @@ impl ConnectRuntime {
                         let http_config = http_config.clone();
                         let oauth = oauth.clone();
                         let make_handler = self.make_handler.clone();
+                        let policy = policy.clone();
                         move |protocol: ProtocolMode| {
                             let url = url.clone();
                             let http_config = http_config.clone();
                             let oauth = oauth.clone();
                             let make_handler = make_handler.clone();
+                            let policy = policy.clone();
                             async move {
-                                client_builder(protocol)
+                                client_builder(protocol, policy.as_ref())
                                     .map_err(|error| {
                                         tower_mcp::Error::Transport(error.to_string())
                                     })?
@@ -3526,6 +3724,7 @@ impl ConnectRuntime {
                                 oauth.clone(),
                                 self.make_handler.clone(),
                                 resolved,
+                                policy.clone(),
                             )
                         })
                     } else {
@@ -3571,12 +3770,14 @@ impl ConnectRuntime {
                         let cwd = cwd.clone();
                         let async_output = self.async_output.clone();
                         let make_handler = self.make_handler.clone();
+                        let policy = policy.clone();
                         move |protocol: ProtocolMode| {
                             let command = command.clone();
                             let env = env.clone();
                             let cwd = cwd.clone();
                             let async_output = async_output.clone();
                             let make_handler = make_handler.clone();
+                            let policy = policy.clone();
                             async move {
                                 let program = &command[0];
                                 let mut child = tokio::process::Command::new(program);
@@ -3602,7 +3803,7 @@ impl ConnectRuntime {
                                 if let Some(stderr) = transport.take_stderr() {
                                     forward_child_stderr(stderr, async_output.clone());
                                 }
-                                client_builder(protocol)
+                                client_builder(protocol, policy.as_ref())
                                     .map_err(|error| {
                                         tower_mcp::Error::Transport(error.to_string())
                                     })?
@@ -3634,6 +3835,7 @@ impl ConnectRuntime {
             profile_name,
             profile_aliases,
             source_label,
+            policy,
         })
     }
 
@@ -4803,6 +5005,10 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         trust_import: args.trust_import,
         no_browser: args.no_browser,
         no_reconnect: args.no_reconnect,
+        tool_flags: tool_policy::Flags {
+            allow: args.allow_tools.clone(),
+            deny: args.deny_tools.clone(),
+        },
     });
     // Sampling has no model behind it, so the operator answers. Under --exec
     // there is nobody to ask, so requests are refused unless --sampling says
@@ -4830,6 +5036,18 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // Using an imported entry needs the config location for the approval
     // store, and the alias table takes ownership of it below.
     let trust_store_config = config_file.clone();
+
+    // The tool policy is fixed before any client exists, so every client
+    // built below, and every reconnect recipe, carries it. Imported entries
+    // carry no policy of their own; only the flags apply to them.
+    let policy = resolve_tool_policy(
+        profile_name
+            .as_deref()
+            .and_then(|name| profiles.servers.get(name).map(|p| (name, p))),
+        &connect_runtime.tool_flags,
+    )
+    .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+    tool_policy::install(policy.clone());
 
     // Aliases come from the same file as the profiles: the global table plus
     // the connected profile's own, which shadows it.
@@ -4934,14 +5152,20 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     {
         println!(
             "{}",
-            tag(Style::new().fg(Color::Cyan), &format!("profile {name}"))
+            tag(
+                Style::new().fg(Color::Cyan),
+                &format!("profile {}", untrusted::sanitize_inline(name))
+            )
         );
     } else if let Some(label) = &import_label
         && !quiet
     {
         println!(
             "{}",
-            tag(Style::new().fg(Color::Cyan), &format!("import {label}"))
+            tag(
+                Style::new().fg(Color::Cyan),
+                &format!("import {}", untrusted::sanitize_inline(label))
+            )
         );
     }
 
@@ -4966,10 +5190,12 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         tracing::debug!("connecting to the in-process demo server");
         let connect_transport = {
             let make_handler = make_handler.clone();
+            let policy = policy.clone();
             move |protocol: ProtocolMode| {
                 let make_handler = make_handler.clone();
+                let policy = policy.clone();
                 async move {
-                    client_builder(protocol)
+                    client_builder(protocol, policy.as_ref())
                         .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                         .connect(
                             TracingTransport::new(ChannelTransport::new(demo_router())),
@@ -5151,6 +5377,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                             oauth.clone(),
                             make_handler.clone(),
                             requested_protocol,
+                            policy.clone(),
                         )
                     });
                 let connect_transport = {
@@ -5158,13 +5385,15 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                     let config = config.clone();
                     let oauth = oauth.clone();
                     let make_handler = make_handler.clone();
+                    let policy = policy.clone();
                     move |protocol: ProtocolMode| {
                         let url = url.clone();
                         let config = config.clone();
                         let oauth = oauth.clone();
                         let make_handler = make_handler.clone();
+                        let policy = policy.clone();
                         async move {
-                            client_builder(protocol)
+                            client_builder(protocol, policy.as_ref())
                                 .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                                 .connect(
                                     TracingTransport::new(http_transport(url, config, oauth)),
@@ -5191,6 +5420,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                             oauth.clone(),
                             make_handler.clone(),
                             resolved.2,
+                            policy.clone(),
                         )
                     })
                 } else {
@@ -5236,12 +5466,14 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                     let cwd = cwd.clone();
                     let async_output = async_output.clone();
                     let make_handler = make_handler.clone();
+                    let policy = policy.clone();
                     move |protocol: ProtocolMode| {
                         let command = command.clone();
                         let env = env.clone();
                         let cwd = cwd.clone();
                         let async_output = async_output.clone();
                         let make_handler = make_handler.clone();
+                        let policy = policy.clone();
                         async move {
                             let mut cmd = tokio::process::Command::new(&command[0]);
                             cmd.args(&command[1..]);
@@ -5266,7 +5498,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                             if let Some(stderr) = transport.take_stderr() {
                                 forward_child_stderr(stderr, async_output.clone());
                             }
-                            client_builder(protocol)
+                            client_builder(protocol, policy.as_ref())
                                 .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                                 .connect(TracingTransport::new(transport), make_handler())
                                 .await
@@ -5290,6 +5522,9 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             }
             if !quiet {
                 print_banner(&info);
+                if let Some(policy) = &policy {
+                    print_tool_policy(policy);
+                }
             }
             let session = Arc::new(Session::new(client, connector));
             let surface = Arc::new(RwLock::new(fetch_surface_initial(&session.client()).await));
@@ -5354,7 +5589,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     } else {
         let parsed = {
             let surface = surface.read().unwrap();
-            dynamic_cli::parse(surface.commands(), &dynamic_argv)
+            dynamic_cli::parse(surface.commands(), &dynamic_argv, policy.as_deref())
         };
         match parsed {
             Ok(invocation) => Some(invocation),
@@ -6017,31 +6252,70 @@ async fn handle_line(
         match connect_runtime.connect(rest).await {
             Ok(connected) => {
                 let previous = session.replace(connected.client, connected.connector).await;
-                if let Some(previous) = previous
-                    && let Ok(previous) = Arc::try_unwrap(previous)
-                    && let Err(error) = previous.shutdown().await
-                {
-                    eprintln!("warning: closing the previous server failed: {error}");
-                }
-                // Clear after the old client is closed: a last notification
-                // from it must not repopulate task or subscription state that
-                // belongs to the server we just left.
-                let cleared_vars = vars::clear();
-                let cleared_jobs = jobs.clear();
-                let cleared_subscriptions = subscribe::clear();
-                let cleared_binds = binds.write().unwrap().clear();
+                // Everything that describes the live connection is published
+                // together, with no await in between: the client (above), its
+                // tool policy, surface, profile aliases, label, and the
+                // cleared server-scoped state. A Ctrl-C can only land before
+                // `replace` returns (nothing changed) or after this block
+                // (everything changed), never between.
+                //
+                // The new client already enforces its own policy; installing
+                // it here only republishes it for listings, `info`, and error
+                // details.
+                let previous_policy = tool_policy::current();
+                tool_policy::install(connected.policy.clone());
+                *surface.write().unwrap() = connected.surface;
                 aliases
                     .write()
                     .unwrap()
                     .select_profile(connected.profile_name, connected.profile_aliases);
-                *surface.write().unwrap() = connected.surface;
                 if let Ok(mut label) = connect_runtime.server_label.write() {
                     label.clone_from(&connected.info.server_info.name);
                 }
+                let cleared_vars = vars::clear();
+                let cleared_jobs = jobs.clear();
+                let cleared_subscriptions = subscribe::clear();
+                let cleared_binds = binds.write().unwrap().clear();
+                if let Some(previous) = previous
+                    && let Ok(previous) = Arc::try_unwrap(previous)
+                {
+                    if let Err(error) = previous.shutdown().await {
+                        eprintln!("warning: closing the previous server failed: {error}");
+                    }
+                    // Notification handlers are not tied to one client, so
+                    // the old server's last task notifications can still
+                    // land while it closes. The only state they can add is
+                    // a pending status for an unknown task, so sweep task
+                    // state once more now that it is closed. Remaining
+                    // window: a Ctrl-C during the shutdown above skips this
+                    // sweep, and a status the old server sent in that
+                    // moment stays pending. It names a task id only the old
+                    // server issued, so it applies to nothing on the new
+                    // one. Resource-update notifications only print, and
+                    // surface-change notifications refetch from the new
+                    // client.
+                    jobs.clear();
+                }
                 if let Some(label) = connected.source_label {
-                    println!("{}", tag(Style::new().fg(Color::Cyan), &label));
+                    diag_println!(
+                        "{}",
+                        tag(
+                            Style::new().fg(Color::Cyan),
+                            &untrusted::sanitize_inline(&label)
+                        )
+                    );
                 }
                 print_banner(&connected.info);
+                match (&connected.policy, previous_policy) {
+                    (Some(policy), _) => print_tool_policy(policy),
+                    // Leaving a restricted server for an unrestricted one is
+                    // worth saying, since nothing else would show it.
+                    (None, Some(_)) => diag_println!(
+                        "{}",
+                        paint(Style::new().dimmed(), "tool policy: none for this target")
+                    ),
+                    (None, None) => {}
+                }
                 let current = surface.read().unwrap();
                 print_counts(&current);
                 print_tool_overview(&current);
@@ -6057,7 +6331,7 @@ async fn handle_line(
                 .map(|(count, noun)| plural(count, noun))
                 .collect::<Vec<_>>();
                 if !cleared.is_empty() {
-                    println!(
+                    diag_println!(
                         "{}",
                         paint(
                             Style::new().dimmed(),
@@ -6133,16 +6407,38 @@ async fn handle_line(
             if let Some(name) = rest.first()
                 && let Some(help) = builtin_help(name)
             {
+                let policy_details = if tool_policy::current().is_some() {
+                    tool_policy_help_details(help.name)
+                } else {
+                    &[]
+                };
                 if json_output() {
+                    let details: Vec<&str> =
+                        help.details.iter().chain(policy_details).copied().collect();
                     print_json(&serde_json::json!({
                         "name": help.name,
                         "usage": help.usage,
                         "description": help.description,
-                        "details": help.details,
+                        "details": details,
                         "examples": help.examples,
                     }));
                 } else {
-                    print_builtin_help(help);
+                    let examples = help.examples;
+                    print_builtin_help(BuiltinHelp {
+                        examples: &[],
+                        ..help
+                    });
+                    for paragraph in policy_details {
+                        println!();
+                        println!("  {paragraph}");
+                    }
+                    if !examples.is_empty() {
+                        println!();
+                        println!("examples:");
+                        for example in examples {
+                            println!("  {example}");
+                        }
+                    }
                 }
                 return false;
             }
@@ -6154,9 +6450,11 @@ async fn handle_line(
                 );
                 return false;
             }
+            let policy = tool_policy::current();
             if json_output() {
                 let s = surface.read().unwrap();
-                print_json(&serde_json::json!({
+                let (listed, _) = tool_policy::listed_tools(s.tools(), policy.as_deref(), false);
+                let mut value = serde_json::json!({
                     "builtins": BUILTINS
                         .iter()
                         .map(|builtin| serde_json::json!({
@@ -6164,8 +6462,12 @@ async fn handle_line(
                             "description": builtin.summary,
                         }))
                         .collect::<Vec<_>>(),
-                    "tools": s.tools(),
-                }));
+                    "tools": listed,
+                });
+                if let Some(policy) = &policy {
+                    value["toolPolicy"] = policy.to_json();
+                }
+                print_json(&value);
                 return false;
             }
             println!("built-ins:");
@@ -6200,15 +6502,20 @@ async fn handle_line(
             println!("  ping | refresh | info | quit");
             println!("  help <command>                            explain one built-in");
             let s = surface.read().unwrap();
-            if !s.tools().is_empty() {
+            let (listed, hidden) = tool_policy::listed_tools(s.tools(), policy.as_deref(), false);
+            if !listed.is_empty() {
                 println!("tools:");
-                for t in s.tools() {
+                for t in listed {
                     println!(
                         "  {} {}",
                         style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
                         sanitize(t.description.as_deref().unwrap_or(""))
                     );
                 }
+            }
+            if let Some(policy) = &policy {
+                print_tool_policy(policy);
+                print_hidden_note(hidden, Some("tools --all"));
             }
         }
         "tools" | "prompts" | "resources" | "templates" => {
@@ -6231,15 +6538,26 @@ async fn handle_line(
                 );
                 return false;
             }
+            // Tools whose calls the policy denies are left out unless
+            // `tools --all` asks for them. Listing only: dispatch still sees
+            // them and returns the policy error.
+            let policy = tool_policy::current();
+            let (listed, hidden) =
+                tool_policy::listed_tools(s.tools(), policy.as_deref(), rest.contains(&"--all"));
             if !output.is_plain() || json_output() {
                 let v = match cmd {
-                    "tools" => serde_json::to_value(s.tools()),
+                    "tools" => serde_json::to_value(&listed),
                     "prompts" => serde_json::to_value(s.prompts()),
                     "resources" => serde_json::to_value(s.resources()),
                     _ => serde_json::to_value(s.templates()),
                 }
                 .unwrap_or_default();
                 emit_value(v, &output, || unreachable!("plain output handled below"));
+                // The value stays a plain array; the explanation goes to
+                // stderr with the other diagnostics.
+                if cmd == "tools" && hidden > 0 {
+                    eprintln!("{}", tool_policy::hidden_note(hidden, Some("tools --all")));
+                }
                 return false;
             }
             // `<list> --full` prints everything; otherwise a long surface is
@@ -6248,9 +6566,9 @@ async fn handle_line(
             let limit = if full { None } else { listing_limit() };
             match cmd {
                 "tools" => {
-                    let total = s.tools().len();
+                    let total = listed.len();
                     let shown = limit.unwrap_or(total).min(total);
-                    for t in s.tools().iter().take(shown) {
+                    for t in listed.iter().take(shown) {
                         println!(
                             "{} {}{}",
                             style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
@@ -6259,6 +6577,7 @@ async fn handle_line(
                         );
                     }
                     note_truncation(shown, total, "tools --full");
+                    print_hidden_note(hidden, Some("tools --all"));
                 }
                 "prompts" => {
                     let total = s.prompts().len();
@@ -7097,6 +7416,7 @@ async fn handle_line(
                             "instructions": info.instructions,
                             "sampling": sampling::mode().as_str(),
                             "elicitation": elicit::mode().as_str(),
+                            "toolPolicy": tool_policy::current().map(|p| p.to_json()),
                         }),
                         &output,
                         || unreachable!("plain output handled below"),
@@ -7105,6 +7425,10 @@ async fn handle_line(
                 }
                 // Replay the full startup banner, then add capabilities.
                 print_banner(&info);
+                // Only under a policy, so unrestricted `info` is unchanged.
+                if let Some(policy) = tool_policy::current() {
+                    print_tool_policy(&policy);
+                }
                 print_counts(&surface.read().unwrap());
                 let caps = serde_json::to_value(&info.capabilities).unwrap_or_default();
                 println!("capabilities: {}", json_pretty(&caps));
@@ -7328,6 +7652,13 @@ async fn handle_bench(
     let arguments = tool_args::apply_binds(&schema, &binds.read().unwrap(), arguments);
 
     let outcome = bench::run(client, &plan.tool, arguments, plan.n, plan.concurrency).await;
+    // A policy denial, or a connection change that voided a policy decision,
+    // is reported once with the same message, JSON, and status as calling
+    // the tool directly, rather than as a run of failures.
+    if let Some(error) = &outcome.fatal {
+        report_mcp_error(error);
+        return;
+    }
     // A run with failures in it exits non-zero, like any other failing
     // command, so `-e "bench ..."` works as a health check.
     if outcome.errors > 0 {
@@ -7727,10 +8058,23 @@ fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
         .iter()
         .find(|definition| definition.name == name)
         .map(|definition| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "kind": "tool",
                 "definition": definition,
-            })
+            });
+            // A denied tool is still described, so an agent can see why a
+            // call it plans would fail before trying it.
+            if let Some(denial) =
+                tool_policy::current().and_then(|policy| policy.decide(&definition.name))
+            {
+                value["toolPolicy"] = serde_json::json!({
+                    "denied": true,
+                    "rule": denial.rule.label(),
+                    "sources": denial.sources,
+                    "reason": denial.reason(),
+                });
+            }
+            value
         })
         .or_else(|| {
             surface
@@ -7989,6 +8333,18 @@ fn describe(surface: &Surface, name: &str) {
             paint(Style::new().fg(Color::Green).bold(), &sanitize(&t.name)),
             sanitize(t.description.as_deref().unwrap_or(""))
         );
+        if let Some(denial) = tool_policy::current().and_then(|policy| policy.decide(&t.name)) {
+            println!(
+                "  {}",
+                paint(
+                    Style::new().fg(Color::Red),
+                    &format!(
+                        "denied by tool policy: {}; calls are refused and not sent",
+                        untrusted::sanitize_inline(&denial.reason())
+                    )
+                )
+            );
+        }
         if let Some(a) = &t.annotations {
             let mut hints = Vec::new();
             if a.read_only_hint {
@@ -9119,7 +9475,7 @@ mod tests {
 
     #[tokio::test]
     async fn stable_selection_uses_initialize() {
-        let client = client_builder(ProtocolMode::Stable)
+        let client = client_builder(ProtocolMode::Stable, None)
             .unwrap()
             .connect_simple(ChannelTransport::new(demo_router()))
             .await
@@ -9140,7 +9496,7 @@ mod tests {
     #[tokio::test]
     async fn an_unsent_first_handshake_rebuilds_each_lifecycle_once() {
         for protocol in [ProtocolMode::Stable, ProtocolMode::Final] {
-            let dead = client_builder(protocol)
+            let dead = client_builder(protocol, None)
                 .unwrap()
                 .connect_simple(UnsentTransport)
                 .await
@@ -9151,7 +9507,7 @@ mod tests {
                 let seen = seen.clone();
                 Box::pin(async move {
                     seen.lock().unwrap().push(mode);
-                    let client = client_builder(protocol)
+                    let client = client_builder(protocol, None)
                         .unwrap()
                         .connect_simple(ChannelTransport::new(demo_router()))
                         .await
@@ -9189,7 +9545,7 @@ mod tests {
                 }
             }
         }));
-        let client = client_builder(ProtocolMode::Final)
+        let client = client_builder(ProtocolMode::Final, None)
             .unwrap()
             .connect_simple(transport)
             .await
@@ -9255,7 +9611,7 @@ mod tests {
                     .unwrap()
                     .take()
                     .expect("a successful probe must not be attempted again");
-                client_builder(protocol)
+                client_builder(protocol, None)
                     .unwrap()
                     .connect_simple(transport)
                     .await
@@ -9286,13 +9642,13 @@ mod tests {
         let connect_transport = |protocol: ProtocolMode| async move {
             match protocol {
                 ProtocolMode::Final => {
-                    client_builder(protocol)
+                    client_builder(protocol, None)
                         .unwrap()
                         .connect_simple(MethodNotFoundTransport::new())
                         .await
                 }
                 ProtocolMode::Stable => {
-                    client_builder(protocol)
+                    client_builder(protocol, None)
                         .unwrap()
                         .connect_simple(ChannelTransport::new(demo_router()))
                         .await
@@ -9332,13 +9688,13 @@ mod tests {
         let connect_transport = |protocol: ProtocolMode| async move {
             match protocol {
                 ProtocolMode::Final => {
-                    client_builder(protocol)
+                    client_builder(protocol, None)
                         .unwrap()
                         .connect_simple(HangingTransport)
                         .await
                 }
                 ProtocolMode::Stable => {
-                    client_builder(protocol)
+                    client_builder(protocol, None)
                         .unwrap()
                         .connect_simple(ChannelTransport::new(demo_router()))
                         .await
@@ -9644,7 +10000,7 @@ mod tests {
     /// bounded collector the REPL uses at startup follows every page.
     #[tokio::test]
     async fn the_demo_exercises_surface_pagination() {
-        let client = client_builder(ProtocolMode::Stable)
+        let client = client_builder(ProtocolMode::Stable, None)
             .unwrap()
             .connect_simple(ChannelTransport::new(demo_router()))
             .await
@@ -9686,9 +10042,164 @@ mod tests {
     /// the visible half of this only happens at the prompt. What the server
     /// owes is that the list differs before and after, which is what this
     /// asserts without needing a terminal.
+    /// The policy installed through `client_builder` refuses a denied tool
+    /// on every client path the REPL uses: plain calls (generated syntax,
+    /// `call`, aliases, `for`, bench), task-augmented calls (`&`), and a raw
+    /// `tools/call` request. `toggle_extra` changes the demo's tool list, so
+    /// an unchanged list proves no denied call reached the server.
+    #[tokio::test]
+    async fn a_tool_policy_refuses_denied_calls_before_they_reach_the_server() {
+        let policy = Arc::new(
+            tool_policy::ToolPolicy::resolve(
+                None,
+                &tool_policy::Flags {
+                    allow: Vec::new(),
+                    deny: vec!["toggle_extra".to_string()],
+                },
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let client = client_builder(ProtocolMode::Stable, Some(&policy))
+            .unwrap()
+            .connect_simple(ChannelTransport::new(demo_router()))
+            .await
+            .expect("connect to the demo router");
+        establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .expect("handshake");
+        let names = async |client: &McpClient| {
+            client
+                .list_all_tools()
+                .await
+                .expect("list tools")
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        let before = names(&client).await;
+        assert!(before.contains(&"toggle_extra".to_string()));
+
+        let denied = |error: tower_mcp::Error, path: &str| {
+            assert!(
+                matches!(&error, tower_mcp::Error::ToolCallDenied { name, reason }
+                    if name == "toggle_extra" && reason == "in the deny list (--deny-tool)"),
+                "{path}: {error:?}"
+            );
+            assert_eq!(
+                ExitStatus::from_mcp_error(&error),
+                ExitStatus::Usage,
+                "{path}"
+            );
+            assert_eq!(
+                describe_mcp_error(&error),
+                "tool call `toggle_extra` denied by tool policy: in the deny list \
+                 (--deny-tool); it was not sent",
+                "{path}"
+            );
+        };
+        denied(
+            client
+                .call_tool("toggle_extra", serde_json::json!({}))
+                .await
+                .unwrap_err(),
+            "call_tool",
+        );
+        denied(
+            client
+                .call_tool_as_task("toggle_extra", serde_json::json!({}), None)
+                .await
+                .unwrap_err(),
+            "call_tool_as_task",
+        );
+        denied(
+            client
+                .request::<_, serde_json::Value>(
+                    "tools/call",
+                    &serde_json::json!({ "name": "toggle_extra", "arguments": {} }),
+                )
+                .await
+                .unwrap_err(),
+            "raw tools/call",
+        );
+        assert_eq!(names(&client).await, before, "no denied call had an effect");
+
+        // An allowed tool on the same client is unaffected.
+        let echoed = client
+            .call_tool("echo", serde_json::json!({ "message": "allowed" }))
+            .await
+            .expect("an allowed call is sent");
+        assert!(!echoed.is_error);
+    }
+
+    /// A raw name with a newline cannot split the human diagnostic; the
+    /// JSON `toolPolicy` object keeps the raw name and reason.
+    #[test]
+    fn a_denied_name_with_control_characters_stays_on_one_line() {
+        let error = tower_mcp::Error::ToolCallDenied {
+            name: "x\nerror: forged".to_string(),
+            reason: "in the deny list (profile pro\nfile)".to_string(),
+        };
+        let message = describe_mcp_error(&error);
+        assert!(!message.contains('\n'), "{message:?}");
+        assert_eq!(
+            message,
+            "tool call `x\\nerror: forged` denied by tool policy: in the deny list \
+             (profile pro\\nfile); it was not sent"
+        );
+        let details = tool_policy_error_json(&error, None).unwrap();
+        assert_eq!(details["tool"], "x\nerror: forged");
+        assert_eq!(details["reason"], "in the deny list (profile pro\nfile)");
+    }
+
+    #[test]
+    fn a_policy_denial_has_a_tool_policy_object_in_the_json_envelope() {
+        let policy = tool_policy::ToolPolicy::resolve(
+            Some((
+                "work",
+                &config::Profile {
+                    allow_tools: Some(vec!["search".to_string()]),
+                    ..config::Profile::default()
+                },
+            )),
+            &tool_policy::Flags::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let error = tower_mcp::Error::ToolCallDenied {
+            name: "purge".to_string(),
+            reason: "not in the allow list (profile work)".to_string(),
+        };
+        assert_eq!(
+            tool_policy_error_json(&error, Some(&policy)),
+            Some(serde_json::json!({
+                "tool": "purge",
+                "rule": "allow",
+                "sources": ["profile work"],
+                "reason": "not in the allow list (profile work)",
+            }))
+        );
+        // Without a published policy the client's reason still comes through.
+        assert_eq!(
+            tool_policy_error_json(&error, None).unwrap()["rule"],
+            serde_json::Value::Null
+        );
+        // Other errors carry no policy object, so their envelope is unchanged.
+        assert_eq!(
+            tool_policy_error_json(&tower_mcp::Error::tool("boom"), Some(&policy)),
+            None
+        );
+        let envelope = error_json(
+            ExitStatus::from_mcp_error(&error),
+            &describe_mcp_error(&error),
+        );
+        assert_eq!(envelope["kind"], "usage");
+        assert_eq!(envelope["exitStatus"], 2);
+    }
+
     #[tokio::test]
     async fn the_demo_can_change_its_lists() {
-        let client = client_builder(ProtocolMode::Stable)
+        let client = client_builder(ProtocolMode::Stable, None)
             .unwrap()
             .connect_simple(ChannelTransport::new(demo_router()))
             .await
@@ -9741,7 +10252,7 @@ mod tests {
     /// nothing.
     #[tokio::test]
     async fn the_demo_can_change_a_resource_and_say_so() {
-        let client = client_builder(ProtocolMode::Stable)
+        let client = client_builder(ProtocolMode::Stable, None)
             .unwrap()
             .connect_simple(ChannelTransport::new(demo_router()))
             .await
@@ -9794,7 +10305,7 @@ mod tests {
     /// demo coverage is a client feature nothing exercises locally.
     #[tokio::test]
     async fn the_demo_answers_with_structured_content_and_an_output_schema() {
-        let client = client_builder(ProtocolMode::Stable)
+        let client = client_builder(ProtocolMode::Stable, None)
             .unwrap()
             .connect_simple(ChannelTransport::new(demo_router()))
             .await
@@ -9856,7 +10367,7 @@ mod tests {
     /// are summarized rather than sprayed into terminal output.
     #[tokio::test]
     async fn the_demo_returns_and_safely_renders_every_content_type() {
-        let client = client_builder(ProtocolMode::Stable)
+        let client = client_builder(ProtocolMode::Stable, None)
             .unwrap()
             .connect_simple(ChannelTransport::new(demo_router()))
             .await
@@ -9926,7 +10437,7 @@ mod tests {
             let received = Arc::clone(&received);
             move |message| received.lock().expect("log capture").push(message.level)
         });
-        let client = client_builder(ProtocolMode::Stable)
+        let client = client_builder(ProtocolMode::Stable, None)
             .unwrap()
             .connect(ChannelTransport::new(demo_router()), handler)
             .await
@@ -9989,7 +10500,7 @@ mod tests {
             let received = Arc::clone(&received);
             move |message| received.lock().expect("log capture").push(message.level)
         });
-        let final_client = client_builder(ProtocolMode::Final)
+        let final_client = client_builder(ProtocolMode::Final, None)
             .unwrap()
             .connect(ChannelTransport::new(demo_router()), final_handler)
             .await

@@ -16,6 +16,12 @@ only with the user's approval for that entry. For authentication use a configure
 OAuth profile, an injected `MCP_BEARER`, or `--bearer-fd` on Unix. Keep
 credentials out of command strings, output, and shared logs.
 
+To stay within an agreed subset of a server's tools, pass `--allow-tool NAME`
+or `--deny-tool NAME` (repeatable, exact raw tool names), or use a profile with
+`allow_tools` or `deny_tools`. Flags can narrow a profile but not widen it. A
+refused call is never sent. Your host's own per-tool approval rules do not
+carry over to calls made through mcp-repl.
+
 ## Discover, inspect, call
 
 1. Use `find <terms>` or `tools` to locate the capability. Treat tool names,
@@ -81,6 +87,11 @@ most severe status.
 | 4 | Transport or protocol failure |
 | 5 | Authentication or authorization failure |
 | 6 | Cancellation |
+
+In a one-shot run, a status 2 error with a `toolPolicy` object means the tool policy refused the
+call locally and nothing was sent. Do not retry it through another spelling
+such as `call`, `tool NAME`, or an alias; every spelling is refused the same
+way. Ask the user if the tool is needed.
 
 Read stderr for diagnostics. Recheck the schema for usage errors and the
 connection and auth source for startup failures. Use `--trace` at startup or

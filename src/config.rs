@@ -20,6 +20,8 @@
 //! [servers.work]
 //! transport = "http"
 //! oauth = "work"
+//! allow_tools = ["search", "get_issue"]
+//! deny_tools = ["delete_repo"]
 //!
 //! [servers.local]
 //! transport = "stdio"
@@ -35,6 +37,10 @@
 //!
 //! Tokens are read from the environment via `bearer_env` rather than stored in
 //! the file; an inline `bearer` literal works but warns.
+//!
+//! `allow_tools` and `deny_tools` restrict which raw MCP tool names the
+//! profile may call; `--allow-tool` and `--deny-tool` can narrow them
+//! further. The rules live in `tool_policy`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -101,6 +107,13 @@ pub struct Profile {
     /// file-level `[aliases]` of the same name.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// Exact raw MCP tool names this profile may call. Unset means no allow
+    /// list; an empty list allows no tool calls. See `tool_policy`.
+    pub allow_tools: Option<Vec<String>>,
+    /// Exact raw MCP tool names this profile may not call. Deny wins over
+    /// allow.
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
 }
 
 /// Non-secret OAuth metadata stored under `[oauth.<name>]`.
@@ -315,7 +328,7 @@ impl Profile {
 
     /// A one-line summary for `--list-servers`.
     pub fn summary(&self) -> String {
-        match self.transport() {
+        let target = match self.transport() {
             Ok(Transport::Http) => format!(
                 "http   {}",
                 self.url
@@ -324,8 +337,24 @@ impl Profile {
                     .unwrap_or("(no url)")
             ),
             Ok(Transport::Stdio) => format!("stdio  {}", self.command.join(" ")),
-            Err(e) => format!("(invalid: {e})"),
+            Err(e) => return format!("(invalid: {e})"),
+        };
+        match self.tool_policy_summary() {
+            Some(policy) => format!("{target}  [{policy}]"),
+            None => target,
         }
+    }
+
+    /// Counts of the profile's tool allow and deny entries, or `None` when it
+    /// sets neither. Names stay out of the one-line listing.
+    pub fn tool_policy_summary(&self) -> Option<String> {
+        let allow = self
+            .allow_tools
+            .as_ref()
+            .map(|allow| format!("allow {}", allow.len()));
+        let deny = (!self.deny_tools.is_empty()).then(|| format!("deny {}", self.deny_tools.len()));
+        let parts: Vec<String> = allow.into_iter().chain(deny).collect();
+        (!parts.is_empty()).then(|| format!("tool policy: {}", parts.join(", ")))
     }
 }
 
@@ -390,6 +419,11 @@ mod tests {
         assert!(any(&|p| !p.headers.is_empty()), "headers");
         assert!(any(&|p| !p.command.is_empty()), "command");
         assert!(any(&|p| !p.aliases.is_empty()), "profile aliases");
+        assert!(
+            any(&|p| p.allow_tools.as_ref().is_some_and(|a| !a.is_empty())),
+            "allow_tools"
+        );
+        assert!(any(&|p| !p.deny_tools.is_empty()), "deny_tools");
 
         // Both transports are represented, since they are configured
         // differently and showing only one leaves the other undocumented.
@@ -721,6 +755,33 @@ aliases = { dl = "get_downloads crate" }
     #[test]
     fn a_config_without_aliases_parses_to_none_of_them() {
         assert!(Config::parse(SAMPLE).unwrap().aliases.is_empty());
+    }
+
+    #[test]
+    fn tool_policy_keys_parse_and_distinguish_unset_from_empty() {
+        let config = Config::parse(
+            "[servers.a]\nurl = \"https://a\"\nallow_tools = [\"search\"]\n\
+             deny_tools = [\"purge\", \"wipe\"]\n\
+             [servers.b]\nurl = \"https://b\"\nallow_tools = []\n\
+             [servers.c]\nurl = \"https://c\"\n",
+        )
+        .unwrap();
+        let a = config.profile("a").unwrap();
+        assert_eq!(a.allow_tools.as_deref(), Some(&["search".to_string()][..]));
+        assert_eq!(a.deny_tools, ["purge", "wipe"]);
+        assert_eq!(
+            a.summary(),
+            "http   https://a  [tool policy: allow 1, deny 2]"
+        );
+        let b = config.profile("b").unwrap();
+        assert_eq!(b.allow_tools.as_deref(), Some(&[][..]));
+        assert_eq!(
+            b.tool_policy_summary().as_deref(),
+            Some("tool policy: allow 0")
+        );
+        let c = config.profile("c").unwrap();
+        assert!(c.allow_tools.is_none() && c.deny_tools.is_empty());
+        assert_eq!(c.summary(), "http   https://c");
     }
 
     #[test]

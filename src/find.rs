@@ -216,7 +216,19 @@ fn parse_limit(flag: &str, raw: &str) -> Result<usize, String> {
 }
 
 /// Every entry of the surface matching the parsed query, best first.
+#[cfg(test)]
 pub fn search_query(surface: &Surface, query: &Query) -> Vec<Hit> {
+    search_query_where(surface, query, |_| true).0
+}
+
+/// [`search_query`] restricted to the hits `keep` accepts, plus how many
+/// matching hits it left out. The filter runs before `-m`, so a capped search
+/// returns the best hits that are actually shown rather than fewer.
+pub fn search_query_where(
+    surface: &Surface,
+    query: &Query,
+    keep: impl Fn(&Hit) -> bool,
+) -> (Vec<Hit>, usize) {
     let matcher = match &query.regex {
         Some(regex) => Matcher::Pattern(regex),
         None => Matcher::Text(if query.case_sensitive {
@@ -226,10 +238,13 @@ pub fn search_query(surface: &Surface, query: &Query) -> Vec<Hit> {
         }),
     };
     let mut hits = search_matching(surface, &matcher, query.case_sensitive, &query.kinds);
+    let before = hits.len();
+    hits.retain(|hit| keep(hit));
+    let left_out = before - hits.len();
     if let Some(limit) = query.limit {
         hits.truncate(limit);
     }
-    hits
+    (hits, left_out)
 }
 
 /// Every entry of the surface matching `query`, best first.
@@ -620,6 +635,20 @@ mod tests {
         assert_eq!(capped.len(), 1);
         // The cap applies after ranking, so the survivor is the best one.
         assert_eq!(capped[0].name, all[0].name);
+    }
+
+    /// A filtered-out hit does not use up the cap: with the best match
+    /// hidden, `-m 1` returns the next one rather than nothing.
+    #[test]
+    fn a_filter_runs_before_the_limit() {
+        let s = surface();
+        let all = search_query(&s, &q(&["download"]));
+        let best = all[0].name.clone();
+        let (capped, left_out) =
+            search_query_where(&s, &q(&["-m", "1", "download"]), |hit| hit.name != best);
+        assert_eq!(left_out, 1);
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].name, all[1].name);
     }
 
     #[test]

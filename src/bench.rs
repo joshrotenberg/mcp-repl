@@ -124,12 +124,23 @@ pub struct Outcome {
     pub first_error: Option<String>,
     /// Wall-clock time for the whole run.
     pub total: Duration,
+    /// A failure that ends the run, kept as the typed error so the caller
+    /// reports it exactly as a direct call would: a tool policy denial (every
+    /// call names the same tool, so the rest would be refused too, and none
+    /// was sent), or a connection change that invalidated a pending policy
+    /// decision.
+    pub fatal: Option<tower_mcp::Error>,
 }
 
 impl Outcome {
     fn record(&mut self, call: Call) {
         match call {
             Call::Ok(elapsed) => self.latencies.push(elapsed),
+            Call::Fatal(error) => {
+                if self.fatal.is_none() {
+                    self.fatal = Some(error);
+                }
+            }
             Call::Err(message) => {
                 self.errors += 1;
                 if self.first_error.is_none() {
@@ -175,6 +186,8 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 enum Call {
     Ok(Duration),
     Err(String),
+    /// Ends the run; see [`Outcome::fatal`].
+    Fatal(tower_mcp::Error),
 }
 
 /// One call, timed. A tool that returns `isError` counts as a failure: it did
@@ -186,6 +199,10 @@ async fn call_once(client: &McpClient, tool: &str, arguments: serde_json::Value)
     match crate::with_deadline(client.call_tool(tool, arguments)).await {
         Ok(result) if result.is_error => Call::Err(error_text(&result)),
         Ok(_) => Call::Ok(started.elapsed()),
+        Err(
+            e
+            @ (tower_mcp::Error::ToolCallDenied { .. } | tower_mcp::Error::ToolCallContextChanged),
+        ) => Call::Fatal(e),
         Err(e) => Call::Err(e.to_string()),
     }
 }
@@ -221,6 +238,9 @@ pub async fn run(
     if concurrency <= 1 {
         for _ in 0..n {
             outcome.record(call_once(client, tool, arguments.clone()).await);
+            if outcome.fatal.is_some() {
+                break;
+            }
         }
         outcome.total = started.elapsed();
         return outcome;
@@ -230,13 +250,21 @@ pub async fn run(
     // each, so one slow call does not leave its worker's remaining share
     // queued behind it while others sit idle.
     let remaining = Arc::new(AtomicUsize::new(n));
-    let mut workers = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
+    // A `JoinSet` aborts its tasks when dropped. Cancelling the command
+    // (Ctrl-C drops this future) therefore stops every worker, rather than
+    // leaving them sending calls through a client the REPL may already have
+    // replaced with another server's.
+    let mut workers = tokio::task::JoinSet::new();
+    // Task id to worker index, so results are recorded in worker order
+    // (keeping `first_error` what it was before the `JoinSet`) whatever order
+    // the workers finish in, including a worker that panicked.
+    let mut worker_index = std::collections::HashMap::with_capacity(concurrency);
+    for index in 0..concurrency {
         let client = client.clone();
         let tool = tool.to_string();
         let arguments = arguments.clone();
         let remaining = remaining.clone();
-        workers.push(tokio::spawn(async move {
+        let handle = workers.spawn(async move {
             let mut calls = Vec::new();
             while remaining
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
@@ -244,19 +272,31 @@ pub async fn run(
                 })
                 .is_ok()
             {
-                calls.push(call_once(&client, &tool, arguments.clone()).await);
-            }
-            calls
-        }));
-    }
-    for worker in workers {
-        match worker.await {
-            Ok(calls) => {
-                for call in calls {
-                    outcome.record(call);
+                let call = call_once(&client, &tool, arguments.clone()).await;
+                let fatal = matches!(call, Call::Fatal(_));
+                calls.push(call);
+                if fatal {
+                    // Stop every worker: the remaining calls would fail the
+                    // same way.
+                    remaining.store(0, Ordering::Relaxed);
+                    break;
                 }
             }
-            Err(e) => outcome.record(Call::Err(format!("bench worker failed: {e}"))),
+            calls
+        });
+        worker_index.insert(handle.id(), index);
+    }
+    let mut finished: Vec<Option<Vec<Call>>> = (0..concurrency).map(|_| None).collect();
+    while let Some(worker) = workers.join_next_with_id().await {
+        let (id, calls) = match worker {
+            Ok((id, calls)) => (id, calls),
+            Err(e) => (e.id(), vec![Call::Err(format!("bench worker failed: {e}"))]),
+        };
+        finished[worker_index[&id]] = Some(calls);
+    }
+    for calls in finished.into_iter().flatten() {
+        for call in calls {
+            outcome.record(call);
         }
     }
     outcome.total = started.elapsed();
@@ -341,6 +381,7 @@ mod tests {
             errors,
             first_error: (errors > 0).then(|| "boom".to_string()),
             total: Duration::from_millis(millis.iter().sum::<u64>()),
+            fatal: None,
         }
     }
 
@@ -464,6 +505,10 @@ mod tests {
     // The run path against the in-process demo router: no socket, no child
     // process, but a real client and real `tools/call` round trips.
     async fn demo_client() -> Arc<McpClient> {
+        demo_client_with(None).await
+    }
+
+    async fn demo_client_with(policy: Option<crate::tool_policy::ToolPolicy>) -> Arc<McpClient> {
         use crate::elicit::ReplClientHandler;
         use std::sync::atomic::AtomicBool;
         use tower_mcp::client::{ChannelTransport, NotificationHandler};
@@ -474,12 +519,90 @@ mod tests {
             Arc::new(std::sync::RwLock::new("bench".to_string())),
             crate::output::AsyncOutput::new(Arc::new(AtomicBool::new(false)), false),
         );
-        let client = McpClient::builder()
+        let mut builder = McpClient::builder();
+        if let Some(policy) = policy {
+            builder = builder.tool_call_policy(policy);
+        }
+        let client = builder
             .connect(ChannelTransport::new(crate::demo_router()), handler)
             .await
             .unwrap();
         client.initialize("bench-test", "0").await.unwrap();
         Arc::new(client)
+    }
+
+    /// Cancelling a run, as Ctrl-C does by dropping the command's future,
+    /// stops its workers: each holds a clone of the client, and every clone
+    /// is released once the aborted tasks are gone.
+    #[tokio::test]
+    async fn dropping_a_concurrent_run_stops_its_workers() {
+        let client = demo_client().await;
+        let args = serde_json::json!({ "a": 1, "b": 2 });
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            run(&client, "slow_add", args, 9, 3),
+        )
+        .await;
+        assert!(cancelled.is_err(), "slow_add should outlast the timeout");
+        for _ in 0..50 {
+            if Arc::strong_count(&client) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "bench workers outlived the cancelled run: {} client handles remain",
+            Arc::strong_count(&client)
+        );
+    }
+
+    /// A connection change that voids a policy decision ends the run and
+    /// stays typed, so the caller reports it with the transport status.
+    #[test]
+    fn a_voided_policy_decision_ends_the_run_with_its_typed_error() {
+        let mut outcome = Outcome::default();
+        outcome.record(Call::Fatal(tower_mcp::Error::ToolCallContextChanged));
+        outcome.record(Call::Err("later".to_string()));
+        let fatal = outcome.fatal.as_ref().expect("the run's fatal error");
+        assert!(matches!(fatal, tower_mcp::Error::ToolCallContextChanged));
+        assert_eq!(
+            crate::exit_status::ExitStatus::from_mcp_error(fatal),
+            crate::exit_status::ExitStatus::Transport
+        );
+    }
+
+    /// A denied tool stops the run at its first call, sequential or
+    /// concurrent, and surfaces tower-mcp's typed denial rather than a count
+    /// of failures.
+    #[tokio::test]
+    async fn a_policy_denial_stops_the_run() {
+        let policy = crate::tool_policy::ToolPolicy::resolve(
+            None,
+            &crate::tool_policy::Flags {
+                allow: Vec::new(),
+                deny: vec!["echo".to_string()],
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let client = demo_client_with(Some(policy)).await;
+        for concurrency in [1, 3] {
+            let o = run(
+                &client,
+                "echo",
+                serde_json::json!({ "message": "hi" }),
+                6,
+                concurrency,
+            )
+            .await;
+            assert!(
+                matches!(&o.fatal, Some(tower_mcp::Error::ToolCallDenied { name, .. }) if name == "echo"),
+                "concurrency {concurrency}: {:?}",
+                o.fatal
+            );
+            assert!(o.latencies.is_empty());
+            assert_eq!(o.errors, 0);
+        }
     }
 
     #[tokio::test]
