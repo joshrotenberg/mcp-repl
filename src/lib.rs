@@ -66,6 +66,8 @@ mod editor;
 mod elicit;
 mod exit_status;
 mod find;
+#[cfg_attr(not(unix), allow(dead_code))]
+mod host_input;
 pub mod import_config;
 mod import_trust;
 mod jobs;
@@ -271,6 +273,27 @@ struct Args {
     /// bearer, Authorization header, and OAuth credential source.
     #[arg(long, value_name = "FD", hide_short_help = true)]
     bearer_fd: Option<i32>,
+
+    /// Exchange elicitation and sampling requests with a host over an
+    /// inherited connected Unix socket. Requires --json.
+    #[arg(
+        long,
+        value_name = "FD",
+        requires = "json",
+        conflicts_with_all = ["elicitation", "sampling", "list_servers", "scan", "login", "logout", "man", "completions"],
+        hide_short_help = true
+    )]
+    host_input_fd: Option<i32>,
+
+    /// Maximum wait for each host answer, in seconds (default 30).
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "host_input_fd",
+        value_parser = clap::value_parser!(u64).range(1..=120),
+        hide_short_help = true
+    )]
+    host_input_timeout: Option<u64>,
 
     /// Extra header for an authenticated `--http` server, as `Name: Value`
     /// (repeatable). Split on the first colon.
@@ -1652,7 +1675,11 @@ async fn establish_initial_connection(
     connector: Option<&Connector>,
     protocol: ProtocolMode,
 ) -> tower_mcp::Result<(McpClient, ConnectionInfo)> {
-    let first = match establish_connection_retrying(&client, protocol).await {
+    let result = tokio::select! {
+        () = host_input::lost() => Err(host_input::lost_error()),
+        result = establish_connection_retrying(&client, protocol) => result,
+    };
+    let first = match result {
         Ok(info) => return Ok((client, info)),
         Err(error) => error,
     };
@@ -1718,7 +1745,7 @@ fn client_builder(
     protocol: ProtocolMode,
     policy: Option<&Arc<tool_policy::ToolPolicy>>,
 ) -> Result<McpClientBuilder, ProtocolSupportError> {
-    let mut builder = McpClient::builder()
+    let builder = McpClient::builder()
         .protocol_support(protocol.support()?)
         .with_elicitation()
         .with_sampling()
@@ -1726,6 +1753,20 @@ fn client_builder(
         // carrying a token on the request. Without this the REPL renders
         // progress lines it can never receive.
         .request_progress();
+    let mut builder = if host_input::enabled() {
+        // with_capabilities replaces the whole set. Keep these declarations
+        // in sync with the setters above. Final Tasks are added below.
+        builder.with_capabilities(tower_mcp::protocol::ClientCapabilities {
+            elicitation: Some(tower_mcp::protocol::ElicitationCapability {
+                form: Some(Default::default()),
+                url: Some(Default::default()),
+            }),
+            sampling: Some(Default::default()),
+            ..Default::default()
+        })
+    } else {
+        builder
+    };
     if let Some(policy) = policy {
         builder = builder.tool_call_policy(policy.clone());
     }
@@ -1777,30 +1818,45 @@ async fn resolve_protocol<F, Fut>(
     requested: ProtocolMode,
     connector: Option<&Connector>,
     connect_transport: F,
-) -> tower_mcp::Result<(McpClient, ConnectionInfo, ProtocolMode)>
+) -> tower_mcp::Result<(
+    McpClient,
+    ConnectionInfo,
+    ProtocolMode,
+    Option<host_input::Connection>,
+)>
 where
-    F: Fn(ProtocolMode) -> Fut,
+    F: Fn(ProtocolMode, Option<host_input::Connection>) -> Fut,
     Fut: Future<Output = tower_mcp::Result<McpClient>>,
 {
     if requested != ProtocolMode::Auto {
-        let client = connect_transport(requested).await?;
+        let host = host_input::Connection::candidate();
+        let client = connect_transport(requested, host).await?;
         let (client, info) = establish_initial_connection(client, connector, requested).await?;
-        return Ok((client, info, requested));
+        return Ok((client, info, requested, host));
     }
 
-    let probe_client = connect_transport(ProtocolMode::Final).await?;
-    match with_probe_deadline(establish_connection(&probe_client, ProtocolMode::Final)).await {
-        Ok(info) => Ok((probe_client, info, ProtocolMode::Final)),
+    let host = host_input::Connection::candidate();
+    let probe_client = connect_transport(ProtocolMode::Final, host).await?;
+    let probe = tokio::select! {
+        () = host_input::lost() => {
+            let _ = probe_client.shutdown().await;
+            return Err(host_input::lost_error());
+        }
+        result = with_probe_deadline(establish_connection(&probe_client, ProtocolMode::Final)) => result,
+    };
+    match probe {
+        Ok(info) => Ok((probe_client, info, ProtocolMode::Final, host)),
         Err(error) if is_modern_incompatible(&error) => Err(error),
         Err(_legacy_signal) => {
             // Close the probe connection in an orderly way rather than
             // dropping it: a stdio child must see its stdin close and be
             // reaped, not linger as an orphan while a second child spawns.
             let _ = probe_client.shutdown().await;
-            let client = connect_transport(ProtocolMode::Stable).await?;
+            let host = host_input::Connection::candidate();
+            let client = connect_transport(ProtocolMode::Stable, host).await?;
             let (client, info) =
                 establish_initial_connection(client, None, ProtocolMode::Stable).await?;
-            Ok((client, info, ProtocolMode::Stable))
+            Ok((client, info, ProtocolMode::Stable, host))
         }
     }
 }
@@ -2113,7 +2169,7 @@ where
     let seen = session.generation();
     // Each attempt gets its own deadline: the retry only happens after a
     // reconnect, so it is a fresh request rather than a continuation.
-    let err = match with_deadline(op(session.client())).await {
+    let err = match with_deadline(host_input::command_request(op(session.client()))).await {
         Ok(value) => return Ok(value),
         Err(e) => e,
     };
@@ -2213,10 +2269,14 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
                 if is_not_initialized(&e) {
                     at.not_initialized = true;
                 } else {
-                    eprintln!(
-                        "warning: fetching {what} failed: {}",
-                        describe_mcp_error(&e)
-                    );
+                    if host_input::enabled() {
+                        eprintln!("warning: fetching {what} failed");
+                    } else {
+                        eprintln!(
+                            "warning: fetching {what} failed: {}",
+                            describe_mcp_error(&e)
+                        );
+                    }
                     // A part the REPL could not read is a failure of the run,
                     // not an empty result: without this an --exec script that
                     // asked for the tools of an unreadable server exits 0
@@ -3286,6 +3346,14 @@ fn forward_child_stderr(stderr: tokio::process::ChildStderr, output: AsyncOutput
     });
 }
 
+fn server_stderr_policy() -> std::process::Stdio {
+    if host_input::enabled() {
+        std::process::Stdio::null()
+    } else {
+        std::process::Stdio::piped()
+    }
+}
+
 /// Watch one task until it reaches a terminal state. Final clients open a
 /// task-scoped `subscriptions/listen` stream for immediate notifications; the
 /// bounded polling loop remains authoritative for stable servers and for a
@@ -3372,6 +3440,11 @@ fn http_transport(
     oauth: Option<OAuthRuntime>,
 ) -> HttpClientTransport {
     let transport = HttpClientTransport::with_config(url, config);
+    let transport = if host_input::enabled() {
+        transport.disable_session_recovery()
+    } else {
+        transport
+    };
     match oauth {
         Some(oauth) => transport.with_scope_aware_token_provider(
             oauth.flow,
@@ -3442,6 +3515,7 @@ struct ConnectedTarget {
     client: McpClient,
     connector: Option<Connector>,
     info: ConnectionInfo,
+    host: Option<host_input::Connection>,
     surface: Surface,
     profile_name: Option<String>,
     profile_aliases: std::collections::BTreeMap<String, String>,
@@ -3587,11 +3661,11 @@ impl ConnectRuntime {
 
         let mut connector = None;
         let requested_protocol = self.protocol;
-        let (client, info) = if demo {
+        let (client, info, host) = if demo {
             let connect_transport = {
                 let make_handler = self.make_handler.clone();
                 let policy = policy.clone();
-                move |protocol: ProtocolMode| {
+                move |protocol: ProtocolMode, host| {
                     let make_handler = make_handler.clone();
                     let policy = policy.clone();
                     async move {
@@ -3599,17 +3673,17 @@ impl ConnectRuntime {
                             .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                             .connect(
                                 TracingTransport::new(ChannelTransport::new(demo_router())),
-                                make_handler(),
+                                make_handler().with_host(host),
                             )
                             .await
                     }
                 }
             };
-            let (client, info, _resolved) =
+            let (client, info, _resolved, host) =
                 resolve_protocol(requested_protocol, None, connect_transport)
                     .await
                     .map_err(ConnectFailure::mcp)?;
-            (client, info)
+            (client, info, host)
         } else {
             match connection.expect("non-demo targets resolve a connection") {
                 config::Connection::Http {
@@ -3682,7 +3756,7 @@ impl ConnectRuntime {
                         let oauth = oauth.clone();
                         let make_handler = self.make_handler.clone();
                         let policy = policy.clone();
-                        move |protocol: ProtocolMode| {
+                        move |protocol: ProtocolMode, host| {
                             let url = url.clone();
                             let http_config = http_config.clone();
                             let oauth = oauth.clone();
@@ -3699,13 +3773,13 @@ impl ConnectRuntime {
                                             http_config,
                                             oauth,
                                         )),
-                                        make_handler(),
+                                        make_handler().with_host(host),
                                     )
                                     .await
                             }
                         }
                     };
-                    let (client, info, resolved) = resolve_protocol(
+                    let (client, info, resolved, host) = resolve_protocol(
                         requested_protocol,
                         pre_negotiated_connector.as_ref(),
                         connect_transport,
@@ -3730,7 +3804,7 @@ impl ConnectRuntime {
                     } else {
                         pre_negotiated_connector
                     };
-                    (client, info)
+                    (client, info, host)
                 }
                 config::Connection::Stdio { command, env, cwd } => {
                     if self.bearer_from_fd.is_some() {
@@ -3771,7 +3845,7 @@ impl ConnectRuntime {
                         let async_output = self.async_output.clone();
                         let make_handler = self.make_handler.clone();
                         let policy = policy.clone();
-                        move |protocol: ProtocolMode| {
+                        move |protocol: ProtocolMode, host| {
                             let command = command.clone();
                             let env = env.clone();
                             let cwd = cwd.clone();
@@ -3792,7 +3866,7 @@ impl ConnectRuntime {
                                 if let Some(cwd) = cwd {
                                     child.current_dir(cwd);
                                 }
-                                child.stderr(std::process::Stdio::piped());
+                                child.stderr(server_stderr_policy());
                                 let mut transport = StdioClientTransport::spawn_command(&mut child)
                                     .await
                                     .map_err(|error| {
@@ -3807,16 +3881,19 @@ impl ConnectRuntime {
                                     .map_err(|error| {
                                         tower_mcp::Error::Transport(error.to_string())
                                     })?
-                                    .connect(TracingTransport::new(transport), make_handler())
+                                    .connect(
+                                        TracingTransport::new(transport),
+                                        make_handler().with_host(host),
+                                    )
                                     .await
                             }
                         }
                     };
-                    let (client, info, _resolved) =
+                    let (client, info, _resolved, host) =
                         resolve_protocol(requested_protocol, None, connect_transport)
                             .await
                             .map_err(ConnectFailure::mcp)?;
-                    (client, info)
+                    (client, info, host)
                 }
             }
         };
@@ -3831,6 +3908,7 @@ impl ConnectRuntime {
             client,
             connector,
             info,
+            host,
             surface,
             profile_name,
             profile_aliases,
@@ -4282,6 +4360,15 @@ fn plugin_matches(
         return Ok(None);
     }
     let root = root_command();
+    if args.host_input_fd.is_some() {
+        // Reject before plugin management can launch a provider process with
+        // an inherited descriptor we have not claimed.
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--host-input-fd is not applicable to plugin management",
+        )
+        .with_cmd(&root));
+    }
     for arg in root.get_arguments() {
         let id = arg.get_id();
         if id != "json"
@@ -4798,7 +4885,9 @@ pub fn run_cli() {
         }
         return;
     }
-    init_tracing(&args);
+    if args.host_input_fd.is_none() {
+        init_tracing(&args);
+    }
 
     // Generators write to stdout and exit. They are checked before anything
     // else so a packaging script never needs a config file, a server, or a
@@ -4813,7 +4902,7 @@ pub fn run_cli() {
     }
 
     style::init(args.color);
-    wire::init(args.trace);
+    wire::init(args.trace && args.host_input_fd.is_none());
     JSON_OUTPUT.store(args.json, Ordering::Relaxed);
 
     // CLI and ambient sources need no config or runtime to identify. Reject
@@ -4831,6 +4920,19 @@ pub fn run_cli() {
     )
     .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
 
+    if args.host_input_fd.is_some() && args.host_input_fd == args.bearer_fd {
+        exit_with_error(
+            ExitStatus::Usage,
+            "--host-input-fd and --bearer-fd require distinct descriptors",
+        );
+    }
+    let host_input = args
+        .host_input_fd
+        .map(host_input::Endpoint::claim)
+        .transpose()
+        .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+    let host_timeout = Duration::from_secs(args.host_input_timeout.unwrap_or(30));
+
     // Consume inherited secret input before Tokio opens any runtime file
     // descriptors. Otherwise a closed descriptor number supplied by the
     // caller could be reused by the runtime before we validate it.
@@ -4845,7 +4947,27 @@ pub fn run_cli() {
         .build()
         .expect("build Tokio runtime");
 
-    if let Err(error) = runtime.block_on(run(args, bearer_from_fd)) {
+    let result = runtime.block_on(async {
+        let session = run(args, bearer_from_fd);
+        match host_input {
+            Some(endpoint) => endpoint.run(host_timeout, session).await,
+            None => session.await,
+        }
+    });
+    if let Err(error) = result {
+        if host_input::enabled() {
+            // If the host disappeared during a graceful close, abort any
+            // remaining transport work before exiting the process.
+            runtime.shutdown_timeout(Duration::from_millis(250));
+        }
+        if host_input::enabled()
+            && matches!(&error, tower_mcp::Error::Transport(message) if message == host_input::CHANNEL_CLOSED)
+        {
+            // A running command reports its own JSON error. An idle or
+            // starting process has no command result to put on stdout.
+            eprintln!("error: {}", host_input::CHANNEL_CLOSED);
+            std::process::exit(ExitStatus::Transport.code());
+        }
         // The same rendering an in-session failure gets. A startup failure is
         // the first thing many people see from this program, and it was the
         // one place a JSON-RPC error arrived as its Display rather than as a
@@ -4867,6 +4989,11 @@ fn take_generated_argv(args: &mut Args, positional_target: bool) -> Vec<String> 
 }
 
 async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Result<()> {
+    let bridged = host_input::enabled();
+    if bridged {
+        args.no_reconnect = true;
+        args.no_history = true;
+    }
     // Server profiles are read up front: both --list-servers and profile
     // resolution need them before anything connects.
     let config_file = config::config_path(args.config.as_deref()).map(|(path, _)| path);
@@ -4945,9 +5072,15 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // and surface listing unless --verbose, so scripted output is only the
     // command result.
     let one_shot = !args.exec.is_empty() || !dynamic_argv.is_empty();
+    if bridged && !one_shot && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        exit_with_error(
+            ExitStatus::Usage,
+            "--host-input-fd requires piped command stdin or a one-shot command",
+        );
+    }
     // JSON stdout is a machine-readable stream. Even `--verbose` must not
     // inject a human banner into it.
-    let quiet = one_shot && (!args.verbose || args.json);
+    let quiet = bridged || one_shot && (!args.verbose || args.json);
 
     // The handler refuses terminal prompts while the command reader owns
     // stdin. Only reedline consumes diagnostics from the external printer.
@@ -5013,10 +5146,10 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // Sampling has no model behind it, so the operator answers. Under --exec
     // there is nobody to ask, so requests are refused unless --sampling says
     // otherwise.
-    sampling::init(sampling::resolve(args.sampling, one_shot));
+    sampling::init(sampling::resolve(args.sampling, one_shot || bridged));
     // Elicitation is the same bargain: a form needs someone at the keyboard,
     // so a script refuses rather than blocking on a read nobody will answer.
-    elicit::init(elicit::resolve(args.elicitation, one_shot));
+    elicit::init(elicit::resolve(args.elicitation, one_shot || bridged));
 
     // Explicit flags override imported or native profile fields: --http
     // retargets the URL while keeping HTTP auth, and --bearer/--header are
@@ -5191,7 +5324,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         let connect_transport = {
             let make_handler = make_handler.clone();
             let policy = policy.clone();
-            move |protocol: ProtocolMode| {
+            move |protocol: ProtocolMode, host| {
                 let make_handler = make_handler.clone();
                 let policy = policy.clone();
                 async move {
@@ -5199,7 +5332,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                         .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                         .connect(
                             TracingTransport::new(ChannelTransport::new(demo_router())),
-                            make_handler(),
+                            make_handler().with_host(host),
                         )
                         .await
                 }
@@ -5386,7 +5519,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                     let oauth = oauth.clone();
                     let make_handler = make_handler.clone();
                     let policy = policy.clone();
-                    move |protocol: ProtocolMode| {
+                    move |protocol: ProtocolMode, host| {
                         let url = url.clone();
                         let config = config.clone();
                         let oauth = oauth.clone();
@@ -5397,7 +5530,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                                 .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
                                 .connect(
                                     TracingTransport::new(http_transport(url, config, oauth)),
-                                    make_handler(),
+                                    make_handler().with_host(host),
                                 )
                                 .await
                         }
@@ -5467,7 +5600,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                     let async_output = async_output.clone();
                     let make_handler = make_handler.clone();
                     let policy = policy.clone();
-                    move |protocol: ProtocolMode| {
+                    move |protocol: ProtocolMode, host| {
                         let command = command.clone();
                         let env = env.clone();
                         let cwd = cwd.clone();
@@ -5492,7 +5625,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                             if let Some(cwd) = cwd {
                                 cmd.current_dir(cwd);
                             }
-                            cmd.stderr(std::process::Stdio::piped());
+                            cmd.stderr(server_stderr_policy());
                             let mut transport =
                                 StdioClientTransport::spawn_command(&mut cmd).await?;
                             if let Some(stderr) = transport.take_stderr() {
@@ -5500,7 +5633,10 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                             }
                             client_builder(protocol, policy.as_ref())
                                 .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?
-                                .connect(TracingTransport::new(transport), make_handler())
+                                .connect(
+                                    TracingTransport::new(transport),
+                                    make_handler().with_host(host),
+                                )
                                 .await
                         }
                     }
@@ -5516,7 +5652,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         }
     };
     let (session, surface, resolved_protocol) =
-        if let Some((client, info, resolved_protocol)) = connected {
+        if let Some((client, info, resolved_protocol, host)) = connected {
             if let Ok(mut label) = server_label.write() {
                 label.clone_from(&info.server_info.name);
             }
@@ -5527,7 +5663,17 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 }
             }
             let session = Arc::new(Session::new(client, connector));
-            let surface = Arc::new(RwLock::new(fetch_surface_initial(&session.client()).await));
+            if let Some(host) = host {
+                host.activate(&info, &session.client());
+            }
+            let surface = tokio::select! {
+                () = host_input::lost() => {
+                    let _ = session.close().await;
+                    return Err(host_input::lost_error());
+                }
+                surface = async { fetch_surface_initial(&session.client()).await } => surface,
+            };
+            let surface = Arc::new(RwLock::new(surface));
             if !quiet {
                 let s = surface.read().unwrap();
                 print_counts(&s);
@@ -5620,6 +5766,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // exit non-zero if any errored. No editor, no event loop.
     if one_shot {
         let client = session.client();
+        let mut host_lost = false;
         for input in dynamic_command
             .as_ref()
             .map(CommandInput::Generated)
@@ -5643,6 +5790,10 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 // A quit command, or an interrupt: either way the rest of
                 // the sequence does not run.
                 Ran::Completed(true) | Ran::Cancelled => break,
+                Ran::HostLost => {
+                    host_lost = true;
+                    break;
+                }
             }
         }
         let status = exit_status::current().code();
@@ -5653,12 +5804,21 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         // panicking after the work already succeeded: the child is killed on
         // drop either way, and the status the commands earned survives.
         match Arc::try_unwrap(session) {
-            Ok(session) => session.shutdown().await?,
+            Ok(session) => {
+                let shutdown = session.shutdown().await;
+                if !host_lost {
+                    shutdown?;
+                }
+            }
             Err(_) => eprintln!(
                 "warning: a background task outlived its command; exiting without the orderly \
                  shutdown"
             ),
         }
+        if host_lost {
+            return Err(host_input::lost_error());
+        }
+        host_input::finish().await;
         std::process::exit(status);
     }
 
@@ -5669,7 +5829,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // what the connection actually negotiated, not what `--protocol` asked
     // for: under `auto` that is the only way to tell whether the probe
     // landed on the final lifecycle.
-    let _surface_subscription = (resolved_protocol == ProtocolMode::Final).then(|| {
+    let _surface_subscription = (!bridged && resolved_protocol == ProtocolMode::Final).then(|| {
         surface_subscription::SurfaceSubscription::start(session.clone(), async_output.clone())
     });
 
@@ -5697,15 +5857,19 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         history_capacity,
     );
 
-    loop {
+    let host_lost = loop {
         tokio::select! {
+            () = host_input::lost() => break true,
             Ok(()) = refresh_rx.changed() => {
                 // Let a burst land before refetching, then mark whatever
                 // arrived during the wait as covered by this refetch.
                 tokio::time::sleep(SURFACE_REFRESH_DEBOUNCE).await;
                 refresh_rx.mark_unchanged();
                 tracing::debug!("surface change signalled; re-fetching");
-                let fresh = fetch_surface(&session.client()).await;
+                let fresh = tokio::select! {
+                    () = host_input::lost() => break true,
+                    surface = async { fetch_surface(&session.client()).await } => surface,
+                };
                 async_output.line(format!("{} {}, {}, {}",
                     tag(Style::new().fg(Color::Cyan), "surface changed"),
                     plural(fresh.tools().len(), "tool"),
@@ -5714,7 +5878,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 *surface.write().unwrap() = fresh;
             }
             maybe_line = line_rx.recv() => {
-                let Some(line) = maybe_line else { break };
+                let Some(line) = maybe_line else { break false };
                 let ran = run_cancellable(
                     &session,
                     &surface,
@@ -5731,18 +5895,24 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 // whether the command finished or was interrupted, or the
                 // prompt never comes back.
                 let _ = ack_tx.send(());
-                if matches!(ran, Ran::Completed(true)) {
-                    break;
+                match ran {
+                    Ran::HostLost => break true,
+                    Ran::Completed(true) => break false,
+                    _ => {}
                 }
             }
         }
-    }
+    };
     // tower-mcp kills a stdio child when its transport is dropped, so leaving
     // without closing would deny the server an orderly shutdown.
     drop(_surface_subscription);
     if let Err(error) = session.close().await {
         eprintln!("warning: closing the server failed: {error}");
     }
+    if host_lost {
+        return Err(host_input::lost_error());
+    }
+    host_input::finish().await;
     Ok(())
 }
 
@@ -5760,6 +5930,7 @@ enum Ran {
     Completed(bool),
     /// The operator pressed Ctrl-C.
     Cancelled,
+    HostLost,
 }
 
 /// The interrupt listener, installed once and reused by every command.
@@ -5874,7 +6045,11 @@ async fn run_cancellable(
     interrupts.discard_pending();
     tokio::select! {
         biased;
-        quit = handle_line(
+        () = host_input::lost() => {
+            report_error(ExitStatus::Transport, host_input::CHANNEL_CLOSED);
+            Ran::HostLost
+        },
+        quit = host_input::command_request(handle_line(
             session,
             surface,
             aliases,
@@ -5883,7 +6058,7 @@ async fn run_cancellable(
             schema_contracts,
             connect_runtime,
             input,
-        ) => {
+        )) => {
             Ran::Completed(quit)
         }
         Some(()) = interrupts.recv() => {
@@ -6160,6 +6335,10 @@ async fn handle_line(
     };
     let line = command.as_str();
     let background = parsed.background;
+    if background && host_input::enabled() {
+        command_error("background jobs with `&` are unavailable with --host-input-fd");
+        return false;
+    }
     let tokens: Vec<&str> = parsed.words.iter().map(String::as_str).collect();
     if tokens.is_empty() {
         if json_output() {
@@ -6252,6 +6431,9 @@ async fn handle_line(
         match connect_runtime.connect(rest).await {
             Ok(connected) => {
                 let previous = session.replace(connected.client, connected.connector).await;
+                if let Some(host) = connected.host {
+                    host.activate(&connected.info, &session.client());
+                }
                 // Everything that describes the live connection is published
                 // together, with no await in between: the client (above), its
                 // tool policy, surface, profile aliases, label, and the
@@ -6295,6 +6477,13 @@ async fn handle_line(
                     // surface-change notifications refetch from the new
                     // client.
                     jobs.clear();
+                }
+                if host_input::enabled() {
+                    print_json(&serde_json::json!({
+                        "connected": connected.info.server_info.name,
+                        "protocol": connected.info.protocol_version,
+                    }));
+                    return false;
                 }
                 if let Some(label) = connected.source_label {
                     diag_println!(
@@ -7099,6 +7288,10 @@ async fn handle_line(
             // question was asked while the editor held the terminal, so
             // nothing could answer it at the time.
             if cmd == "task" && rest.get(1).is_some_and(|word| *word == "respond") {
+                if host_input::enabled() {
+                    command_error("manual task input is unavailable with --host-input-fd");
+                    return false;
+                }
                 respond_to_task(
                     client.as_deref().expect("connected above"),
                     id,
@@ -7213,6 +7406,10 @@ async fn handle_line(
         }
         "wire" => {
             match rest.first().copied() {
+                Some("on") if host_input::enabled() => {
+                    command_error("wire tracing is unavailable with --host-input-fd");
+                    return false;
+                }
                 Some("on") => wire().set_trace(true),
                 Some("off") => wire().set_trace(false),
                 None => {}
@@ -7605,6 +7802,10 @@ async fn handle_bench(
     rest: &[&str],
     background: bool,
 ) {
+    if host_input::enabled() {
+        command_error("bench is unavailable with --host-input-fd");
+        return;
+    }
     // A trailing `&` is stripped before dispatch, so say why it did nothing
     // rather than silently benchmarking the non-task path.
     if background {
@@ -8539,7 +8740,7 @@ async fn run_tool(
     let started = std::time::Instant::now();
     match with_reconnect(session, surface, |c| {
         let arguments = arguments.clone();
-        async move { c.call_tool(name, arguments).await }
+        async move { host_input::call_tool(&c, name, arguments).await }
     })
     .await
     {
@@ -9603,7 +9804,7 @@ mod tests {
         // second, unexpected attempt into an immediate panic instead of a
         // silent extra connection.
         let transport = Arc::new(Mutex::new(Some(transport)));
-        let connect_transport = move |protocol: ProtocolMode| {
+        let connect_transport = move |protocol: ProtocolMode, _host| {
             let transport = transport.clone();
             async move {
                 let transport = transport
@@ -9618,7 +9819,7 @@ mod tests {
             }
         };
 
-        let (client, info, resolved) =
+        let (client, info, resolved, _) =
             resolve_protocol(ProtocolMode::Auto, None, connect_transport)
                 .await
                 .expect("a server that answers discover resolves");
@@ -9639,7 +9840,7 @@ mod tests {
     /// connects again with a fresh client that sends `initialize`.
     #[tokio::test]
     async fn auto_falls_back_to_a_fresh_stable_client_when_discover_is_not_found() {
-        let connect_transport = |protocol: ProtocolMode| async move {
+        let connect_transport = |protocol: ProtocolMode, _host| async move {
             match protocol {
                 ProtocolMode::Final => {
                     client_builder(protocol, None)
@@ -9657,7 +9858,7 @@ mod tests {
             }
         };
 
-        let (client, info, resolved) =
+        let (client, info, resolved, _) =
             resolve_protocol(ProtocolMode::Auto, None, connect_transport)
                 .await
                 .expect("a legacy server falls back to a stable connection");
@@ -9685,7 +9886,7 @@ mod tests {
         let previous = REQUEST_TIMEOUT_SECS.swap(1, Ordering::Relaxed);
         let _restore = RestoreRequestTimeout(previous);
 
-        let connect_transport = |protocol: ProtocolMode| async move {
+        let connect_transport = |protocol: ProtocolMode, _host| async move {
             match protocol {
                 ProtocolMode::Final => {
                     client_builder(protocol, None)
@@ -9703,7 +9904,7 @@ mod tests {
             }
         };
 
-        let (client, info, resolved) =
+        let (client, info, resolved, _) =
             resolve_protocol(ProtocolMode::Auto, None, connect_transport)
                 .await
                 .expect("an expired probe deadline falls back to a stable connection");

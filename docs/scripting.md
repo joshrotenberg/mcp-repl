@@ -102,6 +102,100 @@ default to decline on both command paths.
 The previous `unstable-dynamic-cli` Cargo feature is a compatibility alias;
 all builds, including `--no-default-features`, now include generated commands.
 
+## Host-mediated input on Unix
+
+A host can answer elicitation and sampling while an MCP operation is still
+running. Pass `--json --host-input-fd FD` before the command or the raw stdio
+server argv. Create a connected Unix stream socket pair, pass only the REPL
+endpoint to the child, and close the parent's copy of that endpoint after
+spawn. In Python, use `socket.socketpair()` and
+`subprocess.Popen(..., pass_fds=(repl_end.fileno(),))`. The descriptor is
+owned by mcp-repl and closed on exec of any MCP server subprocess. If using
+`--bearer-fd`, supply a separate descriptor.
+
+The socket is full duplex. Stdout keeps its normal command-result NDJSON
+framing, and piped stdin still takes REPL commands. The bridge works with
+`-e`, generated commands, and a quiet session with piped command stdin.
+In bridge mode, a successful `connect` emits one stdout value such as
+`{"connected":"example","protocol":"2025-11-25"}`.
+`--host-input-timeout SECONDS` sets the per-question timeout (default 30,
+range 1 to 120). Set the command's `--timeout` high enough to allow for
+the server's work and the expected input rounds. The flag is incompatible
+with explicit `--elicitation` and `--sampling` strategies and with plugin
+management.
+
+Protocol v1 uses one UTF-8 JSON object followed by LF, with a 1 MiB limit
+including the delimiter. `session` is an opaque identifier for the current
+connection, and `id` is an opaque string within it. Copy both into every
+reply. `server.name` is the peer's claimed name, and `server.protocol` is
+the negotiated version. `deadlineUnixMs` is a wall-clock estimate for the
+host UI. The REPL enforces the deadline with its monotonic clock.
+
+```json
+{"v":1,"type":"needs_input","session":"0123456789abcdef0123456789abcdef-1","id":"1","server":{"name":"example","protocol":"2025-11-25"},"kind":"form","request":{"message":"Proceed?","schema":{"type":"object","properties":{"approve":{"type":"boolean"}},"required":["approve"]}},"actions":["accept","decline","cancel"],"deadlineUnixMs":1800000030000}
+{"v":1,"type":"response","session":"0123456789abcdef0123456789abcdef-1","id":"1","action":"accept","content":{"approve":true}}
+{"v":1,"type":"response_status","session":"0123456789abcdef0123456789abcdef-1","id":"1","status":"accepted"}
+```
+
+- Form requests carry `message`, an MCP form `schema`, and an optional
+  `credentialFields` array of field names flagged by a heuristic. Send
+  `accept` with typed `content`, or send `decline` or `cancel`.
+- URL requests carry `message` and `url`. Use `confirm_url` only after the
+  user explicitly confirms completing the out-of-band step. Displaying or
+  opening the HTTP(S) link alone does not count. `decline` and `cancel`
+  are also available.
+- Sampling requests carry MCP `CreateMessageParams`. Send `sample` with
+  `origin` set to `model` or `operator` and an MCP `CreateMessageResult`
+  in `result`. Set `role` to `assistant`, include the answer in `content`,
+  and give the actual model name in `model`. Use `mcp-repl/operator` for
+  operator-authored content. Use `decline` or `cancel` to refuse sampling.
+- `response_status` is best effort. Hosts must keep working without it.
+  Acceptance confirms
+  local receipt. Rejection includes a fixed `reason` such as `duplicate`,
+  `stale`, `cross_session`, `unknown`, `wrong_kind`, `invalid_payload`,
+  `unsupported_version`, or `malformed`. A malformed frame may have no
+  identifiers. Re-sending the same answer returns `duplicate` if it was
+  consumed and its ID is still remembered. Otherwise the original
+  rejection repeats while the request state is the same. For example,
+  a reply that was initially invalid can become `stale` after timeout.
+- `withdrawn` carries the question identifiers and a fixed `reason`.
+  A server cancelling a request gives `server_cancelled`. A lost server
+  connection gives `disconnected`. Hosts can answer questions out of order,
+  and at most 32 questions can be pending. When `--timeout` or Ctrl-C drops
+  a foreground command, stable questions opened since that command began
+  are withdrawn with `cancelled`.
+
+Keep draining the control socket while commands run, including while a
+user or model is preparing an answer. The session ends with exit status 4
+if a socket write makes no progress for `--host-input-timeout` seconds
+(30 seconds by default), the channel closes, or an inbound frame is
+oversized or truncated. A full 64-frame output queue can refuse new
+questions and drop `response_status` and `withdrawn` frames. A dropped
+status leaves the answer's disposition unchanged.
+
+Treat server-authored text, schemas, URLs, and sampling messages as data
+from that server. Ask for consent in the host before sending answers,
+including before invoking a model on the server's behalf. Send sensitive
+answers over the socket and keep them out of application logs. Servers
+receive answers and can include them in ordinary MCP command results.
+History, wire capture, and peer diagnostics are disabled in bridge mode.
+
+Stable server-initiated requests use the bridge directly. For final
+`2026-07-28` tool calls, the REPL continues the live operation with the
+answers, allowing up to four tool-call attempts including state-only
+continuations. Sampling refusal ends a final input round because the
+protocol has no sampling error value for a continuation. Automatic HTTP
+session recovery and command replay are disabled in bridge mode.
+
+Windows IPC, final task input, prompt and resource continuations, and
+session-driver integration are deferred. The descriptor flag returns a
+usage error on non-Unix platforms. Server-created final tasks use the
+existing task wait path with declined input. In bridge mode, `bench` and
+background jobs using a trailing `&` return usage errors. Final-protocol
+list-change subscriptions are disabled in bridge mode. Run `refresh` to
+update the final protocol's discovered surface. Stable list-change
+notifications still refresh the surface automatically.
+
 ## Waiting for background tasks
 
 A tool that requires task-augmented execution has to be started with a

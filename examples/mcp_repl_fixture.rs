@@ -20,10 +20,15 @@ use axum::response::{IntoResponse, Response};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower_mcp::{
-    CallToolResult, HttpTransport, McpRouter, PromptBuilder, ProtocolSupport, ResourceBuilder,
-    StdioTransport, TaskSupportMode, ToolBuilder,
+    BidirectionalStdioTransport, CallToolResult, HttpTransport, McpRouter, PromptBuilder,
+    ProtocolSupport, RequestContext, ResourceBuilder, StdioTransport, TaskSupportMode, ToolBuilder,
     extract::{Context, RawArgs},
-    protocol::{LogLevel, LoggingMessageParams},
+    protocol::{
+        CreateMessageParams, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema,
+        ElicitMode, ElicitRequestParams, ElicitResult, ElicitUrlParams, InputRequest,
+        InputRequiredResult, InputResponse, LogLevel, LoggingMessageParams, RequestOutcome,
+        SamplingMessage,
+    },
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -34,8 +39,11 @@ struct AddInput {
 
 static LISTEN_SUBSCRIPTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// The sensitive form answer the host-input e2e case sends.
+const SEEDED_ANSWER: &str = "bridge-private-answer";
+
 fn fixture_router() -> McpRouter {
-    McpRouter::new()
+    let router = McpRouter::new()
         .server_info("mcp-repl-fixture", "1.0.0")
         .with_tasks()
         .tool(
@@ -193,7 +201,167 @@ fn fixture_router() -> McpRouter {
                     )))
                 })
                 .build(),
+        );
+    if std::env::var_os("MCP_REPL_FIXTURE_HOST_INPUT").is_some() {
+        host_tools(router)
+    } else {
+        router
+    }
+}
+
+fn host_tools(router: McpRouter) -> McpRouter {
+    router
+        .tool(
+            ToolBuilder::new("host_form")
+                .description("Ask the client for a form answer")
+                .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                    let answer = ctx.elicit_form(host_form()).await?;
+                    // A peer can echo a sensitive answer into either diagnostic
+                    // channel. Echo the e2e case's seeded value when it arrives.
+                    if matches!(
+                        answer.content.as_ref().and_then(|values| values.get("apiKey")),
+                        Some(ElicitFieldValue::String(value)) if value == SEEDED_ANSWER
+                    ) {
+                        eprintln!("{SEEDED_ANSWER}");
+                        ctx.send_log(LoggingMessageParams::new(
+                            LogLevel::Info,
+                            serde_json::json!(SEEDED_ANSWER),
+                        ));
+                    }
+                    Ok(form_result(&answer))
+                })
+                .build(),
         )
+        .tool(
+            ToolBuilder::new("host_url")
+                .description("Ask the client to confirm a URL")
+                .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                    let answer = ctx
+                        .elicit_url(ElicitUrlParams {
+                            mode: Some(ElicitMode::Url),
+                            elicitation_id: "fixture-url".into(),
+                            message: "Confirm the fixture URL flow".into(),
+                            url: "https://example.com/confirm?token=fixture-url-token".into(),
+                            meta: None,
+                        })
+                        .await?;
+                    Ok(CallToolResult::text(format!(
+                        "url {}",
+                        action_name(answer.action)
+                    )))
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("host_sample")
+                .description("Ask the client for a sampling answer")
+                .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                    let reply = ctx.sample(host_sample()).await?;
+                    Ok(CallToolResult::text(format!("sampled by {}", reply.model)))
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("host_rounds")
+                .description("Run a state-only round and a multi-input round")
+                .mrtr_handler(|ctx: RequestContext, _args: serde_json::Value| async move {
+                    match ctx.request_state() {
+                        None => Ok(RequestOutcome::input_required(
+                            InputRequiredResult::new().with_request_state("fixture-state-only"),
+                        )),
+                        Some("fixture-state-only") if ctx.input_responses().is_none() => {
+                            let inputs = [
+                                (
+                                    "a-form".into(),
+                                    InputRequest::Elicit(ElicitRequestParams::Form(host_form())),
+                                ),
+                                (
+                                    "b-sample".into(),
+                                    InputRequest::CreateMessage(host_sample()),
+                                ),
+                            ]
+                            .into_iter()
+                            .collect();
+                            Ok(RequestOutcome::input_required(
+                                InputRequiredResult::with_requests(inputs)
+                                    .with_request_state("fixture-answer-round"),
+                            ))
+                        }
+                        Some("fixture-answer-round") => {
+                            let responses = ctx.input_responses().expect("answer round responses");
+                            let Some(InputResponse::Elicit(form)) = responses.get("a-form") else {
+                                return Ok(RequestOutcome::Complete(CallToolResult::error(
+                                    "missing form",
+                                )));
+                            };
+                            let Some(InputResponse::CreateMessage(sample)) =
+                                responses.get("b-sample")
+                            else {
+                                return Ok(RequestOutcome::Complete(CallToolResult::error(
+                                    "missing sample",
+                                )));
+                            };
+                            if let Some(text) = sample.first_text() {
+                                eprintln!("{text}");
+                            }
+                            Ok(RequestOutcome::Complete(CallToolResult::text(format!(
+                                "final {} / {}",
+                                action_name(form.action),
+                                sample.model,
+                            ))))
+                        }
+                        _ => Ok(RequestOutcome::Complete(CallToolResult::error(
+                            "unexpected fixture state",
+                        ))),
+                    }
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("host_round_limit")
+                .description("Request another round forever")
+                .mrtr_handler(
+                    |_ctx: RequestContext, _args: serde_json::Value| async move {
+                        increment_marker("MCP_REPL_FIXTURE_HOST_ROUNDS");
+                        Ok(RequestOutcome::input_required(
+                            InputRequiredResult::new().with_request_state("fixture-loop"),
+                        ))
+                    },
+                )
+                .build(),
+        )
+}
+
+fn host_form() -> ElicitFormParams {
+    ElicitFormParams {
+        mode: None,
+        message: "Provide a synthetic value".into(),
+        requested_schema: ElicitFormSchema::new().string_field("apiKey", None, true),
+        meta: None,
+    }
+}
+
+fn host_sample() -> CreateMessageParams {
+    CreateMessageParams::new(vec![SamplingMessage::user("Fixture sample")], 24)
+}
+
+fn action_name(action: ElicitAction) -> &'static str {
+    match action {
+        ElicitAction::Accept => "accept",
+        ElicitAction::Decline => "decline",
+        ElicitAction::Cancel => "cancel",
+        _ => "unknown",
+    }
+}
+
+fn form_result(answer: &ElicitResult) -> CallToolResult {
+    if answer.action == ElicitAction::Accept
+        && !matches!(answer.content.as_ref().and_then(|values| values.get("apiKey")),
+            Some(ElicitFieldValue::String(value)) if value == SEEDED_ANSWER)
+    {
+        return CallToolResult::error("fixture did not receive the expected form value");
+    }
+    CallToolResult::text(format!("form {}", action_name(answer.action)))
 }
 
 fn protocol_support() -> ProtocolSupport {
@@ -451,6 +619,8 @@ fn serve_raw_tools_only(
     let mut stdout = std::io::stdout();
     let mut hold_next_call = cancel_first_call;
     let mut pending_call = None;
+    let host_trigger = env_path("MCP_REPL_FIXTURE_HOST_TRIGGER");
+    let disconnect = std::env::args().any(|arg| arg == "--disconnect-host-input");
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -474,7 +644,39 @@ fn serve_raw_tools_only(
         let Some(id) = request.get("id").filter(|id| !id.is_null()).cloned() else {
             continue;
         };
+        if id == "fixture-callback" && method.is_empty() && host_trigger.is_some() {
+            write_marker("MCP_REPL_FIXTURE_UNEXPECTED_HOST_REPLY", b"received");
+            continue;
+        }
         let response = match method {
+            "tools/call" if host_trigger.is_some() => {
+                let callback = serde_json::json!({
+                    "jsonrpc": "2.0", "id": "fixture-callback", "method": "elicitation/create",
+                    "params": host_form(),
+                });
+                writeln!(stdout, "{callback}")?;
+                stdout.flush()?;
+                let trigger = host_trigger.as_ref().unwrap();
+                let end = std::time::Instant::now() + Duration::from_secs(20);
+                while !trigger.exists() {
+                    if std::time::Instant::now() >= end {
+                        return Err("fixture timed out waiting for host trigger".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if disconnect {
+                    break;
+                }
+                let cancellation = serde_json::json!({
+                    "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": "fixture-callback"},
+                });
+                writeln!(stdout, "{cancellation}")?;
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content":[{"type":"text","text":"server cancelled"}]},
+                })
+            }
             // Keep the first call pending until the client sends cancellation.
             // This real child deliberately installs no SIGINT handler: terminal
             // interrupts must reach it through MCP, not its process group.
@@ -645,6 +847,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             .layer(axum::middleware::from_fn(log_received_tool_calls))
             .layer(axum::middleware::from_fn(trace_requests));
         axum::serve(listener, app).await?;
+    } else if std::env::var_os("MCP_REPL_FIXTURE_HOST_INPUT").is_some() {
+        BidirectionalStdioTransport::new(router)
+            .protocol_support(protocol_support())
+            .run()
+            .await?;
+        write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
     } else {
         let mut transport = StdioTransport::new(router).protocol_support(protocol_support());
         if env_path(TOOL_CALL_LOG).is_some() || env_path(TOOL_CALL_PAST_503_LOG).is_some() {
