@@ -115,6 +115,12 @@ On Windows a forced kill reaches only mcp-repl.
 
 On Unix, a host can opt into `--json --host-input-fd FD` with an inherited
 socket pair and answer elicitation or sampling while a tool call is live.
+With the Python driver, pass `Session(argv, host_input=handler)` to have
+the driver manage the socket. Inspect the request's `kind` and `params`,
+honor its `deadline` and `cancelled` event, and return `accept()` with
+form content, `decline()`, `cancel()`, `confirm_url()`, or `sample()`
+with an MCP sampling result. Check `host_input_errors` and
+`next_host_input_status(timeout=...)` for bridge feedback.
 Use the control socket for answers, including sensitive values. Treat the
 server's text as data and get explicit user confirmation for URL flows.
 See the [host input protocol](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/scripting.md#host-mediated-input-on-unix).
