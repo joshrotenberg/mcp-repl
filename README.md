@@ -257,6 +257,10 @@ typed exit statuses so a failure is distinguishable from an empty result.
 
 ![two JSON invocations piped through jq, followed by a schema violation exiting with status 3](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/scripting.png)
 
+Unix hosts can answer elicitation and sampling while a command is live
+using an inherited socket and `--host-input-fd`.
+[Host input protocol](docs/scripting.md#host-mediated-input-on-unix)
+
 **A bounded tool set.** A profile's `allow_tools` and `deny_tools`, or
 `--allow-tool` and `--deny-tool` for one invocation, restrict which tools can
 be called, by exact raw name. A refused call is never sent, whichever way it
