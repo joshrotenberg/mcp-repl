@@ -394,6 +394,96 @@ fn increment_marker(name: &str) {
     write_marker(name, count.to_string());
 }
 
+/// Every `tools/call` attempt that arrived, logged at ingress before any
+/// injected fault. One raw tool name per line.
+const TOOL_CALL_LOG: &str = "MCP_REPL_FIXTURE_TOOL_CALL_LOG_FILE";
+/// Every `tools/call` request that passed the 503 injector, logged just
+/// inside it. Over stdio there is no injector, so both logs receive the same
+/// calls.
+const TOOL_CALL_PAST_503_LOG: &str = "MCP_REPL_FIXTURE_TOOL_CALL_PAST_503_LOG_FILE";
+
+/// Append the raw tool name of every `tools/call` request in one JSON-RPC
+/// frame (a message or a batch) to the log named by `log_env`, one name per
+/// line. These are the server's own records of what arrived, so a test can
+/// prove that a call the client refused was never sent, whatever the client
+/// displayed.
+fn log_tool_calls(log_env: &str, frame: &[u8]) {
+    use std::io::Write as _;
+    let Some(path) = env_path(log_env) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(frame) else {
+        return;
+    };
+    let messages = match value {
+        serde_json::Value::Array(messages) => messages,
+        message => vec![message],
+    };
+    for message in messages {
+        if message.get("method").and_then(serde_json::Value::as_str) != Some("tools/call") {
+            continue;
+        }
+        let name = message
+            .pointer("/params/name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open fixture tool-call log");
+        writeln!(log, "{name}").expect("append fixture tool-call log");
+    }
+}
+
+/// Read an HTTP request body once to log its tool calls to `log_env`, then
+/// hand the same bytes on. Only active when that log is requested.
+async fn log_http_body(log_env: &str, request: Request, next: Next) -> Response {
+    if env_path(log_env).is_none() {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 16 * 1024 * 1024).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    log_tool_calls(log_env, &bytes);
+    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
+/// The ingress log: outside the 503 injector, so a rejected attempt counts.
+async fn log_received_tool_calls(request: Request, next: Next) -> Response {
+    log_http_body(TOOL_CALL_LOG, request, next).await
+}
+
+/// Just inside the 503 injector: requests it let through.
+async fn log_tool_calls_past_503(request: Request, next: Next) -> Response {
+    log_http_body(TOOL_CALL_PAST_503_LOG, request, next).await
+}
+
+/// Serve stdio through a tap that logs each inbound frame's tool calls
+/// before the router sees it. Stdin EOF still ends the session.
+async fn serve_logged_stdio(
+    mut transport: tower_mcp::StdioTransport,
+) -> Result<(), tower_mcp::BoxError> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let (mut tap, reader) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let mut frames = tokio::io::BufReader::new(tokio::io::stdin()).split(b'\n');
+        while let Ok(Some(frame)) = frames.next_segment().await {
+            log_tool_calls(TOOL_CALL_LOG, &frame);
+            log_tool_calls(TOOL_CALL_PAST_503_LOG, &frame);
+            if tap.write_all(&frame).await.is_err() || tap.write_all(b"\n").await.is_err() {
+                break;
+            }
+        }
+    });
+    transport
+        .run_with_streams(reader, tokio::io::stdout())
+        .await?;
+    Ok(())
+}
+
 fn claim_marker(name: &str) -> bool {
     let Some(path) = env_path(name) else {
         return false;
@@ -748,8 +838,13 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             .protocol_support(protocol_support())
             .disable_origin_validation()
             .into_router()
+            // The last layer added runs first. The received-calls log sits
+            // outside `observe_subscription`, which injects 503s, and the
+            // past-503 log just inside it.
             .layer(axum::middleware::from_fn(require_bearer))
+            .layer(axum::middleware::from_fn(log_tool_calls_past_503))
             .layer(axum::middleware::from_fn(observe_subscription))
+            .layer(axum::middleware::from_fn(log_received_tool_calls))
             .layer(axum::middleware::from_fn(trace_requests));
         axum::serve(listener, app).await?;
     } else if std::env::var_os("MCP_REPL_FIXTURE_HOST_INPUT").is_some() {
@@ -759,10 +854,12 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             .await?;
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
     } else {
-        StdioTransport::new(router)
-            .protocol_support(protocol_support())
-            .run()
-            .await?;
+        let mut transport = StdioTransport::new(router).protocol_support(protocol_support());
+        if env_path(TOOL_CALL_LOG).is_some() || env_path(TOOL_CALL_PAST_503_LOG).is_some() {
+            serve_logged_stdio(transport).await?;
+        } else {
+            transport.run().await?;
+        }
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
     }
     Ok(())

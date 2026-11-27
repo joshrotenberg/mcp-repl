@@ -66,11 +66,28 @@ struct SurfaceCommandSpec {
     name: String,
     about: Option<String>,
     arguments: Vec<ArgumentSpec>,
+    /// Left out of help because the tool policy denies calling it. The
+    /// subcommand still parses, so the call reaches the policy hook and gets
+    /// the same denial as every other spelling.
+    hidden: bool,
 }
 
 /// Parse one command using a clap tree assembled from the connected surface.
-pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation, clap::Error> {
-    let tool_specs = command_specs(&commands.tools, "tool");
+///
+/// Tools the `policy` denies are hidden from help but still parse: hiding is
+/// presentation, and enforcement stays in the client's policy hook.
+pub(crate) fn parse(
+    commands: &CommandSet,
+    argv: &[String],
+    policy: Option<&crate::tool_policy::ToolPolicy>,
+) -> Result<Invocation, clap::Error> {
+    let mut tool_specs = command_specs(&commands.tools, "tool");
+    if let Some(policy) = policy {
+        for spec in &mut tool_specs {
+            spec.hidden = !policy.permits(&spec.name);
+        }
+    }
+    let hidden = tool_specs.iter().filter(|spec| spec.hidden).count();
     let prompt_specs = command_specs(&commands.prompts, "prompt");
     let mut root = Command::new("mcp-repl")
         .bin_name("mcp-repl <connection options>")
@@ -79,11 +96,17 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true);
+    if hidden > 0 {
+        root = root.after_help(crate::tool_policy::hidden_note(hidden, Some("tools --all")));
+    }
 
-    root = root.subcommand(tool_namespace(&tool_specs));
-    root = root.subcommand(builtin_namespace(&prompt_specs));
+    root = root.subcommand(tool_namespace(&tool_specs, hidden));
+    // `tools --all` only matters under a policy; without one its help stays
+    // exactly as it was.
+    let policy_active = policy.is_some();
+    root = root.subcommand(builtin_namespace(&prompt_specs, policy_active));
     for name in ONE_SHOT_BUILTINS {
-        root = root.subcommand(builtin_command(name, &prompt_specs));
+        root = root.subcommand(builtin_command(name, &prompt_specs, policy_active));
     }
     // Bare tool names are the same convenience they are in the REPL. A tool
     // colliding with a built-in is deliberately absent here and handled by
@@ -157,20 +180,23 @@ pub(crate) fn parse(commands: &CommandSet, argv: &[String]) -> Result<Invocation
     }
 }
 
-fn tool_namespace(specs: &[SurfaceCommandSpec]) -> Command {
+fn tool_namespace(specs: &[SurfaceCommandSpec], hidden: usize) -> Command {
     let mut command = Command::new("tool")
         .about("Run a server tool explicitly")
         .subcommand_help_heading("SERVER TOOLS")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true);
+    if hidden > 0 {
+        command = command.after_help(crate::tool_policy::hidden_note(hidden, Some("tools --all")));
+    }
     for spec in specs {
         command = command.subcommand(surface_command(spec));
     }
     command
 }
 
-fn builtin_namespace(prompt_specs: &[SurfaceCommandSpec]) -> Command {
+fn builtin_namespace(prompt_specs: &[SurfaceCommandSpec], policy_active: bool) -> Command {
     let mut command = Command::new("builtin")
         .about("Run a REPL built-in explicitly")
         .subcommand_help_heading("ONE-SHOT BUILT-INS")
@@ -179,13 +205,32 @@ fn builtin_namespace(prompt_specs: &[SurfaceCommandSpec]) -> Command {
         .disable_help_subcommand(true)
         .after_help("Use --exec for other REPL built-ins, multi-command or stateful workflows.");
     for name in ONE_SHOT_BUILTINS {
-        command = command.subcommand(builtin_command(name, prompt_specs));
+        command = command.subcommand(builtin_command(name, prompt_specs, policy_active));
     }
     command
 }
 
-fn builtin_command(name: &str, prompt_specs: &[SurfaceCommandSpec]) -> Command {
+fn builtin_command(
+    name: &str,
+    prompt_specs: &[SurfaceCommandSpec],
+    policy_active: bool,
+) -> Command {
     match name {
+        "tools" => Command::new("tools")
+            .about("List the server's tools")
+            .arg(
+                Arg::new("full")
+                    .long("full")
+                    .help("Print the complete listing")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("all")
+                    .long("all")
+                    .help("Include tools the tool policy denies")
+                    .hide(!policy_active)
+                    .action(ArgAction::SetTrue),
+            ),
         name if LIST_BUILTINS.contains(&name) => Command::new(name.to_string())
             .about(format!("List the server's {name}"))
             .arg(
@@ -300,6 +345,9 @@ fn builtin_invocation(
             if matches.get_flag("full") {
                 words.push("--full".to_string());
             }
+            if name == "tools" && matches.get_flag("all") {
+                words.push("--all".to_string());
+            }
         }
         "read" => {
             words.push(required_string(matches, "uri"));
@@ -370,7 +418,7 @@ fn required_string(matches: &ArgMatches, id: &str) -> String {
 }
 
 fn surface_command(spec: &SurfaceCommandSpec) -> Command {
-    let mut command = Command::new(spec.command.clone());
+    let mut command = Command::new(spec.command.clone()).hide(spec.hidden);
     if let Some(about) = &spec.about {
         command = command.about(about.clone());
     }
@@ -457,6 +505,7 @@ fn command_specs(commands: &[CommandSpec], fallback: &str) -> Vec<SurfaceCommand
             name: command.name.clone(),
             about: command.description.as_deref().map(clean_text),
             arguments: argument_specs(index, &command.arguments),
+            hidden: false,
         })
         .collect()
 }
@@ -583,7 +632,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        super::parse(surface.commands(), argv)
+        super::parse(surface.commands(), argv, None)
     }
 
     fn tool(name: &str, schema: serde_json::Value) -> ToolDefinition {
@@ -900,5 +949,62 @@ mod tests {
             invocation.parsed().words,
             ["call", "odd", "{\"a=b\":\"text\"}"]
         );
+    }
+
+    /// A denied tool disappears from help but still parses, so the one-shot
+    /// call reaches the policy hook and fails the same way as `-e`.
+    #[test]
+    fn a_denied_tool_is_hidden_from_help_but_still_parses() {
+        let tools = [
+            tool("search", json!({"type":"object"})),
+            tool("purge", json!({"type":"object"})),
+        ];
+        let surface = crate::Surface::new(
+            tools.to_vec(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = crate::tool_policy::ToolPolicy::resolve(
+            None,
+            &crate::tool_policy::Flags {
+                allow: Vec::new(),
+                deny: vec!["purge".to_string()],
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let parse_with = |argv: &[&str]| {
+            super::parse(
+                surface.commands(),
+                &argv.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                Some(&policy),
+            )
+        };
+
+        for argv in [&["--help"][..], &["tool", "--help"][..]] {
+            let help = parse_with(argv).unwrap_err().to_string();
+            assert!(help.contains("search"), "{help}");
+            assert!(!help.contains("purge"), "{help}");
+            assert!(
+                help.contains("1 tool hidden: calls are denied by tool policy"),
+                "{help}"
+            );
+        }
+        assert_eq!(parse_with(&["purge"]).unwrap().parsed().words, ["purge"]);
+        assert_eq!(
+            parse_with(&["tool", "purge"]).unwrap().parsed().words,
+            ["tool", "purge"]
+        );
+        assert_eq!(
+            parse_with(&["tools", "--all"]).unwrap().parsed().words,
+            ["tools", "--all"]
+        );
+        // Without a policy nothing is hidden and help carries no note.
+        let help = parse(&tools, &[], &["--help".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("purge") && !help.contains("hidden"), "{help}");
     }
 }

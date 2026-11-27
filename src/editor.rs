@@ -320,11 +320,23 @@ impl ReplCompleter {
         }
     }
 
+    /// `tool <Tab>`: server tools, leaving out those the tool policy denies.
     fn complete_tool_name_word(commands: &CommandSet, word: &str, span: Span) -> Vec<Suggestion> {
+        Self::complete_tool_name_word_where(commands, word, span, |name| {
+            !crate::tool_policy::hides(name)
+        })
+    }
+
+    fn complete_tool_name_word_where(
+        commands: &CommandSet,
+        word: &str,
+        span: Span,
+        visible: impl Fn(&str) -> bool,
+    ) -> Vec<Suggestion> {
         commands
             .tools
             .iter()
-            .filter(|tool| tool.name.starts_with(word))
+            .filter(|tool| tool.name.starts_with(word) && visible(&tool.name))
             .map(|tool| word_suggestion(&tool.name, Self::tool_description(tool), span))
             .collect()
     }
@@ -368,8 +380,12 @@ impl ReplCompleter {
         }
         // A colliding bare spelling is represented once above as ambiguous,
         // rather than twice as though either duplicate would be runnable.
+        // A tool the policy denies is not offered.
         for tool in &commands.tools {
-            if tool.name.starts_with(word) && !crate::is_builtin(&tool.name) {
+            if tool.name.starts_with(word)
+                && !crate::is_builtin(&tool.name)
+                && !crate::tool_policy::hides(&tool.name)
+            {
                 out.push(word_suggestion(
                     &tool.name,
                     Self::tool_description(tool),
@@ -625,7 +641,7 @@ impl ReplCompleter {
             }
             "call" => {
                 for t in &commands.tools {
-                    if t.name.starts_with(word) {
+                    if t.name.starts_with(word) && !crate::tool_policy::hides(&t.name) {
                         out.push(word_suggestion(&t.name, t.description.clone(), span));
                     }
                 }
@@ -644,7 +660,7 @@ impl ReplCompleter {
                     }
                 } else if naming_tool {
                     for t in &commands.tools {
-                        if t.name.starts_with(word) {
+                        if t.name.starts_with(word) && !crate::tool_policy::hides(&t.name) {
                             out.push(word_suggestion(&t.name, t.description.clone(), span));
                         }
                     }
@@ -1117,6 +1133,44 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    /// `tool <Tab>` offers only tools the policy permits.
+    #[test]
+    fn tool_name_completion_leaves_out_denied_tools() {
+        let tool = |name: &str| -> tower_mcp::protocol::ToolDefinition {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "inputSchema": { "type": "object" },
+            }))
+            .expect("tool definition")
+        };
+        let surface = Surface::new(
+            vec![tool("purge"), tool("pull"), tool("push")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = crate::tool_policy::ToolPolicy::resolve(
+            None,
+            &crate::tool_policy::Flags {
+                allow: Vec::new(),
+                deny: vec!["purge".to_string()],
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let offered = ReplCompleter::complete_tool_name_word_where(
+            surface.commands(),
+            "pu",
+            Span::new(5, 7),
+            |name| policy.permits(name),
+        );
+        assert_eq!(
+            offered.iter().map(|s| s.value.as_str()).collect::<Vec<_>>(),
+            ["pull", "push"]
+        );
     }
 
     /// A schema shaped the way a generator emits one: named types hoisted

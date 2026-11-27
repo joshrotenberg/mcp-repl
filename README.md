@@ -255,6 +255,13 @@ Unix hosts can answer elicitation and sampling while a command is live
 using an inherited socket and `--host-input-fd`.
 [Host input protocol](docs/scripting.md#host-mediated-input-on-unix)
 
+**A bounded tool set.** A profile's `allow_tools` and `deny_tools`, or
+`--allow-tool` and `--deny-tool` for one invocation, restrict which tools can
+be called, by exact raw name. A refused call is never sent, whichever way it
+was spelled; a one-shot run reports it with status 2. This is a client-side
+control, not a sandbox; see
+[restricting tool calls](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/connecting.md#restricting-tool-calls).
+
 ## Bundled agent skills
 
 mcp-repl embeds a skills-only plugin for Claude Code and Codex. It teaches an

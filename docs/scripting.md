@@ -237,8 +237,15 @@ default; pass `--verbose` to keep them. Under `--json`, stdout is always a
 machine-only [NDJSON](https://github.com/ndjson/ndjson-spec) stream: every
 executed command emits exactly one compact, independently parseable value on
 one line. `--verbose` never adds a banner there. Timings, tracing, progress,
-notifications, reconnect notices, spawned-child diagnostics, and warnings go
-to stderr.
+notifications, reconnect notices, spawned-child diagnostics, warnings, and
+the banner, tool policy, and surface summary that a `connect` prints go to
+stderr.
+
+`connect` is the one exception to one value per command: under `--json` a
+successful `connect` reports its banner, tool policy, and surface summary on
+stderr and emits no value on stdout. A failed `connect` emits the usual error
+envelope on stdout. This applies with or without a tool policy. Earlier
+releases printed the human banner on stdout here, which broke NDJSON parsing.
 
 Successful protocol operations preserve their MCP result shape: foreground
 tool calls return `CallToolResult`, `read` returns `ReadResourceResult`,
@@ -268,11 +275,40 @@ name exists. Process statuses are stable:
 | ---: | --- |
 | 0 | success |
 | 1 | no-match: the command ran and the thing asked about is not there (`find` matched nothing, `describe`/`bench` named something absent) |
-| 2 | local invocation or command usage error, including an unrecognized command word |
+| 2 | local invocation or command usage error, including an unrecognized command word and a tool call refused by the tool policy |
 | 3 | server rejection or tool error result |
 | 4 | transport or protocol connection failure (including a `--timeout`) |
-| 5 | authentication or authorization failure |
+| 5 | authentication or authorization failure reported by the server or the transport |
 | 6 | the run was interrupted with Ctrl-C |
+
+### Tool policy denials
+
+A tool call refused by `allow_tools`, `deny_tools`, `--allow-tool`, or
+`--deny-tool` (see [Connecting](connecting.md#restricting-tool-calls)) is
+never sent. In one-shot modes (`-e` and generated commands) it sets process
+status 2, whichever spelling made it: a generated command, `call`,
+`tool <name>`, an alias, `for`, `bench`, or a task-augmented call. Like every
+status in the table above, this applies to one-shot runs; at the interactive
+prompt the refusal is printed and the session continues. Status 5 stays
+reserved for credentials the server or transport rejected, so a script does
+not log in again to fix a local policy.
+
+```text
+error: tool call `delete_issue` denied by tool policy: in the deny list (profile work); it was not sent
+```
+
+Under `--json` the usual envelope gains a `toolPolicy` object. `rule` names
+the list that decided (`deny`, or `allow` when an allow list does not name the
+tool) and `sources` names where that list came from:
+
+```json
+{"error":"tool call `delete_issue` denied by tool policy: in the deny list (profile work); it was not sent","kind":"usage","exitStatus":2,"toolPolicy":{"tool":"delete_issue","rule":"deny","sources":["profile work"],"reason":"in the deny list (profile work)"}}
+```
+
+`info` reports the effective policy as `toolPolicy` (`null` when none
+applies). `tools` leaves denied tools out of its array and notes how many on
+stderr; `tools --all` includes them. `describe` of a denied tool adds a
+`toolPolicy` object with `"denied": true`.
 
 ## Schema snapshots and compatibility checks
 
