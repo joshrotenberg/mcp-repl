@@ -1433,31 +1433,67 @@ async fn get_task(client: &McpClient, id: &str) -> tower_mcp::Result<TaskObject>
 /// With `--host-input-fd`, input the task asks for goes to the host, and its
 /// questions expire no later than that deadline.
 async fn wait_for_one(
-    client: &McpClient,
+    session: &Session,
+    surface: &RwLock<Surface>,
     jobs: &Jobs,
     id: &str,
     limit: Option<Duration>,
 ) -> tower_mcp::Result<TaskObject> {
     tracing::debug!(task_id = ?id, "waiting for task via polling");
+    let deadline = host_input::deadline_after(limit);
     let wait = async {
         if host_input::enabled() {
-            host_input::wait_task(client, jobs, id, host_input::deadline_after(limit)).await
+            host_input::wait_task(&session.client(), jobs, id, deadline).await
         } else {
-            client.task_wait(id).await
+            wait_with_reconnect(session, surface, id).await
         }
     };
-    let result = match limit {
-        None => wait.await,
-        Some(limit) => match tokio::time::timeout(limit, wait).await {
+    let result = match (deadline, limit) {
+        (Some(deadline), Some(limit)) => match tokio::time::timeout_at(deadline, wait).await {
             Ok(result) => result,
             Err(_) => Err(tower_mcp::Error::Transport(format!(
-                "task {id} was still running after {}s (--timeout)",
+                "task {id} did not settle within {}s (--timeout)",
                 limit.as_secs()
             ))),
         },
+        _ => wait.await,
     };
     tracing::debug!(task_id = ?id, success = result.is_ok(), "foreground task wait returned");
     result
+}
+
+async fn wait_with_reconnect(
+    session: &Session,
+    surface: &RwLock<Surface>,
+    id: &str,
+) -> tower_mcp::Result<TaskObject> {
+    let (client, seen, target) = session.client_snapshot().expect("connected above");
+    let can_resume = session.can_reconnect() && uses_final_tasks(&client).await;
+    let error = match client.task_wait(id).await {
+        Err(error) if can_resume && is_session_lost(&error) => error,
+        result => return result,
+    };
+    drop(client);
+    if reconnect_for_command(session, surface, seen).await.is_err() {
+        return Err(error);
+    }
+    let (client, _, current_target) = session.client_snapshot().expect("reconnected above");
+    if current_target != target {
+        return Err(error);
+    }
+    if !uses_final_tasks(&client).await {
+        eprintln!(
+            "The replacement connection uses the stable protocol, so the task cannot be resumed on it."
+        );
+        return Err(error);
+    }
+    // The retry begins with tasks/get. tower-mcp resolves any input requests
+    // the server still reports as outstanding.
+    client.task_wait(id).await
+}
+
+fn task_poll_interval(interval_ms: Option<u64>) -> Duration {
+    Duration::from_millis(interval_ms.unwrap_or(1000).clamp(50, 30_000))
 }
 
 /// Record what a settled task means for the process exit status.
@@ -1490,7 +1526,8 @@ fn note_settled_task(task: &TaskObject) {
 ///
 /// `--timeout` applies per task, matching what it means for `wait <task>`.
 async fn wait_for_all(
-    client: &McpClient,
+    session: &Session,
+    surface: &RwLock<Surface>,
     jobs: &Arc<Jobs>,
     limit: Option<Duration>,
     started: std::time::Instant,
@@ -1508,7 +1545,7 @@ async fn wait_for_all(
     let outcomes_in_array = host_input::enabled() && json_output();
     let mut settled = Vec::new();
     for id in &ids {
-        match wait_for_one(client, jobs, id, limit).await {
+        match wait_for_one(session, surface, jobs, id, limit).await {
             Ok(task) => {
                 jobs.sync(id, task.status, task.status_message.clone());
                 note_settled_task(&task);
@@ -2254,13 +2291,13 @@ where
     F: Fn(Arc<McpClient>) -> Fut,
     Fut: Future<Output = Result<T, tower_mcp::Error>>,
 {
-    let seen = session.generation();
+    let (client, seen, _) = session.client_snapshot().expect("connected above");
     // Each attempt gets its own deadline: the retry only happens after a
     // reconnect, so it is a fresh request rather than a continuation.
     // `answer_aware` withholds the server's error text when the host answered
     // one of its questions during the request.
     let err = match with_deadline(host_input::command_request(host_input::answer_aware(op(
-        session.client(),
+        client,
     ))))
     .await
     {
@@ -2270,19 +2307,9 @@ where
     if !session.can_reconnect() || !is_session_lost(&err) {
         return Err(err);
     }
-    if let Err(reconnect_err) = session.reconnect(seen).await {
-        eprintln!("reconnect failed: {reconnect_err}");
+    if reconnect_for_command(session, surface, seen).await.is_err() {
         return Err(err);
     }
-    // The surface belongs to the old session: a restarted server may expose a
-    // different set of tools, and the completer and command dispatch both read
-    // this. Refresh before the retry so the retried command and the next
-    // prompt agree on what exists.
-    *surface.write().unwrap() = fetch_surface(&session.client()).await;
-    // stderr, so the note does not land in the middle of `--json` output
-    // being piped somewhere.
-    eprintln!("{}", paint(Style::new().dimmed(), "[reconnected]"));
-
     let retried = with_deadline(host_input::answer_aware(op(session.client()))).await;
     if let Err(e) = &retried
         && is_session_lost(e)
@@ -2294,6 +2321,21 @@ where
         );
     }
     retried
+}
+
+async fn reconnect_for_command(
+    session: &Session,
+    surface: &RwLock<Surface>,
+    seen: u64,
+) -> Result<(), ()> {
+    if let Err(error) = session.reconnect(seen, surface).await {
+        eprintln!("reconnect failed: {error}");
+        return Err(());
+    }
+    // stderr, so the note does not land in the middle of `--json` output
+    // being piped somewhere.
+    eprintln!("{}", paint(Style::new().dimmed(), "[reconnected]"));
+    Ok(())
 }
 
 /// How many pages one surface list may follow, and how many entries it may
@@ -2466,22 +2508,16 @@ async fn fetch_surface(client: &McpClient) -> Surface {
 /// gone. The four list calls swallow their own errors, so not-initialized is
 /// the one session-loss signal that survives to here; the typed session
 /// errors would have shown up as empty lists with a warning.
-async fn refresh_surface(session: &Session) -> Surface {
-    let (fresh, not_initialized) = fetch_surface_once(&session.client()).await;
-    if !not_initialized || !session.can_reconnect() {
-        return fresh;
+async fn refresh_surface(session: &Session, surface: &RwLock<Surface>) {
+    let (client, seen, _) = session.client_snapshot().expect("connected above");
+    let (fresh, not_initialized) = fetch_surface_once(&client).await;
+    if not_initialized
+        && session.can_reconnect()
+        && reconnect_for_command(session, surface, seen).await.is_ok()
+    {
+        return;
     }
-    let seen = session.generation();
-    match session.reconnect(seen).await {
-        Ok(()) => {
-            eprintln!("{}", paint(Style::new().dimmed(), "[reconnected]"));
-            fetch_surface(&session.client()).await
-        }
-        Err(e) => {
-            eprintln!("reconnect failed: {e}");
-            fresh
-        }
-    }
+    *surface.write().unwrap() = fresh;
 }
 
 /// Startup surface fetch with a bounded retry on the not-initialized
@@ -3452,45 +3488,115 @@ fn server_stderr_policy() -> std::process::Stdio {
 /// task-scoped `subscriptions/listen` stream for immediate notifications; the
 /// bounded polling loop remains authoritative for stable servers and for a
 /// final notification that is unavailable or dropped.
-async fn watch_task(
+fn watch_task(
     session: Arc<Session>,
     jobs: Arc<Jobs>,
     task_id: String,
     poll_interval: Option<u64>,
-) {
-    let generation = session.generation();
-    let client = session.client();
+) -> impl Future<Output = ()> {
+    let initial = session.client_snapshot();
+    async move {
+        let Some((client, initial_generation, target)) = initial else {
+            return;
+        };
+        let final_task = uses_final_tasks(&client).await;
+        drop(client);
+        let mut generations = session.subscribe_generation();
+        loop {
+            generations.borrow_and_update();
+            let Some((client, generation, current_target)) = session.client_snapshot() else {
+                return;
+            };
+            if current_target != target || jobs.is_terminal(&task_id) {
+                return;
+            }
+            let moved = generation != initial_generation;
+            let probe = moved && (!final_task || !uses_final_tasks(&client).await);
+            let outcome = tokio::select! {
+                biased;
+                changed = generations.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                outcome = async {
+                    if probe {
+                        let task = client.task_get(&task_id).await?;
+                        jobs.observe_task(&task);
+                        Ok(())
+                    } else {
+                        // A listen POST failure can close the entire transport
+                        // (tower-mcp#1713). Use polling alone after recovery.
+                        watch_task_on_client(&client, &jobs, &task_id, poll_interval, !moved).await
+                    }
+                } => outcome,
+            };
+            drop(client);
+            let Err(error) = outcome else {
+                return;
+            };
+            if matches!(&error, tower_mcp::Error::JsonRpc(error) if error.code == -32602) {
+                jobs.announce_gone(&task_id);
+                return;
+            }
+            // A command can reconnect a closed client. Keep the watcher
+            // dormant until then so it can poll on the replacement.
+            if probe || !is_session_lost(&error) || !session.can_reconnect() {
+                return;
+            }
+            tracing::debug!(?task_id, "background task watcher waiting for reconnect");
+            if generations.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+async fn watch_task_on_client(
+    client: &McpClient,
+    jobs: &Jobs,
+    task_id: &str,
+    poll_interval: Option<u64>,
+    subscribe: bool,
+) -> tower_mcp::Result<()> {
     let poll = async {
-        let mut interval_ms = poll_interval.unwrap_or(1000).clamp(50, 30_000);
+        let mut interval = task_poll_interval(poll_interval);
         let mut consecutive_errors = 0;
         loop {
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            if session.generation() != generation {
-                break;
+            tokio::time::sleep(interval).await;
+            if jobs.is_terminal(task_id) {
+                return Ok(());
             }
-            if jobs.is_terminal(&task_id) {
-                break;
-            }
-            tracing::debug!(?task_id, interval_ms, "polling background task status");
-            match client.task_get(&task_id).await {
+            tracing::debug!(
+                ?task_id,
+                interval_ms = interval.as_millis() as u64,
+                "polling background task status"
+            );
+            match client.task_get(task_id).await {
                 Ok(task) => {
                     consecutive_errors = 0;
-                    interval_ms = task.poll_interval.unwrap_or(1000).clamp(50, 30_000);
+                    interval = task_poll_interval(task.poll_interval);
                     let terminal = task.status.is_terminal();
                     jobs.observe_task(&task);
                     if terminal {
-                        break;
+                        return Ok(());
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     consecutive_errors += 1;
-                    if consecutive_errors >= 3 {
-                        break;
+                    if consecutive_errors >= 3
+                        || matches!(&error, tower_mcp::Error::JsonRpc(error) if error.code == -32602)
+                    {
+                        return Err(error);
                     }
                 }
             }
         }
     };
+    if !subscribe {
+        return poll.await;
+    }
     // Keep the subscription alive alongside polling. Neither opening the
     // stream nor receiving its first frame can hold up the polling timer.
     tokio::pin!(poll);
@@ -3500,13 +3606,18 @@ async fn watch_task(
         // cancel the stream on drop. An early exit can still beat ID delivery
         // during a session replacement, when the old transport is retiring.
         biased;
-        () = subscribe_to_task(&client, &task_id) => poll.await,
-        () = &mut poll => {}
+        () = subscribe_to_task(client, task_id) => poll.await,
+        result = &mut poll => result,
     }
 }
 
+async fn uses_final_tasks(client: &McpClient) -> bool {
+    client.selected_protocol_version().await.as_deref()
+        == Some(tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28)
+}
+
 async fn subscribe_to_task(client: &McpClient, task_id: &str) {
-    if client.selected_protocol_version().await.as_deref() != Some("2026-07-28") {
+    if !uses_final_tasks(client).await {
         return;
     }
     tracing::debug!("opening task subscription");
@@ -7420,9 +7531,6 @@ async fn handle_line(
                 println!("{}", timing(started.elapsed()));
             }
         }
-        // Task commands do not reconnect: a task id belongs to the session
-        // that created it, so a fresh session would only report it missing.
-        // "(gone)" from `jobs` is the honest answer there.
         "task" | "wait" | "cancel" => {
             // `wait` blocks until the task settles, so how long that took is
             // the most useful number the command can report.
@@ -7444,12 +7552,9 @@ async fn handle_line(
             // for one to wait on its own work.
             if cmd == "wait" && rest.is_empty() {
                 piped_prompts
-                    .foreground(wait_for_all(
-                        client.as_deref().expect("connected above"),
-                        jobs,
-                        wait_limit,
-                        started,
-                    ))
+                    .foreground(Box::pin(wait_for_all(
+                        session, surface, jobs, wait_limit, started,
+                    )))
                     .await;
                 return false;
             }
@@ -7491,10 +7596,7 @@ async fn handle_line(
                 "wait" => {
                     piped_prompts
                         .foreground(Box::pin(wait_for_one(
-                            client.as_deref().expect("connected above"),
-                            jobs,
-                            id,
-                            wait_limit,
+                            session, surface, jobs, id, wait_limit,
                         )))
                         .await
                 }
@@ -7763,7 +7865,8 @@ async fn handle_line(
         }
         "refresh" => {
             let started = std::time::Instant::now();
-            let fresh = refresh_surface(session).await;
+            refresh_surface(session, surface).await;
+            let fresh = surface.read().unwrap();
             if json_output() {
                 print_json(&serde_json::json!({
                     "tools": fresh.tools().len(),
@@ -7783,7 +7886,6 @@ async fn handle_line(
             if !json_output() {
                 println!("{}", timing(started.elapsed()));
             }
-            *surface.write().unwrap() = fresh;
         }
         "info" => match connection_info(client.as_deref().expect("connected above")).await {
             Some(info) => {
@@ -9856,6 +9958,8 @@ mod tests {
         incoming_tx: tokio::sync::mpsc::Sender<String>,
         incoming_rx: tokio::sync::mpsc::Receiver<String>,
         outgoing: Arc<Mutex<Vec<serde_json::Value>>>,
+        disconnect_on: Option<&'static str>,
+        error_on: Option<(&'static str, i32)>,
         connected: bool,
     }
 
@@ -9869,6 +9973,8 @@ mod tests {
                     incoming_tx,
                     incoming_rx,
                     outgoing: outgoing.clone(),
+                    disconnect_on: None,
+                    error_on: None,
                     connected: true,
                 },
                 outgoing,
@@ -9910,18 +10016,29 @@ mod tests {
         async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
             let request: serde_json::Value = serde_json::from_str(message)?;
             self.outgoing.lock().unwrap().push(request.clone());
-            if let Some(id) = request.get("id")
-                && let Some(result) = (self.respond)(&request)
+            if self
+                .disconnect_on
+                .is_some_and(|method| request["method"] == method)
             {
+                return Err(tower_mcp::Error::Transport("Transport closed".into()));
+            }
+            if let Some(id) = request.get("id") {
+                let response = if let Some((_, code)) = self
+                    .error_on
+                    .filter(|(method, _)| request["method"] == *method)
+                {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": code, "message": "scripted request error"},
+                    })
+                } else if let Some(result) = (self.respond)(&request) {
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                } else {
+                    return Ok(());
+                };
                 self.incoming_tx
-                    .send(
-                        serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": result,
-                        })
-                        .to_string(),
-                    )
+                    .send(response.to_string())
                     .await
                     .map_err(|error| tower_mcp::Error::Transport(error.to_string()))?;
             }
@@ -11886,14 +12003,7 @@ world",
         let mut polls = 0;
         let (transport, outgoing) = ScriptedTransport::new(move |request: &Value| {
             match request["method"].as_str().unwrap() {
-                "server/discover" => Some(json!({
-                    "resultType": "complete",
-                    "supportedVersions": ["2026-07-28"],
-                    "capabilities": {"tasks": {}},
-                    "ttlMs": 0,
-                    "cacheScope": "private",
-                    "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "task-test", "version": "0"}},
-                })),
+                "server/discover" => Some(final_task_discovery()),
                 // Keep the connection open without sending a subscription ack
                 // or any notifications. Only tasks/get can report progress.
                 "subscriptions/listen" => None,
@@ -11968,6 +12078,384 @@ world",
         assert_eq!(cancel["params"]["requestId"], listen["id"]);
     }
 
+    fn final_task_discovery() -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tasks": {}},
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "task-test", "version": "0"}},
+        })
+    }
+
+    async fn final_task_client(
+        transport: impl ClientTransport + 'static,
+    ) -> (McpClient, ConnectionInfo) {
+        scripted_task_client(transport, ProtocolMode::Final).await
+    }
+
+    async fn scripted_task_client(
+        transport: impl ClientTransport + 'static,
+        protocol: ProtocolMode,
+    ) -> (McpClient, ConnectionInfo) {
+        let client = client_builder(protocol, None)
+            .unwrap()
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        let info = establish_connection(&client, protocol).await.unwrap();
+        (client, info)
+    }
+
+    fn task_handshake(request: &serde_json::Value) -> serde_json::Value {
+        match request["method"].as_str().unwrap() {
+            "server/discover" => final_task_discovery(),
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tasks": {}},
+                "serverInfo": {"name": "task-test", "version": "0"},
+            }),
+            method => panic!("unexpected request: {method}"),
+        }
+    }
+
+    fn once_connector(connection: (McpClient, ConnectionInfo)) -> Connector {
+        let connection = Mutex::new(Some(connection));
+        Arc::new(move |_| {
+            let connection = connection.lock().unwrap().take().expect("one reconnect");
+            Box::pin(async move { Ok(connection) })
+        })
+    }
+
+    fn completed_final_task() -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete",
+            "taskId": "task-1",
+            "status": "completed",
+            "createdAt": "2026-07-28T00:00:00Z",
+            "lastUpdatedAt": "2026-07-28T00:00:01Z",
+            "ttlMs": null,
+            "result": {"resultType": "complete", "content": []},
+        })
+    }
+
+    #[tokio::test]
+    async fn wait_retries_the_same_task_read_on_the_new_client() {
+        use serde_json::Value;
+        use tower_mcp::protocol::TaskStatus;
+
+        let (mut transport, outgoing) = ScriptedTransport::new(|request: &Value| {
+            assert_eq!(request["method"], "server/discover");
+            Some(final_task_discovery())
+        });
+        transport.disconnect_on = Some("tasks/get");
+        let (client, _) = final_task_client(transport).await;
+        let connector: Connector = Arc::new(|_| {
+            Box::pin(async {
+                let (transport, _) = ScriptedTransport::new(|request: &Value| {
+                    match request["method"].as_str().unwrap() {
+                        "server/discover" => Some(final_task_discovery()),
+                        "tasks/get" => {
+                            assert_eq!(request["params"]["taskId"], "task-1");
+                            Some(completed_final_task())
+                        }
+                        method => panic!("unexpected request: {method}"),
+                    }
+                });
+                Ok(final_task_client(transport).await)
+            })
+        });
+        let session = Session::new(client, Some(connector));
+        let surface = Arc::new(RwLock::new(Surface::default()));
+        let jobs = Jobs::new(
+            AsyncOutput::new(Arc::new(AtomicBool::new(false)), false),
+            false,
+        );
+        let task = wait_for_one(
+            &session,
+            &surface,
+            &jobs,
+            "task-1",
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.generation(), 1);
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(
+            outgoing.lock().unwrap().last().unwrap()["params"]["taskId"],
+            "task-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_recovery_requires_final_protocol_on_both_clients_and_retries_once() {
+        use ProtocolMode::{Final, Stable};
+
+        for (initial, replacement, generation, retried) in [
+            (Stable, Final, 0, false),
+            (Final, Stable, 1, false),
+            (Final, Final, 1, true),
+        ] {
+            let (mut old, _) = ScriptedTransport::new(|request| Some(task_handshake(request)));
+            old.disconnect_on = Some("tasks/get");
+            let (client, _) = scripted_task_client(old, initial).await;
+            let (mut fresh, sent) = ScriptedTransport::new(|request| Some(task_handshake(request)));
+            fresh.disconnect_on = Some("tasks/get");
+            let connector = once_connector(scripted_task_client(fresh, replacement).await);
+            let session = Session::new(client, Some(connector));
+            let surface = RwLock::new(Surface::default());
+            let error = wait_with_reconnect(&session, &surface, "task-1")
+                .await
+                .unwrap_err();
+            assert!(
+                is_session_lost(&error),
+                "{initial:?} to {replacement:?}: {error}"
+            );
+            assert_eq!(
+                session.generation(),
+                generation,
+                "{initial:?} to {replacement:?}"
+            );
+            let sent = sent.lock().unwrap();
+            assert_eq!(
+                sent.iter()
+                    .filter(|frame| frame["method"] == "tasks/get")
+                    .count(),
+                usize::from(retried),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_reads_current_task_state_after_losing_an_update_response() {
+        use serde_json::{Value, json};
+        use tower_mcp::protocol::TaskStatus;
+
+        let mut polls = 0;
+        let (mut transport, outgoing) =
+            ScriptedTransport::new(move |request: &Value| {
+                match request["method"].as_str().unwrap() {
+                    "tasks/get" => {
+                        polls += 1;
+                        let mut task = completed_final_task();
+                        task.as_object_mut().unwrap().remove("result");
+                        if polls == 1 {
+                            task["status"] = json!("working");
+                            task["pollIntervalMs"] = json!(50);
+                        } else {
+                            task["status"] = json!("input_required");
+                            task["inputRequests"] =
+                                json!({"roots": {"method": "roots/list", "params": {}}});
+                        }
+                        Some(task)
+                    }
+                    _ => Some(task_handshake(request)),
+                }
+            });
+        transport.disconnect_on = Some("tasks/update");
+        let client = client_builder(ProtocolMode::Final, None)
+            .unwrap()
+            .with_roots(Vec::new())
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        establish_connection(&client, ProtocolMode::Final)
+            .await
+            .unwrap();
+        let (fresh, retried) =
+            ScriptedTransport::new(
+                |request: &Value| match request["method"].as_str().unwrap() {
+                    "tasks/get" => Some(completed_final_task()),
+                    _ => Some(task_handshake(request)),
+                },
+            );
+        let connector = once_connector(final_task_client(fresh).await);
+        let session = Session::new(client, Some(connector));
+        let surface = RwLock::new(Surface::default());
+        let jobs = Jobs::new(
+            AsyncOutput::new(Arc::new(AtomicBool::new(false)), false),
+            false,
+        );
+        let result = wait_for_one(
+            &session,
+            &surface,
+            &jobs,
+            "task-1",
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status, TaskStatus::Completed);
+        assert_eq!(session.generation(), 1);
+        let sent = outgoing.lock().unwrap();
+        assert_eq!(
+            sent.iter()
+                .map(|frame| frame["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["server/discover", "tasks/get", "tasks/get", "tasks/update"],
+        );
+        assert_eq!(
+            sent.last().unwrap()["params"]["inputResponses"],
+            json!({"roots": {"roots": []}})
+        );
+        let sent = retried.lock().unwrap();
+        assert_eq!(
+            sent.iter()
+                .map(|frame| frame["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["server/discover", "tasks/get"],
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_deadline_cancels_reconnect_before_publishing_the_surface() {
+        let (mut transport, outgoing) = ScriptedTransport::new(|request: &serde_json::Value| {
+            assert_eq!(request["method"], "server/discover");
+            Some(final_task_discovery())
+        });
+        transport.disconnect_on = Some("tasks/get");
+        let (client, _) = final_task_client(transport).await;
+        let fetching = Arc::new(AtomicBool::new(false));
+        let connector: Connector = {
+            let fetching = fetching.clone();
+            Arc::new(move |_| {
+                let fetching = fetching.clone();
+                Box::pin(async move {
+                    let (transport, _) =
+                        ScriptedTransport::new(move |request: &serde_json::Value| {
+                            match request["method"].as_str().unwrap() {
+                                "server/discover" => {
+                                    let mut discovery = final_task_discovery();
+                                    discovery["capabilities"]["tools"] = serde_json::json!({});
+                                    Some(discovery)
+                                }
+                                "tools/list" => {
+                                    fetching.store(true, Ordering::SeqCst);
+                                    None
+                                }
+                                method => panic!("unexpected request: {method}"),
+                            }
+                        });
+                    Ok(final_task_client(transport).await)
+                })
+            })
+        };
+        let session = Session::new(client, Some(connector));
+        let original_client = session.client();
+        let surface = Arc::new(RwLock::new(Surface::default()));
+        let jobs = Jobs::new(
+            AsyncOutput::new(Arc::new(AtomicBool::new(false)), false),
+            false,
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_one(
+                &session,
+                &surface,
+                &jobs,
+                "task-1",
+                Some(Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("the wait deadline must interrupt the reconnect")
+        .unwrap_err();
+        assert!(
+            matches!(error, tower_mcp::Error::Transport(message) if message.contains("did not settle within 1s (--timeout)"))
+        );
+        assert!(
+            fetching.load(Ordering::SeqCst),
+            "the replacement reached the surface fetch"
+        );
+        assert_eq!(session.generation(), 0);
+        assert!(Arc::ptr_eq(&original_client, &session.client()));
+        assert_eq!(
+            outgoing.lock().unwrap().last().unwrap()["params"]["taskId"],
+            "task-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_task_watcher_moves_to_the_reconnected_client() {
+        use serde_json::Value;
+        use tower_mcp::protocol::TaskStatus;
+
+        let (mut transport, initial_frames) = ScriptedTransport::new(
+            |request: &Value| match request["method"].as_str().unwrap() {
+                "subscriptions/listen" => None,
+                _ => Some(task_handshake(request)),
+            },
+        );
+        transport.disconnect_on = Some("tasks/get");
+        let (client, _) = final_task_client(transport).await;
+        let (replacement, replacement_frames) =
+            ScriptedTransport::new(
+                |request: &Value| match request["method"].as_str().unwrap() {
+                    "tasks/get" => {
+                        assert_eq!(request["params"]["taskId"], "task-1");
+                        Some(completed_final_task())
+                    }
+                    _ => Some(task_handshake(request)),
+                },
+            );
+        let connector = once_connector(final_task_client(replacement).await);
+        let session = Arc::new(Session::new(client, Some(connector)));
+        let old_client = session.client();
+        let jobs = Arc::new(Jobs::new(
+            AsyncOutput::new(Arc::new(AtomicBool::new(false)), false),
+            true,
+        ));
+        jobs.register(
+            "task-1".into(),
+            "slow_add".into(),
+            TaskStatus::Working,
+            None,
+        );
+        let watcher = watch_task(session.clone(), jobs.clone(), "task-1".into(), Some(50));
+        tokio::pin!(watcher);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            std::future::poll_fn(|cx| {
+                assert!(
+                    watcher.as_mut().poll(cx).is_pending(),
+                    "watcher exited before recovery"
+                );
+                // Once dormant, the watcher has released its client and is
+                // waiting on the generation signal. The session and test
+                // own the remaining references.
+                if Arc::strong_count(&old_client) == 2 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            assert!(
+                initial_frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|frame| frame["method"] == "tasks/get")
+            );
+            session
+                .reconnect(0, &RwLock::new(Surface::default()))
+                .await
+                .unwrap();
+            watcher.await;
+        })
+        .await
+        .expect("the dormant watcher must resume on the new client");
+        assert_eq!(jobs.list()[0].status, TaskStatus::Completed);
+        let sent = replacement_frames.lock().unwrap();
+        assert_eq!(
+            sent.iter()
+                .map(|frame| frame["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["server/discover", "tasks/get"]
+        );
+    }
+
     /// A session whose connector builds a fresh demo client, counting how
     /// many times it is asked to.
     async fn demo_session() -> (Arc<Session>, Arc<std::sync::atomic::AtomicUsize>) {
@@ -11988,6 +12476,65 @@ world",
             Arc::new(Session::new(demo_client().await, Some(connector))),
             connects,
         )
+    }
+
+    #[tokio::test]
+    async fn stable_task_watcher_reports_gone_only_if_the_replacement_rejects_the_task() {
+        use serde_json::{Value, json};
+        use tower_mcp::protocol::TaskStatus;
+
+        for error in [None, Some(-32602), Some(-32603)] {
+            let (mut transport, outgoing) = ScriptedTransport::new(|request: &Value| {
+                match request["method"].as_str().unwrap() {
+                    "tasks/get" => Some(json!({
+                        "taskId": "task-1",
+                        "status": "working",
+                        "statusMessage": "still working on the replacement",
+                        "createdAt": "2026-07-28T00:00:00Z",
+                        "lastUpdatedAt": "2026-07-28T00:00:01Z",
+                    })),
+                    _ => Some(task_handshake(request)),
+                }
+            });
+            transport.error_on = error.map(|code| ("tasks/get", code));
+            let connector =
+                once_connector(scripted_task_client(transport, ProtocolMode::Stable).await);
+            let session = Arc::new(Session::new(demo_client().await, Some(connector)));
+            let output = AsyncOutput::new(Arc::new(AtomicBool::new(true)), true);
+            let printer = output.external_printer().unwrap();
+            let jobs = Arc::new(Jobs::new(output, true));
+            jobs.register(
+                "task-1".into(),
+                "slow_add".into(),
+                TaskStatus::Working,
+                None,
+            );
+            let watcher = watch_task(session.clone(), jobs.clone(), "task-1".into(), Some(50));
+            session
+                .reconnect(0, &RwLock::new(Surface::default()))
+                .await
+                .unwrap();
+            watcher.await;
+            if error == Some(-32602) {
+                assert!(printer.get_line().unwrap().ends_with("(gone)"));
+            }
+            assert_eq!(printer.get_line(), None);
+            let job = &jobs.list()[0];
+            assert_eq!(job.status, TaskStatus::Working);
+            assert_eq!(
+                job.status_message.as_deref(),
+                error
+                    .is_none()
+                    .then_some("still working on the replacement")
+            );
+            let sent = outgoing.lock().unwrap();
+            let probes: Vec<_> = sent
+                .iter()
+                .filter(|frame| frame["method"] == "tasks/get")
+                .collect();
+            assert_eq!(probes.len(), 1);
+            assert_eq!(probes[0]["params"]["taskId"], "task-1");
+        }
     }
 
     /// The regression this fixes: the server drops the session mid-command,

@@ -841,11 +841,16 @@ class Session:
                 if _unknown_task(error, ref.task_id):
                     self._task = None
                 if wait_seconds is not None and error.response["exitStatus"] == 4:
-                    expected = "task {} was still running after {}s (--timeout)".format(
+                    legacy = "task {} was still running after {}s (--timeout)".format(
                         ref.task_id, wait_seconds,
                     )
-                    if str(error) in (expected, "Transport error: " + expected):
-                        raise TaskPending(str(error), error.request_id, error.response)
+                    current = "task {} did not settle within {}s (--timeout)".format(
+                        ref.task_id, wait_seconds,
+                    )
+                    message = str(error)
+                    if any(message in (text, "Transport error: " + text)
+                           for text in (legacy, current)):
+                        raise TaskPending(message, error.request_id, error.response)
 
             return self._request(command, task_reply, timeout=wait_seconds, on_error=task_error)
 

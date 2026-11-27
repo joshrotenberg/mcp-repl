@@ -114,7 +114,7 @@ async fn run(
 
         // Mark the current generation observed before opening work on its
         // client. A concurrent reconnect either wakes `changed()` below or is
-        // caught by the atomic comparison before an ending is retried.
+        // caught by the generation comparison before an ending is retried.
         let generation = session.generation();
         generations.borrow_and_update();
         let Some(client) = session.try_client() else {
@@ -390,7 +390,8 @@ mod tests {
 
         wait_for_listens(&listens, 1).await;
         assert_eq!(listens.load(Ordering::SeqCst), 1);
-        session.reconnect(0).await.unwrap();
+        let surface = std::sync::RwLock::new(crate::Surface::default());
+        session.reconnect(0, &surface).await.unwrap();
         wait_for_listens(&listens, 2).await;
         assert_eq!(listens.load(Ordering::SeqCst), 2);
         assert_eq!(session.generation(), 1);

@@ -17,7 +17,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tower_mcp::client::McpClient;
@@ -52,18 +51,24 @@ pub type Connector = Arc<
 /// The live client plus, when the transport supports it, the means to
 /// re-establish it.
 pub struct Session {
-    client: RwLock<Option<Arc<McpClient>>>,
+    connection: RwLock<Connection>,
     connector: RwLock<Option<Connector>>,
     /// Serializes reconnects so two failing commands do not both rebuild.
     reconnecting: tokio::sync::Mutex<()>,
-    /// Bumped on every successful reconnect. A caller that saw generation N
-    /// and finds N+1 after taking the lock knows someone else already
-    /// reconnected and skips its own attempt.
-    generation: AtomicU64,
     /// Wakes long-lived work tied to the current client so it can move to the
-    /// replacement immediately. Polling the atomic would leave an old final
-    /// subscription alive until its transport happened to close.
+    /// replacement immediately. Checking the generation between requests
+    /// would leave an old final subscription alive until its transport closed.
     generation_tx: tokio::sync::watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct Connection {
+    client: Option<Arc<McpClient>>,
+    /// Bumped on every successful reconnect or explicit switch.
+    generation: u64,
+    /// Bumped only on an explicit switch, even if a watcher misses that
+    /// generation and wakes after another reconnect.
+    target: u64,
 }
 
 impl Session {
@@ -73,10 +78,12 @@ impl Session {
     pub fn new(client: McpClient, connector: Option<Connector>) -> Self {
         let (generation_tx, _) = tokio::sync::watch::channel(0);
         Self {
-            client: RwLock::new(Some(Arc::new(client))),
+            connection: RwLock::new(Connection {
+                client: Some(Arc::new(client)),
+                ..Connection::default()
+            }),
             connector: RwLock::new(connector),
             reconnecting: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
             generation_tx,
         }
     }
@@ -85,10 +92,9 @@ impl Session {
     pub fn disconnected() -> Self {
         let (generation_tx, _) = tokio::sync::watch::channel(0);
         Self {
-            client: RwLock::new(None),
+            connection: RwLock::new(Connection::default()),
             connector: RwLock::new(None),
             reconnecting: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
             generation_tx,
         }
     }
@@ -103,11 +109,11 @@ impl Session {
     /// disconnected. Completion and long-lived listeners use this rather
     /// than manufacturing requests before the first `connect`.
     pub fn try_client(&self) -> Option<Arc<McpClient>> {
-        self.client.read().unwrap().clone()
+        self.connection.read().unwrap().client.clone()
     }
 
     pub fn is_connected(&self) -> bool {
-        self.client.read().unwrap().is_some()
+        self.connection.read().unwrap().client.is_some()
     }
 
     pub fn can_reconnect(&self) -> bool {
@@ -115,7 +121,17 @@ impl Session {
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.connection.read().unwrap().generation
+    }
+
+    /// Snapshot a client with its generation and target under the same lock.
+    pub fn client_snapshot(&self) -> Option<(Arc<McpClient>, u64, u64)> {
+        let connection = self.connection.read().unwrap();
+        Some((
+            connection.client.clone()?,
+            connection.generation,
+            connection.target,
+        ))
     }
 
     /// Observe successful reconnects. Long-lived requests should reopen on
@@ -129,7 +145,7 @@ impl Session {
     /// The line editor keeps its own handle to the session, so the interactive
     /// path cannot take ownership the way [`Session::shutdown`] does.
     pub async fn close(&self) -> Result<(), tower_mcp::Error> {
-        let Some(client) = self.client.write().unwrap().take() else {
+        let Some(client) = self.connection.write().unwrap().client.take() else {
             return Ok(());
         };
         let client = Arc::try_unwrap(client).map_err(|_| {
@@ -145,9 +161,10 @@ impl Session {
     /// process exit status so stdio children see EOF and are reaped cleanly.
     pub async fn shutdown(self) -> Result<(), tower_mcp::Error> {
         let Some(client) = self
-            .client
+            .connection
             .into_inner()
             .expect("session client lock poisoned")
+            .client
         else {
             return Ok(());
         };
@@ -159,10 +176,13 @@ impl Session {
         client.shutdown().await
     }
 
-    /// Rebuild the connection, unless another caller already did so since
-    /// `seen` was read. Returns `Ok(())` either way; the caller should
-    /// re-read [`Session::client`] afterwards.
-    pub async fn reconnect(&self, seen: u64) -> Result<(), tower_mcp::Error> {
+    /// Rebuild the connection and its surface unless another caller already
+    /// did so since `seen` was read. The caller should re-read the client.
+    pub async fn reconnect(
+        &self,
+        seen: u64,
+        surface: &RwLock<crate::Surface>,
+    ) -> Result<(), tower_mcp::Error> {
         let Some(connector) = self.connector.read().unwrap().clone() else {
             return Err(tower_mcp::Error::Transport(
                 "this transport cannot be reconnected".to_string(),
@@ -182,8 +202,15 @@ impl Session {
         // pause makes the retry land after the bind rather than during it.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let (fresh, _info) = connector(ConnectorMode::Reconnect).await?;
-        *self.client.write().unwrap() = Some(Arc::new(fresh));
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // The surfaced commands and the client move together. A cancelled
+        // fetch leaves the current client and surface in place.
+        let fresh_surface = crate::fetch_surface(&fresh).await;
+        let mut surface = surface.write().unwrap();
+        let mut connection = self.connection.write().unwrap();
+        *surface = fresh_surface;
+        connection.client = Some(Arc::new(fresh));
+        connection.generation += 1;
+        let generation = connection.generation;
         self.generation_tx.send_replace(generation);
         tracing::debug!(generation, "reconnected");
         Ok(())
@@ -202,8 +229,11 @@ impl Session {
         // this lock observes the bumped generation and reuses this client.
         let _guard = self.reconnecting.lock().await;
         *self.connector.write().unwrap() = connector;
-        let previous = self.client.write().unwrap().replace(Arc::new(client));
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut connection = self.connection.write().unwrap();
+        let previous = connection.client.replace(Arc::new(client));
+        connection.target += 1;
+        connection.generation += 1;
+        let generation = connection.generation;
         self.generation_tx.send_replace(generation);
         tracing::debug!(generation, "replaced session connection");
         previous
