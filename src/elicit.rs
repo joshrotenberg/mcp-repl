@@ -28,7 +28,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex as SyncMutex, RwLock};
 
 use async_trait::async_trait;
 use nu_ansi_term::{Color, Style};
@@ -150,19 +150,106 @@ pub(crate) async fn run_terminal_prompt<T: Send + 'static>(
     spawn_terminal_prompt(guard, prompt).await
 }
 
+/// Shared by piped command dispatch and every handler it installs.
+#[derive(Clone, Default)]
+pub(crate) struct PipedPrompts(Option<Arc<SyncMutex<ForegroundState>>>);
+
+#[derive(Default)]
+struct ForegroundState {
+    depth: usize,
+    generation: u64,
+}
+
+impl PipedPrompts {
+    pub(crate) fn new(piped: bool) -> Self {
+        Self(piped.then(|| Arc::new(SyncMutex::default())))
+    }
+
+    pub(crate) async fn foreground<T>(&self, operation: impl Future<Output = T>) -> T {
+        let _foreground = self.0.as_deref().map(|state| {
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .depth += 1;
+            ForegroundGuard(state)
+        });
+        operation.await
+    }
+}
+
+struct ForegroundGuard<'a>(&'a SyncMutex<ForegroundState>);
+
+impl Drop for ForegroundGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.depth -= 1;
+        // Invalidate queued prompts when the last foreground scope exits.
+        if state.depth == 0 {
+            state.generation = state.generation.wrapping_add(1);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PromptRefusal {
+    CommandReader,
+    NoForeground,
+}
+
+struct PromptTurn<'a> {
+    editor: u64,
+    foreground: Option<(&'a SyncMutex<ForegroundState>, u64)>,
+}
+
+impl<'a> PromptTurn<'a> {
+    fn capture(at_prompt: &AtomicBool, piped: &'a PipedPrompts) -> Result<Self, PromptRefusal> {
+        let editor = EDITOR_TURNS.load(Ordering::SeqCst);
+        if at_prompt.load(Ordering::SeqCst) {
+            return Err(PromptRefusal::CommandReader);
+        }
+        // tower-mcp supplies no originating operation or task identity here.
+        // A callback during a prompt-capable foreground operation may still
+        // come from a background task. Admit it so the foreground can prompt.
+        let foreground = if let Some(state) = piped.0.as_deref() {
+            let current = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.depth == 0 {
+                return Err(PromptRefusal::NoForeground);
+            }
+            Some((state, current.generation))
+        } else {
+            None
+        };
+        Ok(Self { editor, foreground })
+    }
+}
+
 async fn prompt_unless_editor<T: Send + 'static>(
-    editor_turn: u64,
+    turn: PromptTurn<'_>,
     prompt: impl FnOnce() -> T + Send + 'static,
-) -> Result<Option<T>, JsonRpcError> {
-    let guard = lock_terminal_for_prompt(Some(editor_turn)).await;
-    // Check under the lock before starting a blocking task. The turn
-    // cannot change again until that task releases the guard.
-    if EDITOR_TURNS.load(Ordering::SeqCst) != editor_turn {
-        return Ok(None);
+) -> Result<Result<T, PromptRefusal>, JsonRpcError> {
+    let guard = lock_terminal_for_prompt(Some(turn.editor)).await;
+    // A queued callback cannot read once the command reader has taken a turn
+    // or all foreground operations it could belong to have ended.
+    if EDITOR_TURNS.load(Ordering::SeqCst) != turn.editor {
+        return Ok(Err(PromptRefusal::CommandReader));
+    }
+    if turn.foreground.is_some_and(|(state, expected)| {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+            != expected
+    }) {
+        return Ok(Err(PromptRefusal::NoForeground));
     }
     spawn_terminal_prompt(guard, prompt)
         .await
-        .map(Some)
+        .map(Ok)
         .map_err(|e| JsonRpcError::internal_error(e.to_string()))
 }
 
@@ -221,6 +308,7 @@ pub type ServerLabel = Arc<RwLock<String>>;
 pub struct ReplClientHandler {
     notifications: NotificationHandler,
     at_prompt: Arc<AtomicBool>,
+    piped_prompts: PipedPrompts,
     server: ServerLabel,
     output: AsyncOutput,
     host: Option<crate::host_input::Connection>,
@@ -236,10 +324,16 @@ impl ReplClientHandler {
         Self {
             notifications,
             at_prompt,
+            piped_prompts: PipedPrompts::default(),
             server,
             output,
             host: None,
         }
+    }
+
+    pub(crate) fn with_piped_prompts(mut self, prompts: PipedPrompts) -> Self {
+        self.piped_prompts = prompts;
+        self
     }
 
     pub(crate) fn with_host(mut self, host: Option<crate::host_input::Connection>) -> Self {
@@ -262,22 +356,34 @@ impl ReplClientHandler {
         self.output.line(message);
     }
 
-    fn decline_sampling_at_prompt(&self) -> JsonRpcError {
-        self.note(format!(
-            "{} declined a completion request from the server. The command reader took the \
-             terminal. Run the tool in the foreground to answer it.",
-            tag(Style::new().fg(Color::Purple), "sampling"),
-        ));
-        sampling::declined("the command reader took the terminal")
+    fn decline_sampling(&self, refusal: PromptRefusal) -> JsonRpcError {
+        sampling::declined(self.note_refusal("sampling", "a completion request", refusal))
     }
 
-    fn decline_elicitation_at_prompt(&self) -> ElicitResult {
-        self.note(format!(
-            "{} declined a request from the server. The command reader took the terminal. \
-             Run the tool in the foreground to answer it.",
-            tag(Style::new().fg(Color::Purple), "elicit"),
-        ));
+    fn decline_elicitation(&self, refusal: PromptRefusal) -> ElicitResult {
+        self.note_refusal("elicit", "a request", refusal);
         ElicitResult::decline()
+    }
+
+    fn note_refusal(&self, kind: &str, request: &str, refusal: PromptRefusal) -> &'static str {
+        let (sentence, reason, hint) = match refusal {
+            PromptRefusal::CommandReader => (
+                "The command reader took the terminal.",
+                "the command reader took the terminal",
+                "Run the tool in the foreground to answer it.",
+            ),
+            PromptRefusal::NoForeground => (
+                "No foreground operation can answer on piped stdin.",
+                "no foreground operation can answer on piped stdin",
+                "Run the tool in the foreground, or `wait` for the task on the stable lifecycle, \
+                 to answer it.",
+            ),
+        };
+        self.note(format!(
+            "{} declined {request} from the server. {sentence} {hint}",
+            tag(Style::new().fg(Color::Purple), kind),
+        ));
+        reason
     }
 }
 
@@ -302,13 +408,11 @@ impl ClientHandler for ReplClientHandler {
                 Ok(sampling::canned(&params))
             }
             SamplingMode::Prompt => {
-                let editor_turn = EDITOR_TURNS.load(Ordering::SeqCst);
-                if self.at_prompt.load(Ordering::SeqCst) {
-                    return Err(self.decline_sampling_at_prompt());
-                }
-                prompt_unless_editor(editor_turn, move || sampling::prompt(&params))
+                let turn = PromptTurn::capture(&self.at_prompt, &self.piped_prompts)
+                    .map_err(|refusal| self.decline_sampling(refusal))?;
+                prompt_unless_editor(turn, move || sampling::prompt(&params))
                     .await?
-                    .unwrap_or_else(|| Err(self.decline_sampling_at_prompt()))
+                    .unwrap_or_else(|refusal| Err(self.decline_sampling(refusal)))
             }
         }
     }
@@ -329,10 +433,10 @@ impl ClientHandler for ReplClientHandler {
             ));
             return Ok(ElicitResult::decline());
         }
-        let editor_turn = EDITOR_TURNS.load(Ordering::SeqCst);
-        if self.at_prompt.load(Ordering::SeqCst) {
-            return Ok(self.decline_elicitation_at_prompt());
-        }
+        let turn = match PromptTurn::capture(&self.at_prompt, &self.piped_prompts) {
+            Ok(turn) => turn,
+            Err(refusal) => return Ok(self.decline_elicitation(refusal)),
+        };
         let server = self.server_name();
         let answered = match params {
             // 2025-11-25 and 2026-07-28 URL requests differ only in whether
@@ -353,15 +457,14 @@ impl ClientHandler for ReplClientHandler {
                 let link = url;
                 // Accepting says the operator completed an out-of-band flow,
                 // so it has to be the operator who says it.
-                prompt_unless_editor(editor_turn, move || confirm_url(&server, &message, &link))
-                    .await?
+                prompt_unless_editor(turn, move || confirm_url(&server, &message, &link)).await?
             }
             ElicitRequestParams::Form(form) => {
-                prompt_unless_editor(editor_turn, move || prompt_form(&server, &form)).await?
+                prompt_unless_editor(turn, move || prompt_form(&server, &form)).await?
             }
             _ => return Ok(ElicitResult::decline()),
         };
-        Ok(answered.unwrap_or_else(|| self.decline_elicitation_at_prompt()))
+        Ok(answered.unwrap_or_else(|refusal| self.decline_elicitation(refusal)))
     }
 
     async fn on_notification(&self, notification: ServerNotification) {
@@ -993,7 +1096,9 @@ mod tests {
     #[tokio::test]
     async fn an_editor_turn_invalidates_a_waiting_prompt() {
         let _editor_test = EDITOR_TURN_TEST_LOCK.lock().await;
-        let editor_turn = EDITOR_TURNS.load(Ordering::SeqCst);
+        let at_prompt = AtomicBool::new(false);
+        let prompts = PipedPrompts::default();
+        let turn = PromptTurn::capture(&at_prompt, &prompts).expect("prompt initially allowed");
         let (read_finished, wait_for_readline) = oneshot::channel();
         let readline = std::thread::spawn(move || {
             with_readline_terminal(&AtomicBool::new(false), || {});
@@ -1004,12 +1109,78 @@ mod tests {
 
         let answer = tokio::time::timeout(
             Duration::from_secs(5),
-            prompt_unless_editor(editor_turn, || panic!("stale prompt ran")),
+            prompt_unless_editor(turn, || panic!("stale prompt ran")),
         )
         .await
         .expect("stale prompt resolved")
-        .expect("stale prompt was refused");
-        assert_eq!(answer, None::<()>);
+        .expect("prompt task did not fail");
+        assert!(matches!(answer, Err::<(), _>(PromptRefusal::CommandReader)));
+    }
+
+    #[tokio::test]
+    async fn a_queued_piped_prompt_cannot_cross_foreground_operations() {
+        let _editor_test = EDITOR_TURN_TEST_LOCK.lock().await;
+        let at_prompt = AtomicBool::new(false);
+        let prompts = PipedPrompts::new(true);
+        let terminal = terminal_lock().lock_owned().await;
+        let mut operation = Box::pin(prompts.foreground(std::future::pending::<()>()));
+        tokio::select! {
+            biased;
+            () = &mut operation => panic!("foreground operation ended early"),
+            () = std::future::ready(()) => {}
+        }
+        let turn = PromptTurn::capture(&at_prompt, &prompts).expect("operation can prompt");
+        let queued = prompt_unless_editor(turn, || panic!("stale piped prompt ran"));
+        tokio::pin!(queued);
+        tokio::select! {
+            biased;
+            _ = &mut queued => panic!("prompt finished while the terminal was held"),
+            () = std::future::ready(()) => {}
+        }
+
+        drop(operation);
+        assert!(matches!(
+            PromptTurn::capture(&at_prompt, &prompts),
+            Err(PromptRefusal::NoForeground)
+        ));
+        prompts
+            .foreground(async {
+                drop(terminal);
+                let answer = tokio::time::timeout(Duration::from_secs(5), queued)
+                    .await
+                    .expect("queued prompt resolved")
+                    .expect("prompt task did not fail");
+                assert!(matches!(answer, Err::<(), _>(PromptRefusal::NoForeground)));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn nested_foreground_operations_keep_piped_prompts_admitted() {
+        let _editor_test = EDITOR_TURN_TEST_LOCK.lock().await;
+        let at_prompt = AtomicBool::new(false);
+        let prompts = PipedPrompts::new(true);
+
+        prompts
+            .foreground(async {
+                let turn = prompts
+                    .foreground(async {
+                        PromptTurn::capture(&at_prompt, &prompts)
+                            .expect("nested operation can prompt")
+                    })
+                    .await;
+                let answer = prompt_unless_editor(turn, || "answered")
+                    .await
+                    .expect("prompt task did not fail")
+                    .expect("outer operation keeps the prompt eligible");
+                assert_eq!(answer, "answered");
+            })
+            .await;
+
+        assert!(matches!(
+            PromptTurn::capture(&at_prompt, &prompts),
+            Err(PromptRefusal::NoForeground)
+        ));
     }
 
     /// Build a field the way a server does: as JSON on the wire, parsed

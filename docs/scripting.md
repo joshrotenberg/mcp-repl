@@ -417,6 +417,22 @@ list-change subscriptions are disabled in bridge mode. Run `refresh` to
 update the final protocol's discovered surface. Stable list-change
 notifications still refresh the surface automatically.
 
+## Prompts on piped stdin
+
+In a piped REPL session, server elicitation and sampling can read an answer
+from stdin only during a foreground tool call, `bench`, `prompt`, `read`, or
+`wait`. The REPL declines requests that arrive outside those operations or
+are still queued when the last eligible operation ends. `task <id> respond`
+reads answers for the task's outstanding questions directly. `-e`, generated
+commands, and requests sent to `--host-input-fd` bypass this gate.
+
+The client cannot tell which operation a server callback belongs to. If a
+background task asks while a foreground operation can prompt, the callback
+may still consume the next input line. Run tools that need answers in the
+foreground and avoid overlapping them with background tasks that may ask
+for input. If an operation is cancelled or times out after its prompt starts
+reading, the prompt still takes the next input line.
+
 ## Waiting for background tasks
 
 A tool that requires task-augmented execution has to be started with a
