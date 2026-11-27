@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-11-27
+
+### Bug Fixes
+
+- **jobs:** Poll background tasks while their subscription opens (#381)
+- **wait:** Recover a closed transport while waiting on a task (#382)
+- **elicit:** Keep background prompts off a foreground command's piped input (#377)
+
+### Documentation
+
+- Tighten README (#385)
+
+### Features
+
+- Embed agent skills and manage Claude Code/Codex plugins (#367)
+- Expose profile-scoped tool allow and deny policy (#373)
+- Structured needs-input bridge for agent-driven elicitation and sampling (#374)
+- Bounded agent discovery and result previews with full output artifacts (#371)
+- Reusable persistent-session driver for agent workflows (#372)
+- **driver:** Answer host-input requests from the session driver (#380)
+- **host-input:** Answer parked task input through the bridge (#379)
+
+
+
 ## [0.4.1] - 2026-11-24
 
 ### Bug Fixes
