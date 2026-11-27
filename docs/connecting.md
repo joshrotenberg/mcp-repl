@@ -342,6 +342,81 @@ mcp-repl cratesio                  # a bare name works too
   `--config` file is an error. A missing file at the default location is not:
   profiles are opt-in.
 
+### Restricting tool calls
+
+A profile can limit which tools may be called, and so can one invocation:
+
+```toml
+[servers.work]
+url = "https://mcp.example.com/mcp"
+allow_tools = ["search", "get_issue"]
+deny_tools = ["delete_issue"]
+```
+
+```bash
+mcp-repl --server work --deny-tool get_issue        # narrow the profile further
+mcp-repl --allow-tool search,get_issue -- ./server  # flags alone, any target
+```
+
+Entries are exact raw MCP tool names, compared case-sensitively. There are
+no patterns: an entry containing `*`, `?`, `[` or `]` is a usage error, since
+a glob in an allow list would quietly admit tools a server adds later.
+`--allow-tool` and `--deny-tool` repeat and also accept a comma-separated
+list.
+
+| configured | effect |
+| --- | --- |
+| nothing | no policy; behavior is unchanged |
+| only an allow list | only the listed tools can be called; every other tool is refused, including unannotated tools and tools that appear after a refresh or reconnect |
+| only a deny list | the listed tools are refused; everything else can be called |
+| both | a tool can be called when it is allowed and not denied; deny wins, and a name on both lists warns |
+| `allow_tools = []` | every tool call is refused |
+
+Flags can narrow a profile but never widen it. The effective allow list is the
+intersection of the profile's `allow_tools` and `--allow-tool`, where each is
+set; the effective deny list is the union of `deny_tools` and `--deny-tool`.
+An `--allow-tool` name the profile does not allow stays refused, with a
+warning. A target that is not a profile (a URL, a stdio command, `demo`, or an
+imported config entry) gets the flags alone; imported entries carry no policy
+of their own.
+
+The policy is enforced in one place: tower-mcp's client-side tool-call policy
+hook, which checks every outbound `tools/call` before a request id is
+allocated. Every way of calling a tool goes through it, including generated
+commands, `call`, `tool <name>`, aliases, `for`, `bench`, task-augmented
+calls (`&`), `-e`, and the interactive prompt. A refused call is never sent.
+Every spelling gets the same `error:` diagnostic. In one-shot modes (`-e` and
+generated commands) it is a `usage` failure with process status 2 and a
+`toolPolicy` object under `--json` (see
+[Scripting](scripting.md#tool-policy-denials)). At the interactive prompt it
+is reported like any other failed command: the session continues and the
+REPL's own exit status is unaffected. `bench` stops at the first refusal and
+reports it once.
+
+The policy belongs to the connection. A transparent HTTP reconnect rebuilds
+the client with the same policy. `connect` rebuilds it for the new target from
+that target's profile and the flags, and prints it after the banner. Global
+aliases (`[aliases]`, or `alias --global`) survive a switch and are checked
+against the new policy when they run, so a global alias made while a tool was
+allowed is refused once it is not, exactly as a raw `call` would be.
+Profile-scoped aliases follow the active profile: they are available only
+while connected through the profile that defines them. Task lifecycle
+requests (`task`, `wait`, `cancel`) are not tool calls and are outside the
+policy; they only reach tasks this connection started.
+
+Listings leave denied tools out and say how many they hid: `tools`, `find`,
+`help`, the startup overview, completion, and generated `--help`. A hidden
+tool is never merely omitted while still callable: only tools whose calls are
+refused are hidden. `tools --all` lists them, and `describe <tool>` still shows
+a denied tool's definition, marked as denied. `info` shows the effective
+lists and where they came from; `--list-servers` shows each profile's counts.
+
+This is a client-side control, not a sandbox, and it does not replace the
+server's own authorization. Server annotations such as `readOnlyHint` or
+`destructiveHint` are advisory metadata and play no part in it. Launching
+mcp-repl from another MCP host's shell does not carry over that host's own
+per-tool approval rules; configure the policy here as well.
+
 ### Importing standard MCP configs
 
 `--scan` prints what other MCP clients already have configured, so you do not

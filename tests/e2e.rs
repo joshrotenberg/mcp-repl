@@ -315,6 +315,12 @@ struct HttpFixture {
     subscription_file: PathBuf,
     resource_subscriptions_file: PathBuf,
     tool_calls_file: PathBuf,
+    /// One raw tool name per `tools/call` attempt the server received at
+    /// ingress, before any injected fault, when the logs are enabled.
+    tool_call_log: PathBuf,
+    /// One raw tool name per `tools/call` request that passed the fixture's
+    /// 503 injector, when the logs are enabled.
+    tool_call_past_503_log: PathBuf,
     trace_file: PathBuf,
 }
 
@@ -350,12 +356,34 @@ impl HttpFixture {
         Self::start_configured(fixture, temp, None, Some(HttpFailure::Always), None).await
     }
 
+    /// A fixture that records the name of every tool call it receives, for
+    /// proving that a refused call never reached the server.
+    async fn start_logging_tool_calls(
+        fixture: &Path,
+        temp: &TempDir,
+        failure: Option<HttpFailure>,
+        label: &str,
+    ) -> Self {
+        Self::start_with_options(fixture, temp, None, failure, Some(label), true).await
+    }
+
     async fn start_configured(
         fixture: &Path,
         temp: &TempDir,
         bearer: Option<&str>,
         failure: Option<HttpFailure>,
         label: Option<&str>,
+    ) -> Self {
+        Self::start_with_options(fixture, temp, bearer, failure, label, false).await
+    }
+
+    async fn start_with_options(
+        fixture: &Path,
+        temp: &TempDir,
+        bearer: Option<&str>,
+        failure: Option<HttpFailure>,
+        label: Option<&str>,
+        log_tool_calls: bool,
     ) -> Self {
         let label = label.unwrap_or(match (bearer.is_some(), failure) {
             (true, _) => "http-auth",
@@ -368,6 +396,8 @@ impl HttpFixture {
         let resource_subscriptions_file =
             temp.path().join(format!("{label}.resource-subscriptions"));
         let tool_calls_file = temp.path().join(format!("{label}.tool-calls"));
+        let tool_call_log = temp.path().join(format!("{label}.tool-call-log"));
+        let tool_call_past_503_log = temp.path().join(format!("{label}.tool-call-past-503-log"));
         let trace_file = temp.path().join(format!("{label}.trace"));
         let mut command = test_command(fixture);
         command
@@ -387,11 +417,19 @@ impl HttpFixture {
         if let Some(bearer) = bearer {
             command.env("MCP_REPL_FIXTURE_EXPECT_BEARER", bearer);
         }
+        if log_tool_calls {
+            command
+                .env("MCP_REPL_FIXTURE_TOOL_CALL_LOG_FILE", &tool_call_log)
+                .env(
+                    "MCP_REPL_FIXTURE_TOOL_CALL_PAST_503_LOG_FILE",
+                    &tool_call_past_503_log,
+                );
+        }
         match failure {
             Some(HttpFailure::Once) => {
                 command.env(
                     "MCP_REPL_FIXTURE_HTTP_503_ONCE_FILE",
-                    temp.path().join("http-reconnect.triggered"),
+                    temp.path().join(format!("{label}.triggered")),
                 );
             }
             Some(HttpFailure::Always) => {
@@ -407,6 +445,8 @@ impl HttpFixture {
             subscription_file,
             resource_subscriptions_file,
             tool_calls_file,
+            tool_call_log,
+            tool_call_past_503_log,
             trace_file,
         }
     }
@@ -4112,6 +4152,606 @@ async fn exercise_string_tool_arguments() {
     }
 }
 
+/// A fixture log of tool calls, one raw name per line. Empty when nothing
+/// arrived.
+fn logged_tool_calls(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `--json` envelope for a call refused by a deny list.
+fn tool_policy_denial(tool: &str, source: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": format!(
+            "tool call `{tool}` denied by tool policy: in the deny list ({source}); it was not sent"
+        ),
+        "kind": "usage",
+        "exitStatus": 2,
+        "toolPolicy": {
+            "tool": tool,
+            "rule": "deny",
+            "sources": [source],
+            "reason": format!("in the deny list ({source})"),
+        },
+    })
+}
+
+/// Every way of dispatching a tool call, run against a target that denies
+/// `add` and `slow_add`: generated syntax, raw `call`, the `tool` namespace,
+/// a global alias, bench, a task-augmented call, and a `for` loop, followed
+/// by the listings and reports that show the policy. Only `inspect_args` is
+/// allowed through.
+const TOOL_POLICY_DISPATCH_FORMS: &[&str] = &[
+    "add a=1 b=2",
+    r#"call add {"a":1,"b":2}"#,
+    "tool add a=1 b=2",
+    "sum a=1 b=2",
+    "bench add a=1 b=2 --n 3 --concurrency 2",
+    "slow_add a=1 b=2 &",
+    r#"r = inspect_args nested={"xs":[1,2]}"#,
+    "for $x in $r.nested.xs: add a=$x b=1",
+    "tools",
+    "tools --all",
+    "info | toolPolicy",
+    "describe add | toolPolicy",
+];
+
+fn tool_policy_dispatch_args(server: &str) -> Vec<String> {
+    let mut args = vec![
+        "--server".to_string(),
+        server.to_string(),
+        "--json".to_string(),
+    ];
+    for form in TOOL_POLICY_DISPATCH_FORMS {
+        args.extend(["-e".to_string(), (*form).to_string()]);
+    }
+    args
+}
+
+/// The outcome of [`TOOL_POLICY_DISPATCH_FORMS`] when `source` denies `add`
+/// and `slow_add`: the whole stdout stream is NDJSON, every refused form
+/// carries the same envelope, and the run exits 2.
+fn assert_tool_policy_dispatch_matrix(output: &Output, label: &str, source: &str) {
+    assert_status(output, 2, label);
+    let add_denied = tool_policy_denial("add", source);
+    let values = json_lines(output, label);
+    assert_eq!(values.len(), 13, "{label}: {values:#?}");
+    for (index, value) in values[..5].iter().enumerate() {
+        assert_eq!(value, &add_denied, "{label} form {index}");
+    }
+    assert_eq!(values[5], tool_policy_denial("slow_add", source), "{label}");
+    assert_eq!(
+        values[6],
+        serde_json::json!({ "nested": { "xs": [1, 2] } }),
+        "{label}"
+    );
+    assert_eq!(values[7], add_denied, "{label} first for iteration");
+    assert_eq!(values[8], add_denied, "{label} second for iteration");
+    let names = |value: &serde_json::Value| {
+        value
+            .as_array()
+            .expect("a tool listing")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name").to_string())
+            .collect::<Vec<_>>()
+    };
+    let listed = names(&values[9]);
+    assert!(listed.contains(&"inspect_args".to_string()), "{listed:?}");
+    assert!(
+        !listed.contains(&"add".to_string()) && !listed.contains(&"slow_add".to_string()),
+        "{listed:?}"
+    );
+    let all = names(&values[10]);
+    assert!(
+        all.contains(&"add".to_string()) && all.contains(&"slow_add".to_string()),
+        "{all:?}"
+    );
+    assert_eq!(
+        values[11],
+        serde_json::json!({
+            "allow": null,
+            "deny": ["add", "slow_add"],
+            "sources": [source],
+        }),
+        "{label}"
+    );
+    assert_eq!(values[12]["denied"], true, "{label}");
+    assert_eq!(values[12]["rule"], "deny", "{label}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("2 tools hidden: calls are denied by tool policy; `tools --all` lists them"),
+        "{stderr}"
+    );
+}
+
+/// `help tools` and `help connect` under `--json` with no policy, byte for
+/// byte as they were before the tool policy existed.
+const UNRESTRICTED_HELP_JSON: &str = concat!(
+    r#"{"name":"tools","usage":"tools [--full]","description":"List the server's tools. Every tool is also a command: `<tool> [k=v...]`. A long list is trimmed to the window; `--full` prints all of it.","details":[],"examples":[]}"#,
+    "\n",
+    r#"{"name":"connect","usage":"connect <url|profile|path.json:entry|command...|demo>","description":"Connect from a disconnected prompt or switch the live REPL to another server.","details":["The target may be an HTTP URL, a saved profile, a path.json:entry import, a stdio command, or demo. Bare connect lists saved and discovered candidates.","A candidate is initialized and its surface fetched before it replaces the current server. A failed switch leaves the old session usable. History and aliases survive; captured variables, task ids, and resource subscriptions are cleared after a successful switch."],"examples":["connect demo","connect https://example.com/mcp","connect -- ./my-server --stdio"]}"#,
+    "\n",
+);
+
+/// Human `info` against the fixture with no policy, byte for byte as it was
+/// before the tool policy existed.
+const UNRESTRICTED_FIXTURE_INFO: &str = "\
+connected: mcp-repl-fixture v1.0.0 (protocol 2025-11-25)
+11 tools, 1 prompt, 1 resource, 0 templates. Type `help`.
+note: builtin, tool, and wait are ambiguous without a qualifier; use `tool <name>` for the server tool or `builtin <name>` for the built-in
+capabilities: {
+  \"tools\": {
+    \"listChanged\": true
+  },
+  \"resources\": {
+    \"subscribe\": true,
+    \"listChanged\": true
+  },
+  \"prompts\": {
+    \"listChanged\": true
+  },
+  \"logging\": {},
+  \"tasks\": {
+    \"cancel\": {},
+    \"requests\": {
+      \"tools\": {
+        \"call\": {}
+      }
+    }
+  },
+  \"extensions\": {
+    \"io.modelcontextprotocol/tasks\": {}
+  }
+}
+sampling: decline, elicitation: decline
+";
+
+/// Tool policy (#365): a denied tool is refused locally through every
+/// dispatch form with one diagnostic, JSON error, and exit status, and the
+/// fixture's own call log proves that no refused call reached the server.
+async fn exercise_tool_policy(fixture: &Path, temp: &TempDir) {
+    let fixture_literal =
+        serde_json::to_string(&fixture.display().to_string()).expect("quote fixture path");
+    let config = temp.path().join("tool-policy.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[servers.open]\ncommand = [{fixture_literal}]\n\
+             allow_tools = [\"add\", \"inspect_args\", \"slow_add\"]\n\
+             [servers.locked]\ncommand = [{fixture_literal}]\n\
+             deny_tools = [\"add\", \"slow_add\"]\n\
+             [aliases]\nsum = \"add\"\n"
+        ),
+    )
+    .expect("write tool policy profiles");
+    let log = temp.path().join("tool-policy.calls");
+    let command = |args: &[&str]| {
+        let mut command = repl_command();
+        command
+            .arg("--config")
+            .arg(&config)
+            .arg("--no-history")
+            .args(args)
+            .env("MCP_REPL_FIXTURE_TOOL_CALL_LOG_FILE", &log);
+        command
+    };
+    let add_denied = tool_policy_denial("add", "profile locked");
+
+    let label = "tool policy dispatch forms";
+    let args = tool_policy_dispatch_args("locked");
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run(command(&args), label, CASE_TIMEOUT).await;
+    assert_tool_policy_dispatch_matrix(&output, label, "profile locked");
+    assert_eq!(logged_tool_calls(&log), ["inspect_args"], "{label}");
+
+    // A generated one-shot command is refused the same way, and its live
+    // help leaves the denied tools out while saying that it did.
+    let label = "tool policy generated command";
+    let output = run(
+        command(&["--server", "locked", "--json", "add", "--a=1", "--b=2"]),
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_status(&output, 2, label);
+    assert_eq!(
+        json_lines(&output, label),
+        std::slice::from_ref(&add_denied)
+    );
+    let label = "tool policy generated help";
+    let output = run(
+        command(&["--server", "locked", "tool", "--help"]),
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, label);
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("inspect_args"), "{help}");
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("add ") || line.contains("slow_add")),
+        "{help}"
+    );
+    assert!(
+        help.contains("2 tools hidden: calls are denied by tool policy"),
+        "{help}"
+    );
+    assert_eq!(logged_tool_calls(&log), ["inspect_args"], "{label}");
+
+    // Switching profiles: a global alias defined while `add` is allowed runs
+    // it; after `connect locked` the same alias gets exactly the error that
+    // a raw `call` gets, while `describe` still shows the cached definition.
+    // Connection diagnostics go to stderr, so stdout is pure NDJSON.
+    let label = "tool policy profile switch";
+    let output = run(
+        command(&[
+            "--server",
+            "open",
+            "--json",
+            "-e",
+            "alias --global keep=add",
+            "-e",
+            "keep a=20 b=22",
+            "-e",
+            "connect locked",
+            "-e",
+            "keep a=1 b=2",
+            "-e",
+            r#"call add {"a":1,"b":2}"#,
+            "-e",
+            "describe add | definition.name",
+        ]),
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_status(&output, 2, label);
+    let values = json_lines(&output, label);
+    assert_eq!(values.len(), 5, "{values:#?}");
+    assert_eq!(values[0]["scope"], "global");
+    assert_eq!(
+        values[1].pointer("/content/0/text"),
+        Some(&serde_json::json!("42"))
+    );
+    assert_eq!(values[2], add_denied, "{label}: the old alias");
+    assert_eq!(values[3], values[2], "{label}: alias and raw call agree");
+    assert_eq!(values[4], "add", "{label}: the definition stays visible");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tool policy: all tools allowed; deny add, slow_add (from profile locked)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        logged_tool_calls(&log),
+        ["inspect_args", "add"],
+        "{label}: only the call made under `open` reached a server"
+    );
+
+    // Precedence: flags narrow a profile but cannot widen it, and deny wins.
+    let label = "tool policy precedence";
+    let output = run(
+        command(&[
+            "--server",
+            "open",
+            "--allow-tool",
+            "inspect_args,add,announce",
+            "--deny-tool",
+            "add",
+            "--json",
+            "-e",
+            "inspect_args text=narrowed",
+            "-e",
+            "add a=1 b=2",
+            "-e",
+            "slow_add a=1 b=2",
+            "-e",
+            "announce",
+            "-e",
+            "help connect",
+        ]),
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_status(&output, 2, label);
+    let values = json_lines(&output, label);
+    assert_eq!(values.len(), 5, "{values:#?}");
+    assert_eq!(
+        values[0].pointer("/content/0/text"),
+        Some(&serde_json::json!(r#"{"text":"narrowed"}"#))
+    );
+    assert_eq!(values[1], tool_policy_denial("add", "--deny-tool"));
+    assert_eq!(values[2]["toolPolicy"]["rule"], "allow");
+    assert_eq!(
+        values[2]["toolPolicy"]["sources"],
+        serde_json::json!(["--allow-tool"])
+    );
+    assert_eq!(
+        values[3]["toolPolicy"]["sources"],
+        serde_json::json!(["profile open"])
+    );
+    // Under a policy, `help connect` explains how it follows a switch.
+    assert!(
+        values[4]["details"]
+            .as_array()
+            .expect("help details")
+            .iter()
+            .any(|detail| detail
+                .as_str()
+                .is_some_and(|text| text.starts_with("Global aliases survive a switch"))),
+        "{:#?}",
+        values[4]
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "warning: tool policy: `add` is both allowed (profile open, --allow-tool) and \
+             denied (--deny-tool); deny wins"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`announce` from --allow-tool stays denied"),
+        "{stderr}"
+    );
+    assert_eq!(
+        logged_tool_calls(&log),
+        ["inspect_args", "add", "inspect_args"],
+        "{label}"
+    );
+
+    // A target that is not a profile gets the flags alone.
+    let label = "tool policy flags without a profile";
+    let mut flagged = command(&["--deny-tool", "add", "--json", "-e", "add a=1 b=2"]);
+    flagged.arg(fixture);
+    let output = run(flagged, label, CASE_TIMEOUT).await;
+    assert_status(&output, 2, label);
+    assert_eq!(
+        json_lines(&output, label),
+        [tool_policy_denial("add", "--deny-tool")]
+    );
+
+    // With no policy, calls go through and output is byte-identical to what
+    // it was before the policy existed.
+    let label = "tool policy absent";
+    let mut unrestricted = command(&["--json", "-e", "add a=1 b=2", "-e", "info | toolPolicy"]);
+    unrestricted.arg(fixture);
+    let output = run(unrestricted, label, CASE_TIMEOUT).await;
+    assert_success(&output, label);
+    let values = json_lines(&output, label);
+    assert_eq!(
+        values[0].pointer("/content/0/text"),
+        Some(&serde_json::json!("3"))
+    );
+    assert_eq!(values[1], serde_json::Value::Null);
+    assert_eq!(
+        logged_tool_calls(&log),
+        ["inspect_args", "add", "inspect_args", "add"],
+        "{label}"
+    );
+    let label = "unrestricted help bytes";
+    let output = run(
+        command(&["--demo", "--json", "-e", "help tools", "-e", "help connect"]),
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, label);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        UNRESTRICTED_HELP_JSON,
+        "{label}"
+    );
+    let label = "unrestricted info bytes";
+    let mut info = command(&["--color", "never", "-e", "info"]);
+    info.arg(fixture);
+    let output = run(info, label, CASE_TIMEOUT).await;
+    assert_success(&output, label);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        UNRESTRICTED_FIXTURE_INFO,
+        "{label}"
+    );
+
+    // Interactive: the human diagnostic, the banner line, and `describe`.
+    // Process statuses are a one-shot contract: as with any failed command
+    // at the prompt, the refusal is printed and the REPL still exits 0.
+    let label = "tool policy interactive";
+    let output = run_with_input(
+        command(&["--server", "locked", "--color", "never"]),
+        "add a=1 b=2\ndescribe add\nquit\n",
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, label);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("tool policy: all tools allowed; deny add, slow_add (from profile locked)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "denied by tool policy: in the deny list (profile locked); calls are refused and not sent"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(
+            "error: tool call `add` denied by tool policy: in the deny list (profile locked); \
+             it was not sent"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        logged_tool_calls(&log),
+        ["inspect_args", "add", "inspect_args", "add"],
+        "{label}"
+    );
+}
+
+/// The tool policy over HTTP: the same dispatch matrix through an HTTP
+/// profile, then a transparent reconnect. The fixture logs every attempt at
+/// ingress, before its 503 injector, and separately every request that
+/// passed the injector, so the two can be asserted on their own.
+async fn exercise_tool_policy_http(fixture: &Path, temp: &TempDir) {
+    let http = HttpFixture::start_logging_tool_calls(fixture, temp, None, "http-tool-policy").await;
+    let config = temp.path().join("tool-policy-http.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[servers.locked-http]\nurl = {}\ndeny_tools = [\"add\", \"slow_add\"]\n\
+             [aliases]\nsum = \"add\"\n",
+            serde_json::to_string(&http.url).expect("quote fixture URL")
+        ),
+    )
+    .expect("write HTTP tool policy profile");
+    let label = "tool policy dispatch forms over HTTP";
+    let mut command = repl_command();
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("--no-history")
+        .args(tool_policy_dispatch_args("locked-http"));
+    let output = run(command, label, CASE_TIMEOUT).await;
+    assert_tool_policy_dispatch_matrix(&output, label, "profile locked-http");
+    assert_eq!(logged_tool_calls(&http.tool_call_log), ["inspect_args"]);
+    assert_eq!(
+        logged_tool_calls(&http.tool_call_past_503_log),
+        ["inspect_args"]
+    );
+    let profile_command = |args: &[&str]| {
+        let mut command = repl_command();
+        command
+            .arg("--config")
+            .arg(&config)
+            .arg("--no-history")
+            .args(["--server", "locked-http", "--json"])
+            .args(args);
+        command
+    };
+    let add_denied = tool_policy_denial("add", "profile locked-http");
+
+    // Generated argv: the denied command is refused, the allowed one is sent.
+    let label = "tool policy generated argv over HTTP";
+    let output = run(
+        profile_command(&["add", "--a=1", "--b=2"]),
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_status(&output, 2, label);
+    assert_eq!(
+        json_lines(&output, label),
+        std::slice::from_ref(&add_denied)
+    );
+    let output = run(
+        profile_command(&["inspect_args", "--text=generated"]),
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    assert_success(&output, label);
+    assert_eq!(
+        logged_tool_calls(&http.tool_call_log),
+        ["inspect_args", "inspect_args"],
+        "{label}"
+    );
+
+    // Piped interactive `--json`: commands on stdin rather than `-e`. The
+    // prompt prints its startup profile label and first-run hint on stdout
+    // before any command (pre-existing), so only the JSON values are read.
+    let label = "tool policy piped interactive over HTTP";
+    let output = run_with_input(
+        profile_command(&[]),
+        "add a=1 b=2\ncall add {\"a\":1,\"b\":2}\nsum a=1 b=2\ninspect_args text=piped\nquit\n",
+        label,
+        CASE_TIMEOUT,
+    )
+    .await;
+    // Process statuses are a one-shot contract; the prompt exits 0.
+    assert_success(&output, label);
+    let values: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str(line).expect("a JSON value"))
+        .collect();
+    assert_eq!(values.len(), 5, "{values:#?}");
+    for (index, value) in values[..3].iter().enumerate() {
+        assert_eq!(value, &add_denied, "{label} command {index}");
+    }
+    assert_eq!(
+        values[3].pointer("/content/0/text"),
+        Some(&serde_json::json!(r#"{"text":"piped"}"#))
+    );
+    assert_eq!(values[4], serde_json::json!({ "exit": true }));
+    assert_eq!(
+        logged_tool_calls(&http.tool_call_log),
+        ["inspect_args", "inspect_args", "inspect_args"],
+        "{label}"
+    );
+    assert_eq!(
+        logged_tool_calls(&http.tool_call_past_503_log),
+        ["inspect_args", "inspect_args", "inspect_args"],
+        "{label}"
+    );
+    http.shutdown().await;
+
+    let reconnecting = HttpFixture::start_logging_tool_calls(
+        fixture,
+        temp,
+        Some(HttpFailure::Once),
+        "http-tool-policy-reconnect",
+    )
+    .await;
+    let label = "tool policy after reconnect";
+    let output = run_http_traced(
+        &reconnecting.url,
+        label,
+        &[
+            "--deny-tool",
+            "add",
+            "--json",
+            "-e",
+            "inspect_args text=before",
+            "-e",
+            "add a=1 b=2",
+        ],
+    )
+    .await;
+    assert_status(&output, 2, label);
+    let values = json_lines(&output, label);
+    assert_eq!(values.len(), 2, "{values:#?}");
+    assert_eq!(
+        values[0].pointer("/content/0/text"),
+        Some(&serde_json::json!(r#"{"text":"before"}"#))
+    );
+    assert_eq!(values[1], tool_policy_denial("add", "--deny-tool"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[reconnected]"), "{stderr}");
+    // The first attempt was received and answered 503, the retry on the
+    // rebuilt client was received and passed the injector, and the denied
+    // call after the reconnect was neither.
+    assert_eq!(
+        logged_tool_calls(&reconnecting.tool_call_log),
+        ["inspect_args", "inspect_args"],
+        "{label}: attempts received"
+    );
+    assert_eq!(
+        logged_tool_calls(&reconnecting.tool_call_past_503_log),
+        ["inspect_args"],
+        "{label}: requests past the 503 injector"
+    );
+    reconnecting.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
@@ -4149,9 +4789,11 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_schema_contracts(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;
+        exercise_tool_policy(&fixture, &temp).await;
         #[cfg(unix)]
         exercise_bearer_fd(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;
+        exercise_tool_policy_http(&fixture, &temp).await;
         exercise_bind(&fixture, &temp).await;
         exercise_string_tool_arguments().await;
     })
