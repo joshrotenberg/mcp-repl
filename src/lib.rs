@@ -353,9 +353,10 @@ struct Args {
     #[arg(short = 'e', long = "exec", value_name = "COMMAND")]
     exec: Vec<String>,
 
-    /// Emit one compact JSON value per command, for piping to tools like jq.
+    /// Emit compact JSON results for piping to tools like jq.
     ///
-    /// Applies to --exec and generated one-shot commands; the format is NDJSON.
+    /// Applies to --exec, generated one-shot commands, and piped REPL commands
+    /// with an explicit target.
     #[arg(long)]
     json: bool,
 
@@ -5121,6 +5122,14 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // JSON stdout is a machine-readable stream. Even `--verbose` must not
     // inject a human banner into it.
     let quiet = bridged || one_shot && (!args.verbose || args.json);
+    let quiet_startup =
+        quiet || (args.json && !std::io::IsTerminal::is_terminal(&std::io::stdin()));
+    // Private to the bundled session driver. It opts into platform-specific
+    // process ownership and interrupt handling for its piped child.
+    const SESSION_DRIVER_ENV: &str = "MCP_REPL_INHERIT_STDIO_PROCESS_GROUP";
+    let driver_mode = !one_shot
+        && quiet_startup
+        && std::env::var_os(SESSION_DRIVER_ENV).is_some_and(|value| value == "1");
 
     // The handler refuses terminal prompts while the command reader owns
     // stdin. Only reedline consumes diagnostics from the external printer.
@@ -5321,7 +5330,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         exit_with_error(ExitStatus::Usage, "--oauth applies only to HTTP servers");
     }
     if let Some(name) = &profile_name
-        && !quiet
+        && !quiet_startup
     {
         println!(
             "{}",
@@ -5331,7 +5340,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             )
         );
     } else if let Some(label) = &import_label
-        && !quiet
+        && !quiet_startup
     {
         println!(
             "{}",
@@ -5650,12 +5659,21 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                         async move {
                             let mut cmd = tokio::process::Command::new(&command[0]);
                             cmd.args(&command[1..]);
-                            // Terminal Ctrl-C belongs to the REPL; the server
-                            // receives cancellation through MCP instead of a
-                            // broadcast SIGINT.
+                            // The driver targets only the REPL for interrupts.
+                            // On Unix its group also owns the server for forceful
+                            // shutdown. On Windows Ctrl-Break is group-targeted,
+                            // so the server must have a separate group.
                             #[cfg(unix)]
-                            cmd.process_group(0);
+                            if !driver_mode {
+                                cmd.process_group(0);
+                            }
+                            #[cfg(windows)]
+                            if driver_mode {
+                                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+                            }
                             cmd.envs(env);
+                            cmd.env_remove(SESSION_DRIVER_ENV);
                             // The child inherits this process's environment,
                             // which is usually what a stdio server wants.
                             // MCP_BEARER is the exception: it is an HTTP
@@ -5696,7 +5714,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             if let Ok(mut label) = server_label.write() {
                 label.clone_from(&info.server_info.name);
             }
-            if !quiet {
+            if !quiet_startup {
                 print_banner(&info);
                 if let Some(policy) = &policy {
                     print_tool_policy(policy);
@@ -5714,7 +5732,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 surface = async { fetch_surface_initial(&session.client()).await } => surface,
             };
             let surface = Arc::new(RwLock::new(surface));
-            if !quiet {
+            if !quiet_startup {
                 let s = surface.read().unwrap();
                 print_counts(&s);
                 // List the tools at startup so the surface is browsable immediately,
@@ -5800,7 +5818,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // `Interrupts`. Everything above this point is connection setup, where an
     // interrupt still ends the process outright: there is no command to
     // abandon yet.
-    let mut interrupts = Interrupts::arm();
+    let mut interrupts = Interrupts::arm(driver_mode);
 
     // One-shot: run the generated command or each --exec command, then
     // exit non-zero if any errored. No editor, no event loop.
@@ -5869,7 +5887,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // what the connection actually negotiated, not what `--protocol` asked
     // for: under `auto` that is the only way to tell whether the probe
     // landed on the final lifecycle.
-    let _surface_subscription = (!bridged && resolved_protocol == ProtocolMode::Final).then(|| {
+    let surface_subscription = (!bridged && resolved_protocol == ProtocolMode::Final).then(|| {
         surface_subscription::SurfaceSubscription::start(session.clone(), async_output.clone())
     });
 
@@ -5945,7 +5963,9 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     };
     // tower-mcp kills a stdio child when its transport is dropped, so leaving
     // without closing would deny the server an orderly shutdown.
-    drop(_surface_subscription);
+    if let Some(subscription) = surface_subscription {
+        subscription.stop().await;
+    }
     if let Err(error) = session.close().await {
         eprintln!("warning: closing the server failed: {error}");
     }
@@ -5985,24 +6005,33 @@ enum Ran {
 /// handler when the listener is constructed, so constructing it before the
 /// first command closes the window.
 ///
-/// Windows has no SIGINT; the console's Ctrl-C event is the same thing for
-/// this purpose.
+/// On Windows the session driver can target the REPL with Ctrl-Break.
 struct Interrupts {
     #[cfg(unix)]
     listener: tokio::signal::unix::Signal,
     #[cfg(not(unix))]
     listener: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    break_listener: Option<tokio::signal::windows::CtrlBreak>,
 }
 
 impl Interrupts {
     /// Install the handler. Runs before the first command.
-    fn arm() -> Self {
+    fn arm(driver_mode: bool) -> Self {
+        #[cfg(unix)]
+        let _ = driver_mode;
         #[cfg(unix)]
         let listener = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .expect("install the SIGINT handler");
         #[cfg(not(unix))]
         let listener = tokio::signal::windows::ctrl_c().expect("install the Ctrl-C handler");
-        Self { listener }
+        Self {
+            listener,
+            #[cfg(windows)]
+            break_listener: driver_mode.then(|| {
+                tokio::signal::windows::ctrl_break().expect("install the Ctrl-Break handler")
+            }),
+        }
     }
 
     /// The next interrupt.
@@ -6011,6 +6040,13 @@ impl Interrupts {
     /// listener that somehow ended from being read as a cancellation the
     /// operator never asked for: the `select!` branch drops out instead.
     async fn recv(&mut self) -> Option<()> {
+        #[cfg(windows)]
+        if let Some(listener) = &mut self.break_listener {
+            return tokio::select! {
+                event = self.listener.recv() => event,
+                event = listener.recv() => event,
+            };
+        }
         self.listener.recv().await
     }
 
@@ -6027,7 +6063,14 @@ impl Interrupts {
     /// Reports whether there was one to forget.
     fn discard_pending(&mut self) -> bool {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        self.listener.poll_recv(&mut context).is_ready()
+        let pending = self.listener.poll_recv(&mut context).is_ready();
+        #[cfg(windows)]
+        let pending = self
+            .break_listener
+            .as_mut()
+            .is_some_and(|listener| listener.poll_recv(&mut context).is_ready())
+            || pending;
+        pending
     }
 }
 
@@ -7359,24 +7402,17 @@ async fn handle_line(
                 "wait" => {
                     wait_for_one(client.as_deref().expect("connected above"), id, wait_limit).await
                 }
-                _ => match client
-                    .as_deref()
-                    .expect("connected above")
-                    .task_cancel(id, None)
-                    .await
-                {
-                    Ok(()) => {
+                _ => {
+                    let client = client.as_deref().expect("connected above");
+                    with_deadline(async {
+                        client.task_cancel(id, None).await?;
                         if !json_output() {
                             println!("cancel acknowledged");
                         }
-                        client
-                            .as_deref()
-                            .expect("connected above")
-                            .task_get(id)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                },
+                        client.task_get(id).await
+                    })
+                    .await
+                }
             };
             match outcome {
                 Ok(task) if json_output() => {
@@ -9210,7 +9246,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_interrupt_is_armed_up_front_and_never_carried_forward() {
-        let mut interrupts = Interrupts::arm();
+        let mut interrupts = Interrupts::arm(false);
         // `raise` targets this process, and the handler for the signal it
         // sends was installed on the line above.
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");

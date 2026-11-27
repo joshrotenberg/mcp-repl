@@ -19,6 +19,8 @@ const CLAUDE_CATALOG: &str = include_str!("../plugin_assets/claude-marketplace.j
 const CLAUDE_MANIFEST: &str = include_str!("../plugin_assets/claude-plugin.json");
 const CODEX_CATALOG: &str = include_str!("../plugin_assets/codex-marketplace.json");
 const SKILL: &str = include_str!("../plugin_assets/skills/mcp-repl/SKILL.md");
+const SESSION_DRIVER: &str =
+    include_str!("../plugin_assets/skills/mcp-repl/scripts/session_driver.py");
 
 pub(super) fn bundle_version() -> String {
     // Stable FNV-1a cache key. Ownership checks compare the actual file bytes.
@@ -29,6 +31,7 @@ pub(super) fn bundle_version() -> String {
         CLAUDE_MANIFEST,
         CODEX_CATALOG,
         SKILL,
+        SESSION_DRIVER,
     ] {
         for byte in asset.bytes().chain(std::iter::once(0)) {
             fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100000001b3);
@@ -55,6 +58,13 @@ pub(super) fn bundle(provider: Provider, version: &str) -> Files {
     ]
     .into_iter()
     .map(|(path, contents)| (path.to_owned(), contents.replace("@VERSION@", version)))
+    .chain(std::iter::once((
+        "plugins/mcp-repl/skills/mcp-repl/scripts/session_driver.py".into(),
+        SESSION_DRIVER.replace(
+            "@SESSION_DRIVER_MIN_REPL_VERSION@",
+            env!("CARGO_PKG_VERSION"),
+        ),
+    )))
     .collect()
 }
 
@@ -565,6 +575,19 @@ mod tests {
                 }
             }
             assert!(files["skills/mcp-repl/SKILL.md"].contains("describe <name>"));
+        }
+    }
+
+    #[test]
+    fn bundled_driver_uses_the_crate_version() {
+        let version = bundle_version();
+        let minimum = format!("MIN_REPL_VERSION = \"{}\"", env!("CARGO_PKG_VERSION"));
+        for provider in [Provider::Claude, Provider::Codex] {
+            let files = plugin_files(&bundle(provider, &version));
+            let driver = &files["skills/mcp-repl/scripts/session_driver.py"];
+            assert!(driver.lines().any(|line| line == minimum));
+            assert!(!driver.contains("@SESSION_DRIVER_MIN_REPL_VERSION@"));
+            assert!(!driver.contains(&version));
         }
     }
 

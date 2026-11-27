@@ -261,6 +261,7 @@ fn copy_bundle(from: &Path, to: &Path) -> io::Result<()> {
         "plugin.json",
         ".claude-plugin/plugin.json",
         "skills/mcp-repl/SKILL.md",
+        "skills/mcp-repl/scripts/session_driver.py",
     ] {
         let target = to.join(name);
         fs::create_dir_all(target.parent().unwrap())?;

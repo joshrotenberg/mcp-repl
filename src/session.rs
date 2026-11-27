@@ -127,15 +127,17 @@ impl Session {
     /// Close the live client through a shared handle when the REPL exits.
     ///
     /// The line editor keeps its own handle to the session, so the interactive
-    /// path cannot take ownership the way [`Session::shutdown`] does. A client
-    /// still held by background work is left to be dropped, which kills a
-    /// stdio child.
+    /// path cannot take ownership the way [`Session::shutdown`] does.
     pub async fn close(&self) -> Result<(), tower_mcp::Error> {
-        let client = self.client.write().unwrap().take();
-        match client.map(Arc::try_unwrap) {
-            Some(Ok(client)) => client.shutdown().await,
-            Some(Err(_)) | None => Ok(()),
-        }
+        let Some(client) = self.client.write().unwrap().take() else {
+            return Ok(());
+        };
+        let client = Arc::try_unwrap(client).map_err(|_| {
+            tower_mcp::Error::Transport(
+                "background work still holds the MCP client; skipping orderly shutdown".into(),
+            )
+        })?;
+        client.shutdown().await
     }
 
     /// Close the live client and its transport once the session is no longer
