@@ -189,6 +189,11 @@ unambiguous prefix of it. `wait` with no argument waits for every task the
 session started, oldest first, which is how an `--exec` script waits for work
 whose id it never saw; see [scripting](scripting.md).
 
+On final-protocol HTTP connections, `wait` can reconnect once per task. It
+polls the same task ID if the replacement also uses the final protocol.
+Its per-task `--timeout` includes reconnection and continued polling. The REPL
+skips this recovery with `--no-reconnect` or `--host-input-fd`.
+
 A task that needs an answer from the operator parks in `input_required`, and
 `task <id> respond` is what moves it forward: it asks whatever the task is
 waiting for and hands the answers back, after which the handler resumes.
@@ -216,8 +221,11 @@ task-status notifications, deduplicating repeated transitions. A final client
 opens a task-scoped `subscriptions/listen` stream; a bounded per-task poller
 remains authoritative for stable servers and for unavailable or dropped final
 notifications. It honors the server's suggested interval, ends at a terminal
-state, and gives up after three consecutive read failures. `jobs`, `task`,
-`wait`, and `cancel` remain the authoritative manual controls.
+state, and gives up after three consecutive ordinary read failures. After a
+reconnect, a final-protocol watcher resumes with polling alone. A stable
+watcher reads the task status once on the replacement connection. Watchers
+report `(gone)` when the server rejects the task read as invalid params.
+`jobs`, `task`, `wait`, and `cancel` remain the authoritative manual controls.
 
 Automatic transition lines are interactive-only. `--exec` and `--json`
 suppress them for deterministic scripted output; explicit task commands still

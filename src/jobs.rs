@@ -257,6 +257,27 @@ impl Jobs {
         self.announce
     }
 
+    /// Report an unreachable job without assigning it a server task status.
+    pub fn announce_gone(&self, task_id: &str) {
+        if !self.announce {
+            return;
+        }
+        let job = self
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .find(|job| job.task_id == task_id && !job.status.is_terminal())
+            .cloned();
+        if let Some(job) = job {
+            self.output.line(format!(
+                "{} (gone)",
+                tag(Style::new(), &format!("task {}", sanitize(&job.label())))
+            ));
+        }
+    }
+
     fn observe(&self, task_id: String, status: TaskStatus, status_message: Option<String>) {
         let status_message = status_message.filter(|_| self.notified_messages);
         let transition = {

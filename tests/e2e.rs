@@ -549,10 +549,7 @@ impl Drop for HttpFixture {
     }
 }
 
-/// Drop the first HTTP request before it reaches the fixture, then proxy every
-/// later connection normally. This reproduces a fresh client's first
-/// handshake request dying in the transport send path without sleeps or a
-/// server-side response.
+/// Drop one HTTP request before it reaches the fixture, then proxy normally.
 struct DropFirstRequestProxy {
     url: String,
     accepted: Arc<AtomicUsize>,
@@ -567,11 +564,16 @@ struct DropFirstRequestProxy {
 fn reset_on_drop(stream: &tokio::net::TcpStream) {
     stream
         .set_linger(Some(Duration::ZERO))
-        .expect("reset first proxy connection");
+        .expect("reset proxy connection");
 }
 
 impl DropFirstRequestProxy {
     async fn start(upstream_url: &str) -> Self {
+        Self::start_dropping(upstream_url, None).await
+    }
+
+    /// Use with `Connection: close` so each request starts on a fresh socket.
+    async fn start_dropping(upstream_url: &str, method: Option<&'static str>) -> Self {
         let upstream = upstream_url
             .strip_prefix("http://")
             .and_then(|address| address.strip_suffix('/'))
@@ -596,7 +598,7 @@ impl DropFirstRequestProxy {
                     break;
                 };
                 let connection = accepted_task.fetch_add(1, Ordering::SeqCst);
-                if connection == 0 {
+                if method.is_none() && connection == 0 {
                     // Wait until the HTTP request has reached the proxy, then
                     // reset the socket without opening an upstream connection.
                     let mut byte = [0u8; 1];
@@ -607,10 +609,32 @@ impl DropFirstRequestProxy {
                     continue;
                 }
                 let upstream = upstream.clone();
+                let dropped = dropped_task.clone();
                 tokio::spawn(async move {
+                    let mut prefix = Vec::new();
+                    if let Some(method) = method
+                        && dropped.load(Ordering::SeqCst) == 0
+                    {
+                        let Ok(matches) =
+                            read_proxy_request(&mut downstream, &mut prefix, method).await
+                        else {
+                            return;
+                        };
+                        if matches
+                            && dropped
+                                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            reset_on_drop(&downstream);
+                            return;
+                        }
+                    }
                     let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream).await else {
                         return;
                     };
+                    if upstream.write_all(&prefix).await.is_err() {
+                        return;
+                    }
                     let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
                 });
             }
@@ -627,6 +651,33 @@ impl DropFirstRequestProxy {
         self.task.abort();
         let _ = self.task.await;
     }
+}
+
+async fn read_proxy_request(
+    stream: &mut tokio::net::TcpStream,
+    prefix: &mut Vec<u8>,
+    method: &str,
+) -> std::io::Result<bool> {
+    let mut chunk = [0; 1024];
+    while prefix.len() < 16 * 1024 {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        prefix.extend_from_slice(&chunk[..read]);
+        if let Some(end) = prefix.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&prefix[..end]);
+            return Ok(headers.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("mcp-method") && value.trim() == method
+                })
+            }));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "incomplete proxy request headers",
+    ))
 }
 
 async fn run_http(url: &str, case: &str, repl_args: &[&str]) -> Output {
@@ -2868,6 +2919,45 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
     );
     assert!(stdout.contains("started"), "{stdout}");
     assert!(stdout.contains("completed"), "{stdout}");
+}
+
+async fn exercise_final_wait_reconnect(fixture: &Path, temp: &TempDir) {
+    let http =
+        HttpFixture::start_configured(fixture, temp, None, None, Some("http-wait-reconnect")).await;
+    let proxy = DropFirstRequestProxy::start_dropping(&http.url, Some("tasks/get")).await;
+    // Exec mode leaves task polling to wait. The proxy resets the first
+    // tasks/get socket as soon as the request arrives, without forwarding it.
+    let waited = run_http_traced(
+        &proxy.url,
+        "final wait after a dropped task read",
+        &[
+            "--protocol",
+            "2026-07-28",
+            "--header",
+            "Connection: close",
+            "--color",
+            "never",
+            "--exec",
+            "slow_add a=2 b=3 &",
+            "--exec",
+            "builtin wait 1",
+        ],
+    )
+    .await;
+    assert_success(&waited, "final wait after a dropped task read");
+    let stdout = String::from_utf8_lossy(&waited.stdout);
+    let stderr = String::from_utf8_lossy(&waited.stderr);
+    assert!(stdout.contains("status=completed"), "{stdout}");
+    assert!(stdout.contains("\n5\n"), "{stdout}");
+    assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(stderr.matches("[reconnected]").count(), 1, "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&http.tool_calls_file).expect("read task start count"),
+        "1",
+        "recovery must only repeat the task read"
+    );
+    proxy.shutdown().await;
+    http.shutdown().await;
 }
 
 async fn exercise_http(fixture: &Path, temp: &TempDir) {
@@ -5459,6 +5549,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         #[cfg(unix)]
         exercise_bearer_fd(&fixture, &temp).await;
         exercise_http(&fixture, &temp).await;
+        exercise_final_wait_reconnect(&fixture, &temp).await;
         exercise_tool_policy_http(&fixture, &temp).await;
         exercise_bind(&fixture, &temp).await;
         exercise_string_tool_arguments().await;

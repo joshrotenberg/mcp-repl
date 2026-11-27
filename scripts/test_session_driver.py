@@ -173,9 +173,10 @@ class DriverTests(_FixtureTests):
     def test_wait_timeout_and_cancel_keep_owned_session(self):
         with self.session("--session-driver", protocol="final") as session:
             task = session.start_task("task_pending", {})
-            with self.assertRaisesRegex(TaskPending, "still running") as pending:
+            with self.assertRaisesRegex(TaskPending, "did not settle|still running") as pending:
                 session.wait_task(task, timeout=0.1)
             self.assertEqual(pending.exception.request_id, task.request_id + 1)
+            self.assertEqual(str(pending.exception), pending.exception.response["error"])
             with self.assertRaises(ValueError):
                 session.start_task("task_pending", {})
             cancelled = session.cancel_task(task)
