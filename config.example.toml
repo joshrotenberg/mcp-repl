@@ -37,6 +37,15 @@ issues = "list_issues state=open"
 transport = "http"
 url = "https://mcp.example.com/mcp"
 bearer_env = "PROD_MCP_TOKEN"
+# Which tools this profile may call, by exact raw MCP tool name. With
+# `allow_tools` set, every other tool is denied, including tools the server
+# adds later; `allow_tools = []` denies every call. `deny_tools` names tools
+# that may not be called, and wins over `allow_tools`. A denied call is
+# refused locally and never sent. `--allow-tool` and `--deny-tool` can narrow
+# these for one invocation but cannot widen them. This is a client-side
+# control, not a sandbox.
+allow_tools = ["search", "get_issue", "list_issues"]
+deny_tools = ["delete_issue"]
 
 # Extra headers sent with every request of an HTTP profile.
 [servers.prod.headers]

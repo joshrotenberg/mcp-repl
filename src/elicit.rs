@@ -27,8 +27,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use async_trait::async_trait;
 use nu_ansi_term::{Color, Style};
@@ -38,6 +38,7 @@ use reedline::{
     ReedlineError, ReedlineErrorVariants, ReedlineEvent, ReedlineMenu, SearchQuery, Signal,
     default_emacs_keybindings,
 };
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tower_mcp::client::{ClientHandler, NotificationHandler, ServerNotification};
 use tower_mcp::error::JsonRpcError;
 use tower_mcp::protocol::{
@@ -50,6 +51,120 @@ use crate::output::AsyncOutput;
 use crate::sampling::{self, SamplingMode};
 use crate::style::{self, paint, tag};
 use crate::untrusted::sanitize;
+
+static TERMINAL: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
+static EDITOR_TURNS: AtomicU64 = AtomicU64::new(0);
+static BLOCKING_PROMPT_ACTIVE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+#[cfg(test)]
+pub(crate) static EDITOR_TURN_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+pub(crate) fn terminal_lock() -> Arc<Mutex<()>> {
+    Arc::clone(&TERMINAL)
+}
+
+fn print_terminal_wait(editor_turn: Option<u64>) {
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    // Keep the holder from releasing the terminal while this notice prints.
+    // The next holder could be the editor, which draws its own prompt.
+    let prompt_active = BLOCKING_PROMPT_ACTIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !*prompt_active
+        || editor_turn.is_some_and(|turn| turn != EDITOR_TURNS.load(Ordering::SeqCst))
+    {
+        return;
+    }
+    eprintln!(
+        "{} waiting for an earlier prompt. Finish answering it or press Ctrl-D on an empty line to end input.",
+        tag(Style::new().fg(Color::Purple), "prompt"),
+    );
+}
+
+/// Read one command or line on the dedicated readline thread.
+pub(crate) fn with_readline_terminal<T>(at_prompt: &AtomicBool, read: impl FnOnce() -> T) -> T {
+    let _terminal = match terminal_lock().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            print_terminal_wait(None);
+            terminal_lock().blocking_lock_owned()
+        }
+    };
+    at_prompt.store(true, Ordering::SeqCst);
+    EDITOR_TURNS.fetch_add(1, Ordering::SeqCst);
+    let result = read();
+    at_prompt.store(false, Ordering::SeqCst);
+    result
+}
+
+struct BlockingPromptGuard {
+    _terminal: OwnedMutexGuard<()>,
+}
+
+impl Drop for BlockingPromptGuard {
+    fn drop(&mut self) {
+        *BLOCKING_PROMPT_ACTIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+}
+
+async fn spawn_terminal_prompt<T: Send + 'static>(
+    terminal: OwnedMutexGuard<()>,
+    prompt: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let guard = BlockingPromptGuard {
+        _terminal: terminal,
+    };
+    *BLOCKING_PROMPT_ACTIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        prompt()
+    })
+    .await
+}
+
+async fn lock_terminal_for_prompt(editor_turn: Option<u64>) -> OwnedMutexGuard<()> {
+    match terminal_lock().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            print_terminal_wait(editor_turn);
+            terminal_lock().lock_owned().await
+        }
+    }
+}
+
+/// Serialize everything that reads the terminal: tower-mcp 0.29 can run
+/// handler calls for one input round concurrently, background tasks can ask
+/// while a foreground prompt is open, and the main editor takes the same
+/// lock while it holds the terminal. The blocking task owns the guard
+/// because dropping the awaiting future does not stop a blocking read.
+pub(crate) async fn run_terminal_prompt<T: Send + 'static>(
+    prompt: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let guard = lock_terminal_for_prompt(None).await;
+    spawn_terminal_prompt(guard, prompt).await
+}
+
+async fn prompt_unless_editor<T: Send + 'static>(
+    editor_turn: u64,
+    prompt: impl FnOnce() -> T + Send + 'static,
+) -> Result<Option<T>, JsonRpcError> {
+    let guard = lock_terminal_for_prompt(Some(editor_turn)).await;
+    // Check under the lock before starting a blocking task. The turn
+    // cannot change again until that task releases the guard.
+    if EDITOR_TURNS.load(Ordering::SeqCst) != editor_turn {
+        return Ok(None);
+    }
+    spawn_terminal_prompt(guard, prompt)
+        .await
+        .map(Some)
+        .map_err(|e| JsonRpcError::internal_error(e.to_string()))
+}
 
 /// How to answer `elicitation/create`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -139,6 +254,24 @@ impl ReplClientHandler {
     fn note(&self, message: String) {
         self.output.line(message);
     }
+
+    fn decline_sampling_at_prompt(&self) -> JsonRpcError {
+        self.note(format!(
+            "{} declined a completion request from the server. The command reader took the \
+             terminal. Run the tool in the foreground to answer it.",
+            tag(Style::new().fg(Color::Purple), "sampling"),
+        ));
+        sampling::declined("the command reader took the terminal")
+    }
+
+    fn decline_elicitation_at_prompt(&self) -> ElicitResult {
+        self.note(format!(
+            "{} declined a request from the server. The command reader took the terminal. \
+             Run the tool in the foreground to answer it.",
+            tag(Style::new().fg(Color::Purple), "elicit"),
+        ));
+        ElicitResult::decline()
+    }
 }
 
 #[async_trait]
@@ -157,23 +290,13 @@ impl ClientHandler for ReplClientHandler {
                 Ok(sampling::canned(&params))
             }
             SamplingMode::Prompt => {
+                let editor_turn = EDITOR_TURNS.load(Ordering::SeqCst);
                 if self.at_prompt.load(Ordering::SeqCst) {
-                    // Same constraint as a form elicitation: the editor holds
-                    // the terminal in raw mode and a second stdin reader
-                    // would corrupt it.
-                    self.note(format!(
-                        "{} declined a completion request from the server (arrived while at \
-                         the prompt; run the tool in the foreground to answer it)",
-                        tag(Style::new().fg(Color::Purple), "sampling"),
-                    ));
-                    return Err(sampling::declined(
-                        "arrived while the editor held the terminal",
-                    ));
+                    return Err(self.decline_sampling_at_prompt());
                 }
-                // Blocking stdin reads must leave the async runtime.
-                tokio::task::spawn_blocking(move || sampling::prompt(&params))
-                    .await
-                    .map_err(|e| JsonRpcError::internal_error(e.to_string()))?
+                prompt_unless_editor(editor_turn, move || sampling::prompt(&params))
+                    .await?
+                    .unwrap_or_else(|| Err(self.decline_sampling_at_prompt()))
             }
         }
     }
@@ -189,18 +312,12 @@ impl ClientHandler for ReplClientHandler {
             ));
             return Ok(ElicitResult::decline());
         }
-        // Both branches read stdin, so both need the editor to not be
-        // holding the terminal in raw mode.
+        let editor_turn = EDITOR_TURNS.load(Ordering::SeqCst);
         if self.at_prompt.load(Ordering::SeqCst) {
-            self.note(format!(
-                "{} declined a request from the server (arrived while at the prompt; run the \
-                 tool in the foreground to answer it)",
-                tag(Style::new().fg(Color::Purple), "elicit"),
-            ));
-            return Ok(ElicitResult::decline());
+            return Ok(self.decline_elicitation_at_prompt());
         }
         let server = self.server_name();
-        match params {
+        let answered = match params {
             // 2025-11-25 and 2026-07-28 URL requests differ only in whether
             // they carry an elicitationId, which nothing here uses.
             ElicitRequestParams::Url(ElicitUrlParams { message, url, .. })
@@ -219,18 +336,15 @@ impl ClientHandler for ReplClientHandler {
                 let link = url;
                 // Accepting says the operator completed an out-of-band flow,
                 // so it has to be the operator who says it.
-                tokio::task::spawn_blocking(move || confirm_url(&server, &message, &link))
-                    .await
-                    .map_err(|e| JsonRpcError::internal_error(e.to_string()))
+                prompt_unless_editor(editor_turn, move || confirm_url(&server, &message, &link))
+                    .await?
             }
             ElicitRequestParams::Form(form) => {
-                // Blocking stdin reads must leave the async runtime.
-                tokio::task::spawn_blocking(move || prompt_form(&server, &form))
-                    .await
-                    .map_err(|e| JsonRpcError::internal_error(e.to_string()))
+                prompt_unless_editor(editor_turn, move || prompt_form(&server, &form)).await?
             }
-            _ => Ok(ElicitResult::decline()),
-        }
+            _ => return Ok(ElicitResult::decline()),
+        };
+        Ok(answered.unwrap_or_else(|| self.decline_elicitation_at_prompt()))
     }
 
     async fn on_notification(&self, notification: ServerNotification) {
@@ -243,11 +357,11 @@ impl ClientHandler for ReplClientHandler {
 /// The handler above refuses while the editor owns the terminal, because a
 /// second stdin reader would corrupt raw mode. This is the other door into
 /// the same prompts, for a question a task parked earlier: the operator
-/// typed the command that asks it, so the editor is parked on the ack and
-/// reading stdin is safe.
+/// typed the command that asks it, so the editor is parked on the ack.
+/// The terminal lock keeps background prompts out while this prompt reads
+/// stdin.
 ///
-/// Refusals are explained on stderr rather than through the external
-/// printer, since nothing else is competing for the terminal here.
+/// Refusals are explained on stderr while the editor is parked.
 pub async fn answer_in_foreground(server: &str, params: ElicitRequestParams) -> ElicitResult {
     if mode() == ElicitationMode::Decline {
         eprintln!(
@@ -272,10 +386,10 @@ pub async fn answer_in_foreground(server: &str, params: ElicitRequestParams) -> 
                 return ElicitResult::decline();
             }
             let link = url;
-            tokio::task::spawn_blocking(move || confirm_url(&server, &message, &link)).await
+            run_terminal_prompt(move || confirm_url(&server, &message, &link)).await
         }
         ElicitRequestParams::Form(form) => {
-            tokio::task::spawn_blocking(move || prompt_form(&server, &form)).await
+            run_terminal_prompt(move || prompt_form(&server, &form)).await
         }
         _ => return ElicitResult::decline(),
     };
@@ -747,6 +861,126 @@ fn coerce_field(schema: &PrimitiveSchemaDefinition, raw: &str) -> ElicitFieldVal
 mod tests {
     use super::*;
     use reedline::{Completer, SearchDirection};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_prompts_do_not_overlap() {
+        let (first_started, wait_for_first) = oneshot::channel();
+        let (second_started, wait_for_second) = mpsc::channel();
+        let first = run_terminal_prompt(move || {
+            first_started.send(()).expect("signal first prompt started");
+            wait_for_second.recv_timeout(Duration::from_millis(150))
+        });
+        let second = async {
+            wait_for_first.await.expect("first prompt started");
+            run_terminal_prompt(move || {
+                // The receiver is gone if the first prompt already returned.
+                let _ = second_started.send(());
+            })
+            .await
+        };
+
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(
+            first.expect("first prompt"),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        second.expect("second prompt");
+    }
+
+    async fn start_blocked_prompt() -> (tokio::task::JoinHandle<()>, mpsc::Sender<()>) {
+        let (started, wait_for_start) = oneshot::channel();
+        let (finish, wait_to_finish) = mpsc::channel();
+        let prompt = tokio::spawn(async move {
+            run_terminal_prompt(move || {
+                started.send(()).expect("signal prompt started");
+                wait_to_finish.recv().expect("release prompt");
+            })
+            .await
+            .expect("prompt task");
+        });
+        wait_for_start.await.expect("prompt started");
+        (prompt, finish)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_terminal_prompt_future_keeps_the_lock_until_the_read_finishes() {
+        let (first, finish) = start_blocked_prompt().await;
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("first caller was cancelled")
+                .is_cancelled()
+        );
+
+        let second = run_terminal_prompt(|| ());
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut second)
+                .await
+                .is_err(),
+            "second prompt ran while the first read was still blocked"
+        );
+
+        finish.send(()).expect("release first prompt");
+        second.await.expect("second prompt");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readline_waits_for_a_blocking_prompt_to_finish() {
+        let _editor_test = EDITOR_TURN_TEST_LOCK.lock().await;
+        let (prompt, finish) = start_blocked_prompt().await;
+        let (attempting, wait_for_attempt) = oneshot::channel();
+        let (acquired, mut wait_for_readline) = oneshot::channel();
+        let readline = std::thread::spawn(move || {
+            attempting.send(()).expect("signal readline started");
+            with_readline_terminal(&AtomicBool::new(false), || {
+                acquired
+                    .send(())
+                    .expect("signal readline acquired the terminal");
+            });
+        });
+
+        wait_for_attempt.await.expect("readline started");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut wait_for_readline)
+                .await
+                .is_err(),
+            "readline acquired the terminal while the prompt was still blocked"
+        );
+
+        finish.send(()).expect("release prompt");
+        prompt.await.expect("prompt finished");
+        wait_for_readline
+            .await
+            .expect("readline acquired the terminal");
+        readline.join().expect("readline thread");
+    }
+
+    #[tokio::test]
+    async fn an_editor_turn_invalidates_a_waiting_prompt() {
+        let _editor_test = EDITOR_TURN_TEST_LOCK.lock().await;
+        let editor_turn = EDITOR_TURNS.load(Ordering::SeqCst);
+        let (read_finished, wait_for_readline) = oneshot::channel();
+        let readline = std::thread::spawn(move || {
+            with_readline_terminal(&AtomicBool::new(false), || {});
+            read_finished.send(()).expect("signal readline finished");
+        });
+        wait_for_readline.await.expect("readline finished");
+        readline.join().expect("readline thread");
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            prompt_unless_editor(editor_turn, || panic!("stale prompt ran")),
+        )
+        .await
+        .expect("stale prompt resolved")
+        .expect("stale prompt was refused");
+        assert_eq!(answer, None::<()>);
+    }
 
     /// Build a field the way a server does: as JSON on the wire, parsed
     /// into the protocol type. Constructing the type directly would hide

@@ -72,6 +72,19 @@ pub fn sanitize(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// [`sanitize`] for a name shown inside one line of text: a tool name, a
+/// profile name, a policy reason. On top of `sanitize`, a newline or tab is
+/// shown as the escape `\n` or `\t`, so a name cannot split a diagnostic
+/// across lines or pass for separate output. Matching and JSON keep the raw
+/// value; this is for human-facing text only.
+pub fn sanitize_inline(text: &str) -> Cow<'_, str> {
+    let sanitized = sanitize(text);
+    if !sanitized.contains(['\n', '\t']) {
+        return sanitized;
+    }
+    Cow::Owned(sanitized.replace('\n', "\\n").replace('\t', "\\t"))
+}
+
 /// [`sanitize`] for a server's diagnostic stream, with color removed quietly.
 ///
 /// Logging libraries color their output whether or not stderr is a terminal,
@@ -169,6 +182,17 @@ fn consume_string_body(chars: &mut Peekable<Chars>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_names_cannot_break_the_line() {
+        assert!(matches!(sanitize_inline("get_issue"), Cow::Borrowed(_)));
+        assert_eq!(
+            sanitize_inline("evil\nerror: forged"),
+            "evil\\nerror: forged"
+        );
+        assert_eq!(sanitize_inline("a\tb\r\nc"), "a\\tb\\nc");
+        assert_eq!(sanitize_inline("x\u{1b}[2Jy"), "x\u{FFFD}y");
+    }
 
     #[test]
     fn plain_text_passes_through_borrowed() {
