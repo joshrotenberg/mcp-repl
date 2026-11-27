@@ -11,16 +11,25 @@ use tower_mcp::protocol::{
 };
 
 use super::{
-    Connection, HOST, Host, Question, Withdrawal, elicit_result, sample_result, transport_error,
+    AnswerResult, Connection, HOST, Host, Question, Ticket, Withdrawal, elicit_result,
+    sample_result, transport_error,
 };
+use crate::jobs::Jobs;
 
-const MAX_ATTEMPTS: usize = 4;
+pub(super) const MAX_ATTEMPTS: usize = 4;
 const DISCONNECT_POLL: Duration = Duration::from_millis(100);
 
+/// `jobs` records a server-created task once it asks for input, so a task the
+/// bridge leaves parked can be answered again with `task <id> respond`.
+/// `deadline` is taken before the command's own `--timeout` starts, so host
+/// questions and an unacknowledged update report themselves before the
+/// command is cut off.
 pub(crate) async fn call_tool(
     client: &McpClient,
+    jobs: &Jobs,
     name: &str,
     arguments: Value,
+    deadline: Option<Instant>,
 ) -> tower_mcp::Result<CallToolResult> {
     let Some(host) = HOST.get() else {
         return client.call_tool(name, arguments).await;
@@ -28,12 +37,25 @@ pub(crate) async fn call_tool(
     if client.selected_protocol_version().await.as_deref() != Some(PROTOCOL_VERSION_2026_07_28) {
         return client.call_tool(name, arguments).await;
     }
+    call_tool_with(client, host, jobs, name, arguments, deadline).await
+}
+
+pub(super) async fn call_tool_with(
+    client: &McpClient,
+    host: &Host,
+    jobs: &Jobs,
+    name: &str,
+    arguments: Value,
+    deadline: Option<Instant>,
+) -> tower_mcp::Result<CallToolResult> {
     let connection = host
         .connection()
         .ok_or_else(|| transport_error("host input connection unavailable"))?;
-    let deadline = crate::request_timeout().map(|limit| Instant::now() + limit);
     let mut responses = None;
     let mut state = None;
+    // Once any attempt carries host answers, a later state-only attempt can
+    // still be rejected with text that repeats them.
+    let mut submitted = false;
     for attempt in 1..=MAX_ATTEMPTS {
         if host.lost.is_cancelled() {
             return Err(super::lost_error());
@@ -41,17 +63,29 @@ pub(crate) async fn call_tool(
         if !client.is_connected() {
             return Err(transport_error("MCP connection closed during host input"));
         }
+        submitted |= responses.is_some();
         let outcome = client
             .call_tool_once_task_aware(name, arguments.clone(), responses.take(), state.take())
-            .await?;
+            .await
+            .map_err(|error| {
+                if submitted {
+                    super::peer_error(error, "tools/call")
+                } else {
+                    error
+                }
+            })?;
         match outcome {
             TaskAwareCallToolOutcome::Complete(result) => return Ok(result),
             TaskAwareCallToolOutcome::Task(created) => {
-                // Preserve the existing task wait path. Its automatic input
-                // resolution uses the regular fallback handler, never the
-                // bridge, because there is no stable cancellation token.
+                // Polled here rather than with `task_wait`. Its automatic
+                // input rounds reach the bridge through the client handler,
+                // which sends an expired question back as `cancel` and has
+                // no round limit.
                 let id = &created.task.metadata.task_id;
-                return task_result(client.task_wait(id).await?);
+                return task_result(
+                    super::task::wait_for_task(client, host, jobs, Some(name), id, deadline)
+                        .await?,
+                );
             }
             TaskAwareCallToolOutcome::InputRequired(required) => {
                 required.validate().map_err(transport_error)?;
@@ -133,16 +167,46 @@ async fn answer_round(
     if questions.is_empty() {
         return Ok(replies);
     }
-    let mut tickets = host
+    let tickets = host
         .open(connection, questions, None, deadline)
-        .map_err(|reason| match reason {
-            Withdrawal::HostGone => super::lost_error(),
-            Withdrawal::Expired => transport_error("host input deadline expired"),
-            Withdrawal::Disconnected => transport_error("MCP connection closed during host input"),
-            _ => transport_error("host input round unavailable"),
-        })?;
+        .map_err(open_error)?;
+    collect(client, host, tickets, |(key, sampling), answer| {
+        let reply = if sampling {
+            InputResponse::CreateMessage(sample_result(answer).map_err(tower_mcp::Error::JsonRpc)?)
+        } else {
+            InputResponse::Elicit(elicit_result(answer))
+        };
+        replies.insert(key, reply);
+        Ok(())
+    })
+    .await?;
+    Ok(replies)
+}
+
+pub(super) fn open_error(reason: Withdrawal) -> tower_mcp::Error {
+    match reason {
+        Withdrawal::HostGone => super::lost_error(),
+        Withdrawal::Expired => transport_error("host input deadline expired"),
+        Withdrawal::Disconnected => transport_error("MCP connection closed during host input"),
+        _ => transport_error("host input round unavailable"),
+    }
+}
+
+/// Wait for every ticket's answer and hand each to `on_answer`.
+///
+/// Host loss and a closed MCP connection end the wait with an error. At the
+/// deadline the remaining questions are withdrawn as expired, and each then
+/// reaches `on_answer` as `Err(Withdrawal::Expired)`. An error from
+/// `on_answer` ends the wait, and dropping the remaining tickets withdraws
+/// their questions.
+pub(super) async fn collect<K>(
+    client: &McpClient,
+    host: &Host,
+    mut tickets: Vec<(K, Ticket<'_>)>,
+    mut on_answer: impl FnMut(K, AnswerResult) -> tower_mcp::Result<()>,
+) -> tower_mcp::Result<()> {
     let Some((_, first)) = tickets.first() else {
-        return Ok(replies);
+        return Ok(());
     };
     let expiration = tokio::time::sleep_until(first.deadline);
     tokio::pin!(expiration);
@@ -179,7 +243,7 @@ async fn answer_round(
                 Poll::Pending
             }) => result,
         };
-        let ((key, sampling), _ticket) = tickets.swap_remove(index);
+        let (key, _ticket) = tickets.swap_remove(index);
         match &answer {
             Err(Withdrawal::Disconnected) => {
                 return Err(transport_error("MCP connection closed during host input"));
@@ -187,14 +251,9 @@ async fn answer_round(
             Err(Withdrawal::HostGone) => return Err(super::lost_error()),
             _ => {}
         }
-        let reply = if sampling {
-            InputResponse::CreateMessage(sample_result(answer).map_err(tower_mcp::Error::JsonRpc)?)
-        } else {
-            InputResponse::Elicit(elicit_result(answer))
-        };
-        replies.insert(key, reply);
+        on_answer(key, answer)?;
     }
-    Ok(replies)
+    Ok(())
 }
 
 #[cfg(test)]

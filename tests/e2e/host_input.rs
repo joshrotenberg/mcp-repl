@@ -190,7 +190,9 @@ pub(super) async fn exercise(fixture: &Path, temp: &TempDir) {
     }
 
     exercise_final(fixture, temp, &config).await;
+    exercise_final_task(fixture, &config).await;
     exercise_command_timeout(fixture, &config).await;
+    exercise_stable_error_is_withheld(fixture, temp).await;
     exercise_server_end(fixture, temp, false).await;
     exercise_server_end(fixture, temp, true).await;
 
@@ -367,6 +369,366 @@ async fn exercise_final(fixture: &Path, temp: &TempDir, config: &Path) {
     let output = host_output(child).await;
     assert_status(&output, 5, "final sampling refusal");
     assert_eq!(json_lines(&output, "final sampling refusal").len(), 1);
+}
+
+/// A server-created final task that parks in `input_required` gets its
+/// requests through the bridge, both while the call waits on it and from
+/// `task <id> respond`.
+async fn exercise_final_task(fixture: &Path, config: &Path) {
+    let mut command = fixture_command(config, json!([fixture]));
+    command.args(["--protocol", "final", "-e", "host_task"]);
+    let (child, mut host) = HostControl::spawn(command, None);
+    let form = host.next("needs_input").await;
+    let sample = host.next("needs_input").await;
+    assert_eq!(form["server"]["protocol"], "2026-07-28");
+    assert_eq!(form["kind"], "form");
+    assert_eq!(sample["kind"], "sampling");
+    host.answer(
+        &form,
+        json!({"action":"accept","content":{"apiKey":"bridge-private-answer"}}),
+    )
+    .await;
+    host.answer(&sample, sample_response()).await;
+    let output = host_output(child).await;
+    assert_success(&output, "final task host input");
+    let frames = json_lines(&output, "final task host input");
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(
+        frames[0]["content"][0]["text"],
+        "task accept / fixture-model"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in ["bridge-private-answer", "bridge-private-sample"] {
+        assert!(!stderr.contains(secret), "{stderr}");
+    }
+
+    // The host declines the form and lets the sampling request expire. The
+    // decline is sent, the expired key stays outstanding, and the call
+    // reports the parked task. `task last respond` asks only for that key.
+    let mut command = fixture_command(config, json!([fixture]));
+    command.args([
+        "--protocol",
+        "final",
+        "--host-input-timeout",
+        "2",
+        "-e",
+        "host_task",
+        "-e",
+        "task last",
+        "-e",
+        "task last respond",
+        "-e",
+        "builtin wait last",
+    ]);
+    let (child, mut host) = HostControl::spawn(command, None);
+    let form = host.next("needs_input").await;
+    let sample = host.next("needs_input").await;
+    host.answer(&form, json!({"action":"decline"})).await;
+    // The decline reached the REPL before the shared deadline.
+    let status = host.next("response_status").await;
+    assert_eq!(status["id"], form["id"]);
+    assert_eq!(status["status"], "accepted");
+    let withdrawn = host.next("withdrawn").await;
+    assert_eq!(withdrawn["id"], sample["id"]);
+    assert_eq!(withdrawn["reason"], "expired");
+    let again = host.next("needs_input").await;
+    assert_eq!(again["kind"], "sampling");
+    assert_eq!(again["session"], sample["session"]);
+    assert_ne!(again["id"], sample["id"]);
+    host.answer(&again, sample_response()).await;
+    let output = host_output(child).await;
+    assert_status(&output, 4, "final task host timeout");
+    let frames = json_lines(&output, "final task host timeout");
+    assert_eq!(frames.len(), 4, "{frames:?}");
+    assert_eq!(frames[0]["exitStatus"], 4);
+    let error = frames[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("still waiting for input")
+            && error.contains("`b-sample` (host reply expired)")
+            && error.contains("respond"),
+        "{error}"
+    );
+    assert!(!error.contains("a-form"), "{error}");
+    assert_eq!(frames[1]["status"], "input_required");
+    let task_id = frames[1]["taskId"].as_str().unwrap();
+    assert!(error.contains(task_id), "{error}");
+    assert_eq!(frames[2]["taskId"], task_id);
+    assert!(frames[2].get("error").is_none(), "{:?}", frames[2]);
+    assert_eq!(frames[3]["status"], "completed");
+    assert_eq!(
+        frames[3]["result"]["content"][0]["text"],
+        "task decline / fixture-model"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("bridge-private-sample"), "{stderr}");
+
+    exercise_wait_answers_a_parked_task(fixture, config).await;
+    exercise_bare_wait_is_one_value(fixture, config).await;
+    exercise_respond_honors_the_command_timeout(fixture, config).await;
+    exercise_failed_task_text_is_withheld(fixture, config).await;
+
+    // Losing the host while the call waits on the task ends the session.
+    let mut command = fixture_command(config, json!([fixture]));
+    command.args(["--protocol", "final", "--timeout", "0"]);
+    let (mut child, mut host) = HostControl::spawn(command, None);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"host_task\n").await.unwrap();
+    assert_eq!(host.next("needs_input").await["kind"], "form");
+    assert_eq!(host.next("needs_input").await["kind"], "sampling");
+    drop(host);
+    let output = host_output(child).await;
+    drop(stdin);
+    assert_status(&output, 4, "host loss during final task");
+    let frames = json_lines(&output, "host loss during final task");
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0]["exitStatus"], 4);
+}
+
+/// Both questions expire during the call, so nothing is sent and the task
+/// stays parked. The first `wait` asks both again; the host answers the
+/// sampling request and lets the form expire, so only the sample is sent and
+/// the form stays outstanding instead of going back as `cancel`. The second
+/// `wait` asks only for the form and the task completes.
+async fn exercise_wait_answers_a_parked_task(fixture: &Path, config: &Path) {
+    let mut command = fixture_command(config, json!([fixture]));
+    command.args([
+        "--protocol",
+        "final",
+        "--host-input-timeout",
+        "2",
+        "-e",
+        "host_task",
+        "-e",
+        "builtin wait last",
+        "-e",
+        "builtin wait last",
+    ]);
+    let (child, mut host) = HostControl::spawn(command, None);
+    for _ in 0..2 {
+        host.next("needs_input").await;
+    }
+    for _ in 0..2 {
+        assert_eq!(host.next("withdrawn").await["reason"], "expired");
+    }
+    let form = host.next("needs_input").await;
+    let sample = host.next("needs_input").await;
+    assert_eq!(form["kind"], "form");
+    assert_eq!(sample["kind"], "sampling");
+    host.answer(&sample, sample_response()).await;
+    let status = host.next("response_status").await;
+    assert_eq!(status["id"], sample["id"]);
+    assert_eq!(status["status"], "accepted");
+    let withdrawn = host.next("withdrawn").await;
+    assert_eq!(withdrawn["id"], form["id"]);
+    assert_eq!(withdrawn["reason"], "expired");
+    let again = host.next("needs_input").await;
+    assert_eq!(again["kind"], "form");
+    host.answer(
+        &again,
+        json!({"action":"accept","content":{"apiKey":"bridge-private-answer"}}),
+    )
+    .await;
+    let output = host_output(child).await;
+    assert_status(&output, 4, "wait answers a parked task");
+    let frames = json_lines(&output, "wait answers a parked task");
+    assert_eq!(frames.len(), 3, "{frames:?}");
+    let error = frames[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("`a-form` (host reply expired)")
+            && error.contains("`b-sample` (host reply expired)"),
+        "{error}"
+    );
+    let error = frames[1]["error"]
+        .as_str()
+        .expect("the form stayed outstanding");
+    assert!(
+        error.contains("`a-form` (host reply expired)") && !error.contains("b-sample"),
+        "{error}"
+    );
+    assert_eq!(frames[2]["status"], "completed");
+    assert_eq!(
+        frames[2]["result"]["content"][0]["text"],
+        "task accept / fixture-model"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in ["bridge-private-answer", "bridge-private-sample"] {
+        assert!(!stderr.contains(secret), "{stderr}");
+    }
+}
+
+/// A bare `wait` whose task is left parked again reports that task's error
+/// inside its one array value.
+async fn exercise_bare_wait_is_one_value(fixture: &Path, config: &Path) {
+    let mut command = fixture_command(config, json!([fixture]));
+    command.args([
+        "--protocol",
+        "final",
+        "--host-input-timeout",
+        "1",
+        "-e",
+        "host_task",
+        "-e",
+        "builtin wait",
+    ]);
+    let (child, mut host) = HostControl::spawn(command, None);
+    for _ in 0..2 {
+        host.next("needs_input").await;
+        host.next("needs_input").await;
+        host.next("withdrawn").await;
+        host.next("withdrawn").await;
+    }
+    let output = host_output(child).await;
+    assert_status(&output, 4, "bare wait with bridge input");
+    let frames = json_lines(&output, "bare wait with bridge input");
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    let outcomes = frames[1].as_array().expect("one array value");
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0]["exitStatus"], 4);
+    assert!(outcomes[0]["taskId"].is_string());
+    assert!(
+        outcomes[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("still waiting for input")
+    );
+}
+
+/// `--timeout` bounds `task <id> respond`, including the host's questions,
+/// well inside the 30 second host timeout. The host-input fixture advertises
+/// a 100 ms poll interval, so the call parks the task within its own one
+/// second deadline; only the `respond` that follows is measured.
+async fn exercise_respond_honors_the_command_timeout(fixture: &Path, config: &Path) {
+    let mut command = fixture_command(config, json!([fixture]));
+    command.args([
+        "--protocol",
+        "final",
+        "--timeout",
+        "1",
+        "--host-input-timeout",
+        "30",
+        "-e",
+        "host_task",
+        "-e",
+        "task last respond",
+    ]);
+    let (child, mut host) = HostControl::spawn(command, None);
+    // The call parks the task and gives up at its deadline.
+    for _ in 0..2 {
+        host.next("needs_input").await;
+    }
+    for _ in 0..2 {
+        host.next("withdrawn").await;
+    }
+    let first = host.next("needs_input").await;
+    let published = std::time::Instant::now();
+    assert_eq!(first["kind"], "form");
+    host.next("needs_input").await;
+    for _ in 0..2 {
+        let withdrawn = host.next("withdrawn").await;
+        assert!(
+            ["expired", "cancelled"].contains(&withdrawn["reason"].as_str().unwrap()),
+            "{withdrawn}"
+        );
+    }
+    assert!(
+        published.elapsed() < std::time::Duration::from_secs(10),
+        "respond questions outlived --timeout"
+    );
+    let output = host_output(child).await;
+    assert_status(&output, 4, "respond under --timeout");
+    let frames = json_lines(&output, "respond under --timeout");
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    for frame in &frames {
+        assert_eq!(frame["exitStatus"], 4, "{frame}");
+    }
+}
+
+/// A task that fails with the submitted value in its error message and data
+/// does not reveal it through the call, `task`, `jobs`, or `cancel`.
+async fn exercise_failed_task_text_is_withheld(fixture: &Path, config: &Path) {
+    let mut command = fixture_command(config, json!([fixture]));
+    command.args([
+        "--protocol",
+        "final",
+        "-e",
+        "host_task_fail",
+        "-e",
+        "task last",
+        "-e",
+        "jobs",
+        "-e",
+        "cancel last",
+    ]);
+    let (child, mut host) = HostControl::spawn(command, None);
+    let form = host.next("needs_input").await;
+    host.answer(
+        &form,
+        json!({"action":"accept","content":{"apiKey":"bridge-private-answer"}}),
+    )
+    .await;
+    let output = host_output(child).await;
+    assert_status(&output, 3, "failed task text");
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains("bridge-private-answer"), "{stream}: {text}");
+    }
+    let frames = json_lines(&output, "failed task text");
+    assert_eq!(frames.len(), 4, "{frames:?}");
+    assert_eq!(frames[0]["exitStatus"], 3);
+    assert!(
+        frames[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("(code -32602)")
+    );
+    assert_eq!(frames[1]["status"], "failed");
+    assert_eq!(frames[1]["statusMessage"], "Task failed");
+    assert_eq!(frames[1]["error"]["code"], -32602);
+    assert!(frames[1]["error"].get("data").is_none());
+    assert_eq!(frames[2][0]["task"]["status"], "failed");
+    assert_eq!(frames[3]["status"], "failed");
+}
+
+/// A stable-protocol server that rejects a tool call, resource read, or
+/// prompt request with the host's form answer in its JSON-RPC error has that
+/// text withheld.
+async fn exercise_stable_error_is_withheld(fixture: &Path, temp: &TempDir) {
+    let config = temp.path().join("host-echo.toml");
+    let mut command = fixture_command(
+        &config,
+        json!([fixture, "--tools-only", "--echo-host-answer"]),
+    );
+    let commands = ["add a=1 b=2", "read note://status", "prompt greet name=x"];
+    for line in commands {
+        command.args(["-e", line]);
+    }
+    let (child, mut host) = HostControl::spawn(command, None);
+    for _ in commands {
+        let form = host.next("needs_input").await;
+        assert_eq!(form["server"]["protocol"], "2025-11-25");
+        host.answer(
+            &form,
+            json!({"action":"accept","content":{"apiKey":"bridge-private-answer"}}),
+        )
+        .await;
+    }
+    let output = host_output(child).await;
+    assert_status(&output, 3, "stable error text");
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains("bridge-private-answer"), "{stream}: {text}");
+    }
+    let frames = json_lines(&output, "stable error text");
+    assert_eq!(frames.len(), commands.len(), "{frames:?}");
+    for frame in &frames {
+        assert!(
+            frame["error"]
+                .as_str()
+                .unwrap()
+                .contains("withheld in bridge mode (code -32602)"),
+            "{frame}"
+        );
+    }
 }
 
 async fn exercise_server_end(fixture: &Path, temp: &TempDir, disconnect: bool) {

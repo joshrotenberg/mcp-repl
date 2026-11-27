@@ -335,11 +335,84 @@ continuations. Sampling refusal ends a final input round because the
 protocol has no sampling error value for a continuation. Automatic HTTP
 session recovery and command replay are disabled in bridge mode.
 
-Windows IPC, final task input, and prompt and resource continuations are
-deferred. The descriptor flag returns a usage error on non-Unix platforms.
-Server-created final tasks use the existing task wait path with declined
-input. In bridge mode, `bench` and
-background jobs using a trailing `&` return usage errors. Final-protocol
+A final server can answer a tool call with a task. When that task parks in
+`input_required`, the REPL publishes all of its outstanding requests at
+once, then sends the answers with `tasks/update` and keeps waiting. The
+same applies to `wait` and to `task <id> respond`. Each wait allows up to
+three rounds that ask the host.
+
+The connection keeps one record per task, shared by every command. It holds
+the keys the server acknowledged, the keys published to the host or
+answered locally, the keys a newer snapshot dropped, and the next poll
+slot. Freshness comes from `lastUpdatedAt`: a published key counts as
+dropped only when a snapshot whose `lastUpdatedAt` is strictly newer than
+the newest one that listed it leaves it out. A `lastUpdatedAt` that is not a
+plain RFC 3339 time gives no freshness evidence. That includes a leap
+second, a fraction longer than nine digits, a day the month does not have,
+and an offset that is not `HH:MM` within range. Acknowledged and dropped
+keys are never asked or sent again for that task, so a snapshot that lists
+only such keys is polled again. Every read of the task, including `task`,
+`jobs`, and `cancel`, starts at least the server's `pollIntervalMs` after
+the previous one. A terminal read clears the keys and keeps the poll slot.
+A record that holds only a poll slot is removed once the slot passes.
+Errors leave the record as it is, and the records end with the connection.
+
+While questions are open, a question whose key is dropped is withdrawn with
+`server_cancelled`, and all of them are when the task settles. Before an
+update, the task is read again at the next poll slot, and the answers for
+the keys that read lists are sent at once. An answer whose key it does not
+list is held, without counting the key as dropped. The task is read again
+while the deadline allows, and the held answer is sent once a read lists its
+key. Answers still held when no slot remains are not sent. Without any such
+read before the deadline, nothing is sent and the command reports that the
+task is still waiting. A JSON-RPC refusal of the update ends the command, and
+its keys can be asked again at once. A transport failure, a `-32000` error
+(tower-mcp's form for HTTP failures), or no acknowledgement before
+`--timeout` leaves the outcome unknown. The command then ends, names the
+task id, and says the update may have been applied. A later `respond` or
+`wait` asks again for any key a snapshot still lists. That is the retry, so
+check the task before answering twice.
+
+Known limits with a server that misreports task state:
+
+- Without a usable `lastUpdatedAt`, no key is ever counted as dropped, so a
+  key the task stopped listing can be asked again. tower-mcp ignores
+  answers for keys that are no longer outstanding.
+- A server that lists ever more distinct keys grows the task's record until
+  the task settles or the connection ends.
+- A server whose `lastUpdatedAt` goes backwards, or that reuses a key
+  against SEP-2663, can leave a key excluded while the task still waits
+  for it. The command then ends at its deadline.
+
+A form or URL `decline` or `cancel` is an answer and is sent. A sampling
+refusal, an expired question, a question the full queue could not take, or
+a request kind the bridge cannot carry leaves that key outstanding. The
+answers that did arrive are still sent, and the command reports an error
+that names the remaining keys and the task id. The error has exit status 4,
+or 5 when the host refused sampling. The task then stays parked and appears
+in `jobs`, so `task <id> respond` can ask again. `--timeout` bounds
+`task <id> respond` as one command, including its questions and reads. If
+the read after its update would fall past that deadline, the command reports
+the snapshot the answers were based on. In bridge mode a bare `wait` reports a
+task it could not settle as an entry with `taskId`, `error`, `kind`, and
+`exitStatus` in its one array value. Losing the host ends the session
+without answering.
+
+A server can copy a submitted value into an error. In bridge mode,
+`tasks/get`, `tasks/update`, and `tasks/cancel` errors have their message and
+`data` replaced with fixed text. So do the errors of a final tool call after
+any attempt carried answers. The same applies to a tool call, `read`, or
+`prompt` on either lifecycle once the host answered one of the server's
+questions during it. The exit status is decided from the original
+error, and the JSON-RPC code is kept. `task`, `jobs`, `cancel`, `wait`, and
+`respond` show a task's `error` and the status message of a failed task as
+fixed text with the original code, and status messages from task
+notifications are not recorded. Completed results are shown as the server
+sent them.
+
+Windows IPC and prompt and resource continuations are deferred. The descriptor flag returns a usage error on
+non-Unix platforms. In bridge mode, `bench` and background jobs using a
+trailing `&` return usage errors. Final-protocol
 list-change subscriptions are disabled in bridge mode. Run `refresh` to
 update the final protocol's discovered surface. Stable list-change
 notifications still refresh the surface automatically.

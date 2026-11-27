@@ -351,6 +351,81 @@ fn host_tools(router: McpRouter) -> McpRouter {
                 })
                 .build(),
         )
+        // Task-capable, so on the final protocol the server answers with a
+        // task that parks in `input_required` until `tasks/update` delivers
+        // both answers. The result names the form action and the sampling
+        // model, and says whether it ran inside a task.
+        .tool(
+            ToolBuilder::new("host_task")
+                .description("Park a task on a form and a sampling request")
+                .task_support(TaskSupportMode::Optional)
+                .mrtr_handler(|ctx: RequestContext, _args: serde_json::Value| async move {
+                    let in_task = ctx.extension::<tower_mcp::tool::TaskContext>().is_some();
+                    let Some(responses) = ctx.input_responses() else {
+                        let inputs = [
+                            (
+                                "a-form".into(),
+                                InputRequest::Elicit(ElicitRequestParams::Form(host_form())),
+                            ),
+                            (
+                                "b-sample".into(),
+                                InputRequest::CreateMessage(host_sample()),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect();
+                        return Ok(RequestOutcome::input_required(
+                            InputRequiredResult::with_requests(inputs),
+                        ));
+                    };
+                    let form = match responses.get("a-form") {
+                        Some(InputResponse::Elicit(form)) => action_name(form.action),
+                        _ => "missing",
+                    };
+                    let model = match responses.get("b-sample") {
+                        Some(InputResponse::CreateMessage(sample)) => sample.model.clone(),
+                        _ => "missing".into(),
+                    };
+                    let mode = if in_task { "task" } else { "inline" };
+                    Ok(RequestOutcome::Complete(CallToolResult::text(format!(
+                        "{mode} {form} / {model}"
+                    ))))
+                })
+                .build(),
+        )
+        // Parks on a form, then fails with an error whose message and data
+        // repeat the submitted value, as a careless server might. A live task
+        // handler is what reaches the `failed` state with a structured error.
+        .tool(
+            ToolBuilder::new("host_task_fail")
+                .description("Park a task on a form and fail with the answer in the error")
+                .live_task_handler(|task: tower_mcp::TaskContext, _args: Value| async move {
+                    let inputs = [(
+                        "a-form".into(),
+                        InputRequest::Elicit(ElicitRequestParams::Form(host_form())),
+                    )]
+                    .into_iter()
+                    .collect();
+                    let answers = task.require_input(inputs).await?;
+                    let value = match answers.get("a-form") {
+                        Some(InputResponse::Elicit(form)) => form
+                            .content
+                            .as_ref()
+                            .and_then(|values| values.get("apiKey"))
+                            .map(|value| format!("{value:?}"))
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    Ok(tower_mcp::TaskOutcome::Failed(
+                        tower_mcp::error::JsonRpcError {
+                            code: -32602,
+                            message: format!("rejected credential {value}"),
+                            data: Some(json!({ "value": value })),
+                        },
+                    ))
+                })
+                .build(),
+        )
         .tool(
             ToolBuilder::new("host_round_limit")
                 .description("Request another round forever")
@@ -708,6 +783,75 @@ async fn serve_logged_stdio(
     Ok(())
 }
 
+/// The task poll interval the host-input fixture advertises. tower-mcp's
+/// task store fixes it at two seconds, which would make every host-input
+/// task case wait out several of them.
+const HOST_INPUT_POLL_MS: u64 = 100;
+
+/// Serve the host-input tools, rewriting every advertised `pollIntervalMs`
+/// on the way out.
+async fn serve_host_input_stdio(router: McpRouter) -> Result<(), tower_mcp::BoxError> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let (writer, output) = tokio::io::duplex(1 << 20);
+    let copy = tokio::spawn(async move {
+        let mut frames = tokio::io::BufReader::new(output).split(b'\n');
+        let mut stdout = tokio::io::stdout();
+        while let Ok(Some(frame)) = frames.next_segment().await {
+            let frame = match serde_json::from_slice::<Value>(&frame) {
+                Ok(mut value) => {
+                    pace(&mut value);
+                    value.to_string().into_bytes()
+                }
+                Err(_) => frame,
+            };
+            if stdout.write_all(&frame).await.is_err()
+                || stdout.write_all(b"\n").await.is_err()
+                || stdout.flush().await.is_err()
+            {
+                break;
+            }
+        }
+    });
+    BidirectionalStdioTransport::new(router)
+        .protocol_support(protocol_support())
+        .run_with_streams(tokio::io::stdin(), writer)
+        .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), copy).await;
+    Ok(())
+}
+
+/// Rewrite the advertised interval of the task metadata in a task response
+/// or task notification: `tasks/get` and `tasks/update` results, a created
+/// task, and `notifications/tasks/status`. Nothing else is touched, so a
+/// tool's own structured content reaches the client as the tool wrote it.
+fn pace(frame: &mut Value) {
+    for (member, nested) in [
+        ("result", false),
+        ("result", true),
+        ("params", false),
+        ("params", true),
+    ] {
+        let Some(mut target) = frame.get_mut(member) else {
+            continue;
+        };
+        if nested {
+            let Some(task) = target.get_mut("task") else {
+                continue;
+            };
+            target = task;
+        }
+        let Some(fields) = target.as_object_mut() else {
+            continue;
+        };
+        if fields.contains_key("taskId")
+            && fields.contains_key("status")
+            && fields.get("pollIntervalMs").is_some_and(Value::is_u64)
+        {
+            fields.insert("pollIntervalMs".into(), json!(HOST_INPUT_POLL_MS));
+        }
+    }
+}
+
 fn claim_marker(name: &str) -> bool {
     let Some(path) = env_path(name) else {
         return false;
@@ -845,6 +989,11 @@ fn serve_raw_tools_only(
     let mut pending_call = None;
     let host_trigger = env_path("MCP_REPL_FIXTURE_HOST_TRIGGER");
     let disconnect = std::env::args().any(|arg| arg == "--disconnect-host-input");
+    // Ask for a form during a tool call, resource read, or prompt request,
+    // then reject it with the answer in the JSON-RPC error's message and
+    // data, as a careless server might.
+    let echo_host_answer = std::env::args().any(|arg| arg == "--echo-host-answer");
+    let mut echo_call = None;
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -868,6 +1017,33 @@ fn serve_raw_tools_only(
         let Some(id) = request.get("id").filter(|id| !id.is_null()).cloned() else {
             continue;
         };
+        if id == "echo-callback" && method.is_empty() {
+            let Some(call) = echo_call.take() else {
+                continue;
+            };
+            let value = request["result"]["content"]["apiKey"].to_string();
+            let response = serde_json::json!({
+                "jsonrpc": "2.0", "id": call,
+                "error": {
+                    "code": -32602,
+                    "message": format!("rejected credential {value}"),
+                    "data": {"value": value},
+                },
+            });
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
+            continue;
+        }
+        if echo_host_answer && matches!(method, "tools/call" | "resources/read" | "prompts/get") {
+            let callback = serde_json::json!({
+                "jsonrpc": "2.0", "id": "echo-callback", "method": "elicitation/create",
+                "params": host_form(),
+            });
+            writeln!(stdout, "{callback}")?;
+            stdout.flush()?;
+            echo_call = Some(id);
+            continue;
+        }
         if id == "fixture-callback" && method.is_empty() && host_trigger.is_some() {
             write_marker("MCP_REPL_FIXTURE_UNEXPECTED_HOST_REPLY", b"received");
             continue;
@@ -1238,10 +1414,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
             .layer(axum::middleware::from_fn(trace_requests));
         axum::serve(listener, app).await?;
     } else if std::env::var_os("MCP_REPL_FIXTURE_HOST_INPUT").is_some() {
-        BidirectionalStdioTransport::new(router)
-            .protocol_support(protocol_support())
-            .run()
-            .await?;
+        serve_host_input_stdio(router).await?;
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
     } else {
         let mut transport = StdioTransport::new(router).protocol_support(protocol_support());
