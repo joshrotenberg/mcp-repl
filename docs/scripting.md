@@ -177,11 +177,84 @@ shutdown kills the owned process group. A forced Windows kill reaches only
 mcp-repl. The server may keep running until it handles EOF or exits on
 its own.
 
+### Answering elicitation and sampling in Python
+
+On Unix, pass `Session(argv, host_input=handler)` to enable the host input
+bridge. The driver opens the socket, keeps reading it while handlers run,
+and sends each answer with the question's identifiers. Commands still return
+one stdout reply each. Set `host_input_timeout` to an integer from 1 to 120
+seconds (default 30). With a handler, `request_timeout` defaults to the
+greater of 10 seconds and `host_input_timeout + 2` seconds. Set it
+explicitly when the tool and its input rounds need a different command
+deadline. On Windows and other non-Unix platforms, constructing a session
+with a handler raises `ValueError`.
+
+```python
+from session_driver import Session, accept, decline
+
+def handle(request):
+    if request.kind == "form" and request.params["schema"] == expected_schema:
+        # The host supplies this function to obtain the user's decision.
+        approved = ask_user(request.params["message"], request.deadline, request.cancelled)
+        if approved and not request.cancelled.is_set():
+            return accept({"approve": True})
+    return decline()
+
+with Session(server_argv, host_input=handle, request_timeout=60) as session:
+    reply = session.call(tool_name, {})
+    status = session.next_host_input_status(timeout=1)
+```
+
+The handler receives a `HostInputRequest` with `kind` (`form`, `url`, or
+`sampling`), opaque `session` and `id` strings, `server` metadata, and
+`actions`. Its `params` contains `message` and `schema` for a form,
+with optional `credentialFields` listing field names whose input should
+be masked. It contains `message` and `url` for a URL or MCP
+`CreateMessageParams` for sampling.
+Treat those fields as server-supplied data and use an answer helper for the
+request kind.
+
+- `accept(content)` with a dictionary of form values.
+- `decline()` or `cancel()` for any question.
+- `confirm_url()` after the user explicitly confirms completing the
+  out-of-band step.
+- `sample(result, origin="model")` with an MCP `CreateMessageResult`
+  dictionary. For operator-authored content, use `origin="operator"` and
+  set the result's model to `mcp-repl/operator`.
+
+Handlers can run concurrently. Use `request.deadline - time.monotonic()`
+to bound blocking work, and check the `request.cancelled` event to release
+it promptly on withdrawal, timeout, socket EOF, or session shutdown.
+Python callbacks must cooperate to exit promptly. The driver sends a
+decline for an exception, timeout, invalid answer, or unavailable handler
+slot and records a fixed reason in `session.host_input_errors`.
+When the REPL's rejection status for a tracked answer arrives with reason
+`malformed`, `invalid_payload`, or `wrong_kind`, the driver records
+`answer_rejected` and sends one fallback decline. Statuses are best effort,
+so if one is dropped the question waits for the REPL's own deadline. When the bridge learns that a question was withdrawn, it discards
+the pending handler answer and sends a decline. The REPL can report stale
+for those declines and for declines sent at the deadline. Results arriving
+after shutdown begins are discarded.
+
+`session.next_host_input_status(timeout=...)` returns a `HostInputStatus`
+with `session`, `id`, `status`, and `reason`, or `None` when the wait
+expires or the closed bridge has no statuses left. Statuses are best effort.
+The status is `accepted` or `rejected`, with reason `duplicate` for a
+repeated answer the REPL already received. The driver retains up
+to 256 unread statuses and 256 recent `HostInputError` records. Error records
+contain only the question identifiers when available and a fixed reason,
+such as `handler_exception` or `handler_timeout`. The driver sends answers
+over the bridge. Keep them out of host logs and treat ordinary MCP results as
+potentially sensitive because the server receives the answers.
+
 ## Host-mediated input on Unix
 
 A host can answer elicitation and sampling while an MCP operation is still
-running. Pass `--json --host-input-fd FD` before the command or the raw stdio
-server argv. Create a connected Unix stream socket pair, pass only the REPL
+running. The Python driver manages the socket when given a
+[`host_input` handler](#answering-elicitation-and-sampling-in-python).
+To use the bridge directly, pass `--json --host-input-fd FD` before the
+command or the raw stdio server argv. Create a connected Unix stream socket
+pair, pass only the REPL
 endpoint to the child, and close the parent's copy of that endpoint after
 spawn. In Python, use `socket.socketpair()` and
 `subprocess.Popen(..., pass_fds=(repl_end.fileno(),))`. The descriptor is
@@ -262,10 +335,10 @@ continuations. Sampling refusal ends a final input round because the
 protocol has no sampling error value for a continuation. Automatic HTTP
 session recovery and command replay are disabled in bridge mode.
 
-Windows IPC, final task input, prompt and resource continuations, and
-session-driver integration are deferred. The descriptor flag returns a
-usage error on non-Unix platforms. Server-created final tasks use the
-existing task wait path with declined input. In bridge mode, `bench` and
+Windows IPC, final task input, and prompt and resource continuations are
+deferred. The descriptor flag returns a usage error on non-Unix platforms.
+Server-created final tasks use the existing task wait path with declined
+input. In bridge mode, `bench` and
 background jobs using a trailing `&` return usage errors. Final-protocol
 list-change subscriptions are disabled in bridge mode. Run `refresh` to
 update the final protocol's discovered surface. Stable list-change
