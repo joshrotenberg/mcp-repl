@@ -1,6 +1,6 @@
 # The command set
 
-[mcp-repl](../README.md) · [Connecting](connecting.md) · [Commands](commands.md) · [Scripting](scripting.md) · [Debugging](debugging.md)
+[mcp-repl](../README.md) · [Connecting](connecting.md) · [Commands](commands.md) · [Scripting](scripting.md) · [Debugging](debugging.md) · [Agent skills](agent-skills.md)
 
 
 The server's surface is the command set. This is everything the REPL adds

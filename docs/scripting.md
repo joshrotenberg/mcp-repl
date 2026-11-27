@@ -1,6 +1,6 @@
 # Scripting
 
-[mcp-repl](../README.md) · [Connecting](connecting.md) · [Commands](commands.md) · [Scripting](scripting.md) · [Debugging](debugging.md)
+[mcp-repl](../README.md) · [Connecting](connecting.md) · [Commands](commands.md) · [Scripting](scripting.md) · [Debugging](debugging.md) · [Agent skills](agent-skills.md)
 
 
 Running mcp-repl from a script or a CI job.

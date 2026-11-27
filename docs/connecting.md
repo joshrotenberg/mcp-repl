@@ -1,6 +1,6 @@
 # Connecting
 
-[mcp-repl](../README.md) · [Connecting](connecting.md) · [Commands](commands.md) · [Scripting](scripting.md) · [Debugging](debugging.md)
+[mcp-repl](../README.md) · [Connecting](connecting.md) · [Commands](commands.md) · [Scripting](scripting.md) · [Debugging](debugging.md) · [Agent skills](agent-skills.md)
 
 
 Every way to reach a server, and how credentials are handled.
