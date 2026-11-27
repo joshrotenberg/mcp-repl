@@ -1,9 +1,12 @@
 """Black-box session driver cases invoked by the Rust e2e suite."""
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import queue
 import signal
+import socket
 import subprocess
 from subprocess import DEVNULL, Popen as real_popen
 import sys
@@ -16,9 +19,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]
                        / "src/plugin_assets/skills/mcp-repl/scripts"))
+import session_driver
 from session_driver import (
     CleanupError, ClientError, Session, SessionError, SessionLost,
-    TaskError, TaskPending, TaskRef, ToolError,
+    TaskError, TaskPending, TaskRef, ToolError, accept, cancel, confirm_url, decline, sample,
 )
 
 
@@ -26,6 +30,12 @@ REPL = FIXTURE = None
 LITERAL = '"hello world" \\ literal $owner | & ; $(name)\n\U0001f642'
 LITERAL += r" # && || = > unbalanced {[ and literal \u0024"
 QUOTED_WORD = 'probe"\\ | &{\u2603'
+FORM_ANSWER = "bridge-private-answer"
+SAMPLE_TEXT = "bridge-private-sample"
+SAMPLE_RESULT = {
+    "model": "fixture-model", "role": "assistant",
+    "content": {"type": "text", "text": SAMPLE_TEXT},
+}
 MARKERS = {
     "spawns": "MCP_REPL_FIXTURE_DRIVER_SPAWNS_FILE",
     "exit": "MCP_REPL_FIXTURE_EXIT_FILE",
@@ -58,7 +68,7 @@ def run_worker(session, *, fail=False):
     return started["handle"], (start.request_id, wait.request_id, result.request_id)
 
 
-class DriverTests(unittest.TestCase):
+class _FixtureTests(unittest.TestCase):
     def setUp(self):
         if REPL is None or FIXTURE is None:
             self.skipTest("run the harness with mcp-repl and fixture paths")
@@ -79,6 +89,8 @@ class DriverTests(unittest.TestCase):
         if clean:
             self.assertEqual(self.paths["exit"].read_text(), "clean")
 
+
+class DriverTests(_FixtureTests):
     def test_stateful_worker(self):
         with self.session("--session-driver") as session:
             if os.name == "posix":
@@ -222,7 +234,333 @@ class DriverTests(unittest.TestCase):
         self.assert_reaped(session)
 
 
-def fake_peer(mode):
+@unittest.skipUnless(os.name == "posix", "the host input bridge requires Unix")
+class HostInputTests(_FixtureTests):
+    def setUp(self):
+        super().setUp()
+        self.env["MCP_REPL_FIXTURE_HOST_INPUT"] = "1"
+        self.env["RUST_LOG"] = "trace"
+
+    def test_host_form_url_and_sampling(self):
+        cases = [
+            ("host_form", accept({"apiKey": FORM_ANSWER}), "form accept"),
+            ("host_form", decline(), "form decline"),
+            ("host_form", cancel(), "form cancel"),
+            ("host_url", decline(), "url decline"),
+            ("host_url", confirm_url(), "url accept"),
+            ("host_sample", sample(SAMPLE_RESULT), "sampled by fixture-model"),
+            ("host_sample", sample(dict(SAMPLE_RESULT, model="mcp-repl/operator"),
+                                   origin="operator"), "sampled by mcp-repl/operator"),
+        ]
+        answers = iter(answer for _, answer, _ in cases)
+        requests = queue.Queue()
+
+        def handle(request):
+            requests.put(request)
+            return next(answers)
+
+        with self.session(host_input=handle) as session:
+            first = session.discover().request_id
+            for index, (tool, _, expected) in enumerate(cases, 1):
+                reply = session.call(tool, {})
+                request = requests.get(timeout=5)
+                self.assertEqual(reply.request_id, first + index)
+                self.assertEqual(reply.value["content"][0]["text"], expected)
+                self.assertEqual(request.kind, "sampling" if tool == "host_sample" else tool[5:])
+                self.assertEqual(request.server["name"], "mcp-repl-fixture")
+                self.assertGreater(request.deadline, time.monotonic())
+                if request.kind == "form":
+                    self.assertEqual(request.params["message"], "Provide a synthetic value")
+                    self.assertEqual(request.params["schema"]["required"], ["apiKey"])
+                    self.assertEqual(request.params["credentialFields"], ["apiKey"])
+                elif request.kind == "url":
+                    self.assertTrue(request.params["url"].startswith("https://example.com/"))
+                    self.assertIn("confirm_url", request.actions)
+                else:
+                    self.assertEqual(request.params["maxTokens"], 24)
+                status = session.next_host_input_status(timeout=5)
+                self.assertEqual((status.session, status.id), (request.session, request.id))
+                self.assertEqual(status.status, "accepted")
+            self.assertEqual(session.host_input_errors, ())
+        self.assert_reaped(session)
+        for secret in (FORM_ANSWER, SAMPLE_TEXT, "fixture-url-token"):
+            self.assertNotIn(secret, session.stderr_tail)
+        self.assertNotIn(FORM_ANSWER, repr(cases))
+
+    def test_host_handler_exception_declines(self):
+        def handle(request):
+            raise ValueError(FORM_ANSWER)
+
+        with self.session(host_input=handle) as session:
+            reply = session.call("host_form", {})
+            self.assertEqual(reply.value["content"][0]["text"], "form decline")
+            status = session.next_host_input_status(timeout=5)
+            self.assertEqual(status.status, "accepted")
+            error, = session.host_input_errors
+            self.assertEqual((error.session, error.id), (status.session, status.id))
+            self.assertEqual(error.reason, "handler_exception")
+        self.assert_reaped(session)
+        self.assertNotIn(FORM_ANSWER, repr(session.host_input_errors) + session.stderr_tail)
+
+    def test_host_invalid_answers_are_declined_locally(self):
+        cases = [
+            ("host_form", accept("x")),
+            ("host_form", accept({})),
+            ("host_form", accept({1: FORM_ANSWER, "apiKey": FORM_ANSWER})),
+            ("host_form", confirm_url()),
+            ("host_sample", sample(SAMPLE_RESULT, origin="Model")),
+            ("host_sample", sample(dict(SAMPLE_RESULT, role="user"))),
+            ("host_sample", sample(SAMPLE_RESULT, origin="operator")),
+            ("host_sample", sample(dict(SAMPLE_RESULT, model="mcp-repl/canned"))),
+        ]
+        answers = iter(answer for _, answer in cases)
+        with self.session(host_input=lambda request: next(answers)) as session:
+            for index, (tool, answer) in enumerate(cases, 1):
+                with self.subTest(tool=tool, answer=answer):
+                    if tool == "host_sample":
+                        with self.assertRaises(ToolError) as failed:
+                            session.call(tool, {})
+                        self.assertNotIn(SAMPLE_TEXT, repr(failed.exception.response))
+                    else:
+                        reply = session.call(tool, {})
+                        self.assertEqual(reply.value["content"][0]["text"], "form decline")
+                    status = session.next_host_input_status(timeout=5)
+                    self.assertEqual(status.status, "accepted")
+                    self.assertEqual(len(session.host_input_errors), index)
+                    error = session.host_input_errors[-1]
+                    self.assertEqual((error.session, error.id), (status.session, status.id))
+                    self.assertEqual(error.reason, "invalid_answer")
+            self.assertIsNone(session.next_host_input_status(timeout=0))
+        self.assert_reaped(session)
+        for secret in (FORM_ANSWER, SAMPLE_TEXT):
+            self.assertNotIn(secret, repr(session.host_input_errors) + session.stderr_tail)
+
+    def test_host_rejected_answers_get_one_decline(self):
+        cases = [
+            (accept({"apiKey": {"private": FORM_ANSWER}}), "malformed"),
+            (accept({"apiKey": 42}), "invalid_payload"),
+        ]
+        answers = iter(answer for answer, _ in cases)
+        with self.session(host_input=lambda request: next(answers), host_input_timeout=10) as session:
+            for index, (_, reason) in enumerate(cases, 1):
+                reply = session.call("host_form", {})
+                self.assertEqual(reply.value["content"][0]["text"], "form decline")
+                rejected = session.next_host_input_status(timeout=5)
+                accepted = session.next_host_input_status(timeout=5)
+                self.assertEqual((rejected.status, rejected.reason), ("rejected", reason))
+                self.assertEqual(accepted.status, "accepted")
+                key = (rejected.session, rejected.id)
+                self.assertEqual(key, (accepted.session, accepted.id))
+                self.assertEqual(len(session.host_input_errors), index)
+                error = session.host_input_errors[-1]
+                self.assertEqual((error.session, error.id), key)
+                self.assertEqual(error.reason, "answer_rejected")
+        self.assert_reaped(session)
+        self.assertNotIn(FORM_ANSWER, repr(session.host_input_errors) + session.stderr_tail)
+
+    def test_host_handler_timeout_declines(self):
+        finished = threading.Event()
+
+        def handle(request):
+            request.cancelled.wait(5)
+            finished.set()
+            return accept({"apiKey": FORM_ANSWER})
+
+        with self.session(host_input=handle, host_input_timeout=1) as session:
+            reply = session.call("host_form", {})
+            self.assertIn(reply.value["content"][0]["text"], ("form decline", "form cancel"))
+            self.assertTrue(finished.wait(5))
+            status = session.next_host_input_status(timeout=5)
+            error, = session.host_input_errors
+            self.assertEqual((error.session, error.id), (status.session, status.id))
+            self.assertEqual(error.reason, "handler_timeout")
+            if status.status == "rejected":
+                self.assertEqual(status.reason, "stale")
+            else:
+                self.assertEqual(status.status, "accepted")
+        self.assert_reaped(session)
+        self.assertNotIn(FORM_ANSWER, repr(session.host_input_errors) + session.stderr_tail)
+
+    def test_host_server_cancellation_rejects_late_answer(self):
+        trigger = self.paths["exit"].with_name("trigger")
+        unexpected_reply = trigger.with_name("unexpected-reply")
+        self.env["MCP_REPL_FIXTURE_HOST_TRIGGER"] = str(trigger)
+        self.env["MCP_REPL_FIXTURE_UNEXPECTED_HOST_REPLY"] = str(unexpected_reply)
+        requests = queue.Queue()
+
+        def handle(request):
+            requests.put(request)
+            trigger.touch()
+            if request.cancelled.wait(5):
+                return accept({"apiKey": FORM_ANSWER})
+            raise RuntimeError("fixture did not cancel the question")
+
+        with self.session("--tools-only", host_input=handle) as session:
+            reply = session.call("add", {"a": 1, "b": 2})
+            self.assertEqual(reply.value["content"][0]["text"], "server cancelled")
+            request = requests.get(timeout=5)
+            status = session.next_host_input_status(timeout=5)
+            self.assertTrue(request.cancelled.is_set())
+            self.assertEqual((status.session, status.id), (request.session, request.id))
+            self.assertEqual((status.status, status.reason), ("rejected", "stale"))
+            self.assertEqual(session.host_input_errors, ())
+        self.assert_reaped(session)
+        self.assertFalse(unexpected_reply.exists())
+
+    def test_host_final_parallel_inputs_and_sampling_refusal(self):
+        sampling_started = threading.Event()
+        refuse = threading.Event()
+
+        def handle(request):
+            if request.kind == "sampling":
+                sampling_started.set()
+                if refuse.is_set():
+                    raise RuntimeError(SAMPLE_TEXT)
+                return sample(SAMPLE_RESULT)
+            if not sampling_started.wait(5):
+                raise RuntimeError("sampling was blocked by the form")
+            return decline()
+
+        with self.session(host_input=handle, protocol="final") as session:
+            reply = session.call("host_rounds", {})
+            self.assertEqual(reply.value["content"][0]["text"], "final decline / fixture-model")
+            self.assertEqual(session.host_input_errors, ())
+            for _ in range(2):
+                self.assertEqual(session.next_host_input_status(timeout=5).status, "accepted")
+            sampling_started.clear()
+            refuse.set()
+            with self.assertRaises(ClientError) as failed:
+                session.call("host_rounds", {})
+            self.assertEqual(failed.exception.response["exitStatus"], 5)
+            self.assertNotIn(SAMPLE_TEXT, str(failed.exception))
+            error, = session.host_input_errors
+            self.assertEqual(error.reason, "handler_exception")
+        self.assert_reaped(session)
+        self.assertNotIn(SAMPLE_TEXT, repr(session.host_input_errors) + session.stderr_tail)
+
+    def test_host_socket_can_replace_closed_standard_descriptors(self):
+        result = subprocess.run(
+            [sys.executable, "-B", __file__, "host-low-fd", REPL, FIXTURE], env=self.env,
+            stdin=DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout.decode("utf-8"))
+
+
+def exercise_low_fds(repl, fixture):
+    socketpair = socket.socketpair
+
+    def low_socketpair():
+        host, repl_end = socketpair()
+        assert repl_end.fileno() < 3
+        return host, repl_end
+
+    os.close(0)
+    os.close(2)
+    try:
+        with patch("session_driver.socket.socketpair", low_socketpair):
+            with Session([fixture], repl=repl, host_input=lambda request: decline()) as session:
+                response = session.call("host_form", {})
+                assert response.value["content"][0]["text"] == "form decline"
+                assert session.next_host_input_status(timeout=5).status == "accepted"
+    except Exception as error:
+        print(type(error).__name__, str(error))
+        sys.exit(1)
+
+
+def fake_host_input(mode, fd, expect, send):
+    def frame(**fields):
+        return json.dumps(dict(v=1, session="fake-1", **fields)).encode("utf-8") + b"\n"
+
+    def question(request_id, seconds=20):
+        return frame(
+            type="needs_input", id=request_id, kind="form", server={},
+            request={"message": "Proceed?", "schema": {}},
+            actions=["accept", "decline", "cancel"],
+            deadlineUnixMs=int((time.time() + seconds) * 1000),
+        )
+
+    def withdrawn(request_id):
+        return frame(type="withdrawn", id=request_id, reason="server_cancelled")
+
+    def expect_declines(channel, ids):
+        with channel.makefile("rb") as reader:
+            replies = [json.loads(reader.readline()) for _ in ids]
+        if {reply.get("id") for reply in replies} != set(ids) or any(
+            reply != {"v": 1, "type": "response", "session": "fake-1",
+                      "id": reply["id"], "action": "decline"}
+            for reply in replies
+        ):
+            sys.exit(94)
+
+    fd = int(fd)
+    with socket.socket(fileno=fd) as channel:
+        expect('builtin call "probe" {}')
+        invalid_frames = {
+            "host-malformed": b'{' + FORM_ANSWER.encode() + b'\n',
+            "host-oversized": b'x' * (1024 * 1024),
+            "host-truncated": b'{"v":1',
+        }
+        if mode in invalid_frames:
+            channel.sendall(invalid_frames[mode])
+            channel.shutdown(socket.SHUT_WR)
+            if channel.recv(1):
+                sys.exit(93)
+            send(b'{"content":[]}\n')
+            expect("builtin quit")
+            send(b'{"exit":true}\n')
+            return
+        if mode == "host-exit":
+            # This keeps the peer endpoint alive until the driver closes its side.
+            real_popen(
+                [sys.executable, "-c",
+                 "import socket, sys; s = socket.socket(fileno=int(sys.argv[1])); "
+                 "s.settimeout(15); s.recv(1)", str(fd)],
+                stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, pass_fds=(fd,),
+            )
+        if mode == "host-timeout":
+            # Future v1 extensions have no bearing on the question or its response.
+            channel.sendall(b'{"v":1,"type":"heartbeat"}\n')
+            channel.sendall(frame(type="response_status", id="1", status="duplicate"))
+            channel.sendall(frame(type="response_status", id="1", status="future"))
+        ids = ["1"] if mode in ("host-timeout", "host-withdrawn") else ["1", "2"]
+        channel.sendall(b"".join(
+            question(request_id, 0.5 if mode == "host-timeout" else 20)
+            for request_id in ids
+        ))
+        if mode == "host-busy":
+            send(b'{"content":[]}\n')
+            expect('builtin call "probe" {}')
+            extra = [str(number) for number in range(3, 73)]
+            channel.sendall(b"".join(withdrawn(key) for key in ids))
+            channel.sendall(b"".join(question(key) + withdrawn(key) for key in extra))
+            expect_declines(channel, ids + extra)
+            send(b'{"content":[]}\n')
+        if mode == "host-withdrawn":
+            send(b'{"content":[]}\n')
+            expect('builtin call "probe" {}')
+            channel.sendall(withdrawn("1"))
+            expect_declines(channel, ids)
+            channel.sendall(frame(type="response_status", id="1", status="rejected",
+                                  reason="stale"))
+            send(b'{"content":[]}\n')
+        if mode in ("host-eof", "host-exit"):
+            send(b'{"content":[]}\n')
+        if mode == "host-eof":
+            expect('builtin call "probe" {}')
+            channel.shutdown(socket.SHUT_WR)
+            if channel.recv(1):
+                sys.exit(93)
+            send(b'{"content":[]}\n')
+        if mode in ("host-close", "host-timeout"):
+            expect_declines(channel, ids)
+            channel.sendall(frame(type="response_status", id="1", status="rejected",
+                                  reason="duplicate"))
+            send(b'{"content":[]}\n')
+        expect("builtin quit")
+        send(b'{"exit":true}\n')
+
+
+def fake_peer(mode, fd=None):
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
@@ -260,6 +598,9 @@ def fake_peer(mode):
         sys.exit(2)
     expect("builtin tools")
     send(b'[{"name":"probe"}]\n')
+    if mode.startswith("host-"):
+        fake_host_input(mode, fd, expect, send)
+        return
     if mode == "inherited-kill":
         hold_pipes()
     if mode in ("blocked-write", "interrupted", "inherited-kill"):
@@ -542,6 +883,164 @@ class PipeTests(unittest.TestCase):
         self.assertIsInstance(error.exception.cause, ClientError)
         self.assertEqual(error.exception.cause.response["exitStatus"], 3)
 
+    def test_host_input_requires_unix(self):
+        with patch("session_driver.os.name", "nt"):
+            with self.assertRaisesRegex(ValueError, "host_input requires Unix"):
+                Session([sys.executable], host_input=lambda request: decline())
+
+    @unittest.skipUnless(os.name == "posix", "the host input bridge requires Unix")
+    def test_host_default_request_timeout_leaves_room_for_input(self):
+        for request_timeout, host_timeout, effective in ((None, 30, 32), (None, 120, 122),
+                                                          (10, 30, 10)):
+            with self.subTest(request_timeout=request_timeout, host_timeout=host_timeout):
+                with patch("session_driver.subprocess.Popen",
+                           side_effect=fake_popen("host-timeout")) as launch:
+                    with Session(
+                        [sys.executable], repl=sys.executable, host_input=lambda request: decline(),
+                        request_timeout=request_timeout, host_input_timeout=host_timeout,
+                    ) as session:
+                        session.call("probe", {})
+                    argv = launch.call_args[0][0]
+                self.assertEqual(argv[argv.index("--timeout") + 1], str(effective))
+                self.assertEqual(argv[argv.index("--host-input-timeout") + 1], str(host_timeout))
+
+    @unittest.skipUnless(os.name == "posix", "the host input bridge requires Unix")
+    def test_host_timeout_sends_decline_and_surfaces_duplicate(self):
+        def handle(request):
+            request.cancelled.wait(5)
+            return accept({"secret": FORM_ANSWER})
+
+        with self.session("host-timeout", host_input=handle) as session:
+            session.call("probe", {})
+            status = session.next_host_input_status(timeout=5)
+            self.assertEqual((status.status, status.reason), ("rejected", "duplicate"))
+            self.assertEqual([error.reason for error in session.host_input_errors],
+                             ["handler_timeout"])
+        self.assertNotIn(FORM_ANSWER, repr(session.host_input_errors) + session.stderr_tail)
+
+    @unittest.skipUnless(os.name == "posix", "the host input bridge requires Unix")
+    def test_host_withdrawal_drops_the_handler_answer(self):
+        original_run = session_driver._HostCall.run
+        for started in (False, True):
+            with self.subTest(started=started):
+                ready = threading.Event()
+                release = threading.Event()
+                workers = queue.Queue()
+                handled = threading.Event()
+
+                def run(call, handler, slots):
+                    workers.put((call.request, threading.current_thread()))
+                    if not started:
+                        ready.set()
+                        release.wait(10)
+                    original_run(call, handler, slots)
+
+                def handle(request):
+                    handled.set()
+                    ready.set()
+                    release.wait(10)
+                    return accept({"secret": FORM_ANSWER})
+
+                with patch.object(session_driver._HostCall, "run", run):
+                    with self.session("host-withdrawn", host_input=handle) as session:
+                        session.call("probe", {})
+                        self.assertTrue(ready.wait(5))
+                        request, worker = workers.get(timeout=5)
+                        try:
+                            session.call("probe", {})
+                            self.assertTrue(request.cancelled.is_set())
+                            status = session.next_host_input_status(timeout=5)
+                            self.assertEqual((status.status, status.reason), ("rejected", "stale"))
+                            self.assertEqual(session.host_input_errors, ())
+                        finally:
+                            release.set()
+                        worker.join(timeout=5)
+                        self.assertFalse(worker.is_alive())
+                        self.assertEqual(handled.is_set(), started)
+
+    @unittest.skipUnless(os.name == "posix", "the host input bridge requires Unix")
+    def test_host_busy_refuses_a_burst_of_questions_without_ending_the_session(self):
+        started = queue.Queue()
+        release = threading.Event()
+
+        def handle(request):
+            started.put(request)
+            release.wait(10)
+            return accept({"secret": FORM_ANSWER})
+
+        with patch.object(session_driver, "_HOST_MAX_HANDLERS", 2):
+            with self.session("host-busy", host_input=handle) as session:
+                session.call("probe", {})
+                handlers = [started.get(timeout=5) for _ in range(2)]
+                try:
+                    session.call("probe", {})
+                    self.assertTrue(all(request.cancelled.is_set() for request in handlers))
+                    self.assertTrue(started.empty())
+                    errors = session.host_input_errors
+                    self.assertEqual([(error.id, error.reason) for error in errors],
+                                     [(str(number), "handler_busy") for number in range(3, 73)])
+                    self.assertIsNone(session.returncode)
+                finally:
+                    release.set()
+        self.assertEqual(session.returncode, 0)
+
+    @unittest.skipUnless(os.name == "posix", "the host input bridge requires Unix")
+    def test_host_invalid_inbound_frames_close_the_bridge_with_sanitized_error(self):
+        for mode in ("host-malformed", "host-oversized", "host-truncated"):
+            with self.subTest(mode=mode):
+                with self.session(mode, host_input=lambda request: decline()) as session:
+                    session.call("probe", {})
+                    self.assertIsNone(session.next_host_input_status(timeout=5))
+                    error, = session.host_input_errors
+                    self.assertEqual((error.session, error.id, error.reason),
+                                     (None, None, "bridge_error"))
+                self.assertNotIn(FORM_ANSWER, repr(session.host_input_errors) + session.stderr_tail)
+
+    @unittest.skipUnless(os.name == "posix", "the host input bridge requires Unix")
+    def test_host_close_eof_and_child_exit_release_handlers(self):
+        for mode in ("host-close", "host-eof", "host-exit"):
+            with self.subTest(mode=mode):
+                started = queue.Queue()
+
+                def handle(request):
+                    started.put((request, threading.current_thread()))
+                    request.cancelled.wait(15)
+                    return accept({"secret": FORM_ANSWER})
+
+                with patch("session_driver.subprocess.Popen", side_effect=fake_popen(mode)):
+                    session = Session([sys.executable], repl=sys.executable, host_input=handle)
+                    session.__enter__()
+                self.addCleanup(self.close_host_peer, session)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    reply = executor.submit(session.call, "probe", {})
+                    handlers = [started.get(timeout=5) for _ in range(2)]
+                    if mode == "host-close":
+                        session.close()
+                        self.assertEqual(session.next_host_input_status(timeout=5).reason,
+                                         "duplicate")
+                    reply.result(timeout=5)
+                    if mode == "host-eof":
+                        session.call("probe", {})
+                        self.assertIsNone(session.returncode)
+                    elif mode == "host-exit":
+                        session._child.terminate()
+                        session._child.wait(timeout=5)
+                for request, worker in handlers:
+                    self.assertTrue(request.cancelled.wait(5))
+                    worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive())
+                session._host_input._thread.join(timeout=5)
+                self.assertFalse(session._host_input._thread.is_alive())
+                self.assertIsNone(session.next_host_input_status(timeout=5))
+
+    @staticmethod
+    def close_host_peer(session):
+        try:
+            session.close()
+        except CleanupError:
+            if session.returncode != -signal.SIGTERM:
+                raise
+
 
 def fake_popen(mode):
     def launch(argv, **kwargs):
@@ -550,13 +1049,16 @@ def fake_popen(mode):
             return real_popen(
                 [sys.executable, "-c", "print('mcp-repl " + version + "')"], **kwargs,
             )
-        return real_popen([sys.executable, "-B", __file__, "fake", mode], **kwargs)
+        descriptors = [str(fd) for fd in kwargs.get("pass_fds", ())]
+        return real_popen([sys.executable, "-B", __file__, "fake", mode, *descriptors], **kwargs)
     return launch
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "fake":
-        fake_peer(sys.argv[2])
+        fake_peer(*sys.argv[2:])
+    elif sys.argv[1] == "host-low-fd":
+        exercise_low_fds(*sys.argv[2:])
     else:
         REPL, FIXTURE = sys.argv[1:3]
         unittest.main(argv=[sys.argv[0]], verbosity=2)
