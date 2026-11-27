@@ -684,7 +684,9 @@ impl<T: ClientTransport> TracingTransport<T> {
 #[async_trait]
 impl<T: ClientTransport> ClientTransport for TracingTransport<T> {
     async fn send(&mut self, message: &str) -> Result<()> {
-        if let Some(block) = self.wire.sent(message) {
+        if !crate::host_input::enabled()
+            && let Some(block) = self.wire.sent(message)
+        {
             eprintln!("{block}");
         }
         self.inner.send(message).await
@@ -692,7 +694,8 @@ impl<T: ClientTransport> ClientTransport for TracingTransport<T> {
 
     async fn recv(&mut self) -> Result<Option<String>> {
         let message = self.inner.recv().await?;
-        if let Some(raw) = &message
+        if !crate::host_input::enabled()
+            && let Some(raw) = &message
             && let Some(block) = self.wire.received(raw)
         {
             eprintln!("{block}");

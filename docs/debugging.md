@@ -7,6 +7,11 @@ When the question is "is it the client, the server, or the network?".
 
 ## Wire tracing
 
+Host input mode disables frame capture, tracing, and peer diagnostics to
+keep answer values and URLs out of terminal logs. Use the host's control
+frame types, IDs, and fixed response or withdrawal reasons to diagnose
+the exchange. [Host input protocol](scripting.md#host-mediated-input-on-unix)
+
 Half of any "is it the client, the server, or the network?" question is
 answered by the raw JSON-RPC frames. `--trace` prints every frame from the
 start; `wire on` / `wire off` toggles it mid-session.
