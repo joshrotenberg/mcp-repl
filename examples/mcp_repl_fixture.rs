@@ -39,6 +39,9 @@ struct AddInput {
 
 static LISTEN_SUBSCRIPTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// The sensitive form answer the host-input e2e case sends.
+const SEEDED_ANSWER: &str = "bridge-private-answer";
+
 fn fixture_router() -> McpRouter {
     let router = McpRouter::new()
         .server_info("mcp-repl-fixture", "1.0.0")
@@ -213,16 +216,16 @@ fn host_tools(router: McpRouter) -> McpRouter {
                 .description("Ask the client for a form answer")
                 .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
                     let answer = ctx.elicit_form(host_form()).await?;
-                    if let Some(ElicitFieldValue::String(secret)) = answer
-                        .content
-                        .as_ref()
-                        .and_then(|values| values.get("apiKey"))
-                    {
-                        // A peer can echo sensitive answers into either diagnostic channel.
-                        eprintln!("{secret}");
+                    // A peer can echo a sensitive answer into either diagnostic
+                    // channel. Echo the e2e case's seeded value when it arrives.
+                    if matches!(
+                        answer.content.as_ref().and_then(|values| values.get("apiKey")),
+                        Some(ElicitFieldValue::String(value)) if value == SEEDED_ANSWER
+                    ) {
+                        eprintln!("{SEEDED_ANSWER}");
                         ctx.send_log(LoggingMessageParams::new(
                             LogLevel::Info,
-                            serde_json::json!(secret),
+                            serde_json::json!(SEEDED_ANSWER),
                         ));
                     }
                     Ok(form_result(&answer))
@@ -354,7 +357,7 @@ fn action_name(action: ElicitAction) -> &'static str {
 fn form_result(answer: &ElicitResult) -> CallToolResult {
     if answer.action == ElicitAction::Accept
         && !matches!(answer.content.as_ref().and_then(|values| values.get("apiKey")),
-            Some(ElicitFieldValue::String(value)) if value == "bridge-private-answer")
+            Some(ElicitFieldValue::String(value)) if value == SEEDED_ANSWER)
     {
         return CallToolResult::error("fixture did not receive the expected form value");
     }
