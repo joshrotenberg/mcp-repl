@@ -4156,6 +4156,577 @@ async fn exercise_string_tool_arguments() {
     }
 }
 
+/// The file a `--max-output` summary names, found by listing the output
+/// directory rather than opening the printed path.
+fn saved_path(dir: &Path, summary: &serde_json::Value, label: &str) -> PathBuf {
+    let name = summary["path"]
+        .as_str()
+        .and_then(|path| Path::new(path).file_name())
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| panic!("{label}: summary names no saved file"));
+    std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.file_name() == Some(name.as_os_str()))
+        .unwrap_or_else(|| panic!("{label}: the saved file is not in the output directory"))
+}
+
+/// Read a result saved by `--max-output`, checking it is one JSON line.
+fn saved_result(dir: &Path, summary: &serde_json::Value, label: &str) -> serde_json::Value {
+    let path = saved_path(dir, summary, label);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{label}: {error}"));
+    assert!(
+        text.ends_with('\n') && text.matches('\n').count() == 1,
+        "{label}: the saved result is not exactly one line"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{label}: saved result mode");
+    }
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{label}: not JSON: {error}"))
+}
+
+/// The raw bytes of a result saved by `--max-output`.
+fn saved_bytes(dir: &Path, summary: &serde_json::Value, label: &str) -> Vec<u8> {
+    std::fs::read(saved_path(dir, summary, label))
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+}
+
+fn count_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |entries| entries.count())
+}
+
+/// [`run_stdio`] with extra environment for mcp-repl and its child.
+async fn run_stdio_with_env(
+    fixture: &Path,
+    temp: &TempDir,
+    case: &str,
+    repl_args: &[&str],
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Output {
+    let exit_file = temp.path().join(format!("{case}.exit"));
+    let mut command = repl_command();
+    command
+        .args(repl_args)
+        .arg(fixture)
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = run(command, case, CASE_TIMEOUT).await;
+    assert_eq!(
+        wait_for_file(&exit_file, "stdio fixture shutdown").await,
+        "clean",
+        "mcp-repl left its stdio child running"
+    );
+    output
+}
+
+/// Progressive discovery and `--max-output`: a search and a schema-free list
+/// stay small, and an oversized tool result becomes a versioned summary that
+/// names an owner-only file holding the complete result.
+async fn exercise_bounded_output(fixture: &Path, temp: &TempDir) {
+    let discovery = run_stdio(
+        fixture,
+        temp,
+        "bounded-discovery",
+        &[
+            "--json",
+            "-e",
+            "find -m 2 --tools bulk",
+            "-e",
+            "tools --brief",
+            "-e",
+            "tools",
+            "-e",
+            "describe bulk",
+        ],
+    )
+    .await;
+    assert_success(&discovery, "bounded discovery");
+    let lines: Vec<&str> = std::str::from_utf8(&discovery.stdout)
+        .unwrap()
+        .lines()
+        .collect();
+    let values = json_lines(&discovery, "bounded discovery");
+    assert_eq!(values.len(), 4);
+    let found = values[0].as_array().unwrap();
+    assert!(!found.is_empty() && found.len() <= 2, "{found:?}");
+    assert_eq!(found[0]["name"], "bulk");
+    assert!(found[0].get("inputSchema").is_none());
+    let brief = values[1].as_array().unwrap();
+    assert_eq!(brief.len(), values[2].as_array().unwrap().len());
+    assert!(brief.iter().all(|tool| tool.get("inputSchema").is_none()));
+    assert!(brief.iter().any(|tool| tool["name"] == "bulk"));
+    assert!(lines[1].len() < lines[2].len(), "--brief must be smaller");
+    assert!(values[3]["definition"]["inputSchema"]["properties"]["kind"].is_object());
+
+    let dir = temp.path().join("bounded-output");
+    let dir_arg = dir.to_str().unwrap();
+    let small = [
+        "-e",
+        "bulk kind=text bytes=40",
+        "-e",
+        "bulk kind=empty",
+        "-e",
+        "add a=1 b=2",
+    ];
+    let unbounded = run_stdio(
+        fixture,
+        temp,
+        "bounded-unset",
+        &[&["--json"][..], &small].concat(),
+    )
+    .await;
+    let roomy = run_stdio(
+        fixture,
+        temp,
+        "bounded-roomy",
+        &[
+            &["--json", "--max-output", "100000", "--output-dir", dir_arg][..],
+            &small,
+        ]
+        .concat(),
+    )
+    .await;
+    assert_success(&roomy, "results within budget");
+    assert_eq!(
+        unbounded.stdout, roomy.stdout,
+        "results within budget are printed unchanged"
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing saved");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a created --output-dir is owner-only");
+    }
+
+    let kinds = run_stdio(
+        fixture,
+        temp,
+        "bounded-kinds",
+        &[
+            "--json",
+            "--max-output",
+            "1024",
+            "--output-dir",
+            dir_arg,
+            "-e",
+            "bulk kind=text bytes=20000",
+            "-e",
+            "bulk kind=structured bytes=20000",
+            "-e",
+            "bulk kind=media bytes=20000",
+            "-e",
+            "bulk kind=empty",
+            "-e",
+            "bulk kind=error bytes=20000",
+            "-e",
+            "r = bulk kind=text bytes=20000",
+            "-e",
+            "vars",
+            "-e",
+            "bulk kind=structured bytes=20000 | items",
+            "-e",
+            "add a=20 b=22",
+        ],
+    )
+    .await;
+    // The tool error sets the status; every later command still ran.
+    assert_status(&kinds, 3, "oversized results");
+    let stdout = String::from_utf8_lossy(&kinds.stdout);
+    let values = json_lines(&kinds, "oversized results");
+    assert_eq!(values.len(), 9, "one value per command: {stdout}");
+    assert!(!stdout.contains("AAAAAAAA"), "base64 never reaches stdout");
+    for (index, line) in stdout.lines().enumerate() {
+        if values[index].get("mcpRepl").is_some() {
+            assert_eq!(values[index]["mcpRepl"], "truncated/v1");
+            assert!(line.len() <= 1024, "summary over budget: {line}");
+        }
+    }
+
+    let text = &values[0];
+    assert_eq!(text["tool"], "bulk");
+    assert_eq!(text["isError"], false);
+    assert_eq!(text["maxOutput"], 1024);
+    assert_eq!(text["saveError"], serde_json::Value::Null);
+    assert_eq!(text["content"][0]["textBytes"], 20000);
+    let saved = saved_result(&dir, text, "text");
+    assert_eq!(text["bytes"], saved.to_string().len());
+    let full = saved["content"][0]["text"].as_str().unwrap();
+    assert_eq!(full.len(), 20000);
+    let preview = text["content"][0]["preview"].as_str().unwrap();
+    assert!(!preview.is_empty() && full.starts_with(preview));
+    assert_eq!(saved["_meta"]["fixture/extra"], "kept");
+
+    let structured = &values[1];
+    assert_eq!(structured["structuredContent"]["type"], "object");
+    assert_eq!(
+        structured["structuredContent"]["keys"],
+        serde_json::json!(["items", "total"])
+    );
+    let saved = saved_result(&dir, structured, "structured");
+    assert_eq!(
+        saved["structuredContent"]["items"]
+            .as_array()
+            .unwrap()
+            .len() as u64,
+        saved["structuredContent"]["total"].as_u64().unwrap()
+    );
+
+    let media = &values[2];
+    assert_eq!(
+        media["content"][1],
+        serde_json::json!({"type": "image", "mimeType": "image/png", "base64Chars": 20000})
+    );
+    assert_eq!(media["content"][2]["type"], "audio");
+    let saved = saved_result(&dir, media, "media");
+    assert_eq!(saved["content"][1]["data"].as_str().unwrap().len(), 20000);
+
+    assert_eq!(
+        values[3],
+        serde_json::json!({"content": [], "_meta": {"fixture/extra": "kept"}}),
+        "a small empty result passes through"
+    );
+
+    let error = &values[4];
+    assert_eq!(error["isError"], true, "a tool error stays an error");
+    assert_eq!(saved_result(&dir, error, "error")["isError"], true);
+
+    assert_eq!(values[5]["value"]["type"], "string");
+    assert_eq!(
+        values[6]["r"].as_str().map(str::len),
+        Some(20000),
+        "a captured variable keeps the whole value"
+    );
+    assert_eq!(values[7]["value"]["type"], "array");
+    assert!(saved_result(&dir, &values[7], "filtered").is_array());
+    assert_eq!(values[8]["content"][0]["text"], "42");
+
+    // Byte for byte, each saved file is what an unbounded run prints for
+    // the same command and selector, newline included.
+    let unbounded = run_stdio(
+        fixture,
+        temp,
+        "bounded-unbounded-bytes",
+        &[
+            "--json",
+            "-e",
+            "bulk kind=text bytes=20000",
+            "-e",
+            "bulk kind=media bytes=20000",
+            "-e",
+            "bulk kind=error bytes=20000",
+            "-e",
+            "bulk kind=structured bytes=20000 | items",
+        ],
+    )
+    .await;
+    assert_status(&unbounded, 3, "unbounded reference run");
+    let reference: Vec<&[u8]> = unbounded.stdout.split_inclusive(|b| *b == b'\n').collect();
+    assert_eq!(reference.len(), 4);
+    for (index, (summary, label)) in [
+        (&values[0], "text"),
+        (&values[2], "media"),
+        (&values[4], "error"),
+        (&values[7], "filtered"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            saved_bytes(&dir, summary, label),
+            reference[index],
+            "{label}: saved bytes differ from unbounded stdout"
+        );
+    }
+
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names.len(), 6, "{names:?}");
+    assert!(
+        names
+            .iter()
+            .all(|name| name.contains("-bulk-") && name.ends_with(".json"))
+    );
+
+    let empty = run_stdio(
+        fixture,
+        temp,
+        "bounded-empty",
+        &[
+            "--json",
+            "--max-output",
+            "1",
+            "--output-dir",
+            dir_arg,
+            "-e",
+            "bulk kind=empty",
+        ],
+    )
+    .await;
+    assert_success(&empty, "empty result over a tiny budget");
+    let summary = &json_lines(&empty, "empty result over a tiny budget")[0];
+    // Below the floor only the fixed fields are printed.
+    let mut keys: Vec<&str> = summary
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "bytes",
+            "isError",
+            "maxOutput",
+            "mcpRepl",
+            "path",
+            "saveError",
+            "tool"
+        ]
+    );
+    assert_eq!(
+        saved_result(&dir, summary, "empty")["content"],
+        serde_json::json!([])
+    );
+
+    let human = run_stdio(
+        fixture,
+        temp,
+        "bounded-human",
+        &[
+            "--color",
+            "never",
+            "--max-output",
+            "1024",
+            "--output-dir",
+            dir_arg,
+            "-e",
+            "bulk kind=text bytes=20000",
+            "-e",
+            "r = bulk kind=text bytes=20000",
+            "-e",
+            "e = bulk kind=error bytes=20000",
+        ],
+    )
+    .await;
+    assert_status(&human, 3, "human oversized results");
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.starts_with("result truncated: "), "{stdout}");
+    assert!(stdout.contains("0123456789 bulk é"), "{stdout}");
+    assert_eq!(stdout.matches("result truncated: ").count(), 3, "{stdout}");
+    // A human capture is bounded too, instead of printing the whole string.
+    assert!(stdout.contains("$r =\n"), "{stdout}");
+    assert!(stdout.len() < 4096, "{stdout}");
+    // The captured tool error is marked even though nothing else printed it.
+    assert_eq!(stdout.matches("[tool error]").count(), 1, "{stdout}");
+    assert!(stdout.contains("$e =\n[tool error]\n"), "{stdout}");
+
+    // Every dispatch path that reaches a tool call is bounded: `call`, an
+    // alias, and each iteration of `for`.
+    let routes = temp.path().join("bounded-routes");
+    let config = temp.path().join("bounded.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[servers.bounded]\ntransport = \"stdio\"\ncommand = [{}]\n\
+             [aliases]\nbig = \"bulk kind=text bytes=5000\"\n",
+            serde_json::to_string(&fixture.display().to_string()).unwrap()
+        ),
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let routed = run_stdio_with_env(
+        fixture,
+        temp,
+        "bounded-routes",
+        &[
+            "--json",
+            "--config",
+            config,
+            "--max-output",
+            "512",
+            "--output-dir",
+            routes.to_str().unwrap(),
+            "-e",
+            r#"call bulk {"kind":"text","bytes":5000}"#,
+            "-e",
+            "big",
+            "-e",
+            "xs = bulk kind=structured bytes=60 | items",
+            "-e",
+            "for $x in $xs: bulk kind=text bytes=5000",
+            "--",
+        ],
+        &[],
+    )
+    .await;
+    assert_success(&routed, "bounded dispatch routes");
+    let values = json_lines(&routed, "bounded dispatch routes");
+    let items = values[2].as_array().expect("the small list fits").len();
+    assert_eq!(items, 3);
+    let summaries = values
+        .iter()
+        .filter(|value| value["mcpRepl"] == "truncated/v1")
+        .count();
+    assert_eq!(summaries, 2 + items, "{values:?}");
+    assert_eq!(count_files(&routes), 2 + items);
+
+    // A tool property named `brief` reaches the tool through the generated
+    // parser rather than being taken for the list commands' flag.
+    let exit_file = temp.path().join("bounded-generated-brief.exit");
+    let mut command = repl_command();
+    command
+        .args([
+            "--json",
+            "--config",
+            config,
+            "--server",
+            "bounded",
+            "bulk",
+            "--kind",
+            "text",
+            "--bytes",
+            "10",
+            "--brief=true",
+        ])
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let brief = run(command, "generated tool property named brief", CASE_TIMEOUT).await;
+    assert_success(&brief, "generated tool property named brief");
+    assert_eq!(
+        json_lines(&brief, "generated tool property named brief")[0]["_meta"]["fixture/brief"],
+        true
+    );
+    assert_eq!(
+        wait_for_file(&exit_file, "generated brief shutdown").await,
+        "clean"
+    );
+
+    // A save failure, made deterministic by giving the lazily created default
+    // directory a temp root that does not exist.
+    let missing = temp.path().join("bounded-missing-temp");
+    let env: [(&str, &std::ffi::OsStr); 3] = [
+        ("TMPDIR", missing.as_os_str()),
+        ("TEMP", missing.as_os_str()),
+        ("TMP", missing.as_os_str()),
+    ];
+    for (case, command, status) in [
+        ("bounded-save-failure", "bulk kind=text bytes=5000", 2),
+        (
+            "bounded-save-failure-error",
+            "bulk kind=error bytes=5000",
+            3,
+        ),
+    ] {
+        let failed = run_stdio_with_env(
+            fixture,
+            temp,
+            case,
+            &["--json", "--max-output", "512", "-e", command],
+            &env,
+        )
+        .await;
+        assert_status(&failed, status, command);
+        let values = json_lines(&failed, command);
+        assert_eq!(values.len(), 1, "one summary: {values:?}");
+        assert_eq!(values[0]["mcpRepl"], "truncated/v1");
+        assert_eq!(values[0]["path"], serde_json::Value::Null);
+        assert!(values[0]["saveError"].is_string());
+        assert_eq!(values[0]["isError"], status == 3);
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert!(
+            stderr.contains("the full result could not be saved"),
+            "{stderr}"
+        );
+    }
+    assert!(!missing.exists());
+
+    // An explicit `wait` reports tasks, not a tool result, and stays
+    // unbounded.
+    let waits = temp.path().join("bounded-wait");
+    let waited = run_stdio(
+        fixture,
+        temp,
+        "bounded-wait",
+        &[
+            "--protocol",
+            "2026-07-28",
+            "--json",
+            "--max-output",
+            "10",
+            "--output-dir",
+            waits.to_str().unwrap(),
+            "-e",
+            "slow_add a=1 b=2 &",
+            "-e",
+            "builtin wait",
+        ],
+    )
+    .await;
+    assert_success(&waited, "bounded wait");
+    let values = json_lines(&waited, "bounded wait");
+    assert_eq!(values.len(), 2);
+    assert!(values.iter().all(|value| value.get("mcpRepl").is_none()));
+    assert_eq!(values[1][0]["status"], "completed");
+    assert_eq!(count_files(&waits), 0);
+
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "--max-output",
+        "60",
+        "--output-dir",
+        dir_arg,
+        "echo",
+        "--message=a message long enough to go over a sixty byte budget",
+    ]);
+    let generated = run(command, "bounded generated command", CASE_TIMEOUT).await;
+    assert_success(&generated, "bounded generated command");
+    let summary = &json_lines(&generated, "bounded generated command")[0];
+    assert_eq!(summary["tool"], "echo");
+    assert_eq!(
+        saved_result(&dir, summary, "generated")["content"][0]["text"],
+        "a message long enough to go over a sixty byte budget"
+    );
+
+    let not_a_dir = temp.path().join("bounded-not-a-dir");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let mut command = repl_command();
+    command.args(["--demo", "--json", "--max-output", "10", "--output-dir"]);
+    command.arg(&not_a_dir).args(["-e", "echo message=hi"]);
+    let refused = run(command, "unusable output dir", CASE_TIMEOUT).await;
+    assert_status(&refused, 2, "unusable output dir");
+    let values = json_lines(&refused, "unusable output dir");
+    assert_eq!(values.len(), 1);
+    assert!(
+        values[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a directory"),
+        "{values:?}"
+    );
+
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "--output-dir",
+        dir_arg,
+        "-e",
+        "echo message=hi",
+    ]);
+    let lone = run(command, "output dir without a budget", CASE_TIMEOUT).await;
+    assert_status(&lone, 2, "output dir without a budget");
+}
+
 /// A fixture log of tool calls, one raw name per line. Empty when nothing
 /// arrived.
 fn logged_tool_calls(log: &Path) -> Vec<String> {
@@ -4275,7 +4846,7 @@ fn assert_tool_policy_dispatch_matrix(output: &Output, label: &str, source: &str
 /// `help tools` and `help connect` under `--json` with no policy, byte for
 /// byte as they were before the tool policy existed.
 const UNRESTRICTED_HELP_JSON: &str = concat!(
-    r#"{"name":"tools","usage":"tools [--full]","description":"List the server's tools. Every tool is also a command: `<tool> [k=v...]`. A long list is trimmed to the window; `--full` prints all of it.","details":[],"examples":[]}"#,
+    r#"{"name":"tools","usage":"tools [--full] [--brief]","description":"List the server's tools. Every tool is also a command: `<tool> [k=v...]`. A long list is trimmed to the window; `--full` prints all of it. Under --json, `--brief` keeps only names, titles, and descriptions, without schemas.","details":[],"examples":[]}"#,
     "\n",
     r#"{"name":"connect","usage":"connect <url|profile|path.json:entry|command...|demo>","description":"Connect from a disconnected prompt or switch the live REPL to another server.","details":["The target may be an HTTP URL, a saved profile, a path.json:entry import, a stdio command, or demo. Bare connect lists saved and discovered candidates.","A candidate is initialized and its surface fetched before it replaces the current server. A failed switch leaves the old session usable. History and aliases survive; captured variables, task ids, and resource subscriptions are cleared after a successful switch."],"examples":["connect demo","connect https://example.com/mcp","connect -- ./my-server --stdio"]}"#,
     "\n",
@@ -4285,7 +4856,7 @@ const UNRESTRICTED_HELP_JSON: &str = concat!(
 /// before the tool policy existed.
 const UNRESTRICTED_FIXTURE_INFO: &str = "\
 connected: mcp-repl-fixture v1.0.0 (protocol 2025-11-25)
-11 tools, 1 prompt, 1 resource, 0 templates. Type `help`.
+12 tools, 1 prompt, 1 resource, 0 templates. Type `help`.
 note: builtin, tool, and wait are ambiguous without a qualifier; use `tool <name>` for the server tool or `builtin <name>` for the built-in
 capabilities: {
   \"tools\": {
@@ -4779,6 +5350,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         #[cfg(unix)]
         exercise_stdio_group_cancellation(&fixture, true).await;
         exercise_json_contract(&fixture, &temp).await;
+        exercise_bounded_output(&fixture, &temp).await;
         exercise_colliding_tool_names(&fixture, &temp).await;
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
         exercise_tools_only_server(&fixture, &temp).await;

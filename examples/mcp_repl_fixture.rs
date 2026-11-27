@@ -186,6 +186,37 @@ fn fixture_router() -> McpRouter {
                 })
                 .build(),
         )
+        // Deterministic results of a requested size, for `--max-output`.
+        .tool(
+            ToolBuilder::new("bulk")
+                .description("Return a deterministic result of about the requested size")
+                .input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["text", "structured", "media", "empty", "error"]
+                        },
+                        "bytes": {"type": "integer", "minimum": 0},
+                        // Shares a name with the list commands' `--brief`, so
+                        // a generated `bulk --brief` must reach the tool.
+                        "brief": {"type": "boolean"}
+                    },
+                    "required": ["kind"]
+                }))
+                .extractor_handler((), |_ctx: Context, RawArgs(args): RawArgs| async move {
+                    let kind = args["kind"].as_str().unwrap_or("text").to_string();
+                    let bytes = args["bytes"].as_u64().unwrap_or(0) as usize;
+                    let mut result = bulk_result(&kind, bytes);
+                    if args["brief"] == true
+                        && let Some(meta) = result.meta.as_mut()
+                    {
+                        meta["fixture/brief"] = serde_json::json!(true);
+                    }
+                    Ok(result)
+                })
+                .build(),
+        )
         .resource(
             ResourceBuilder::new("fixture://guide")
                 .name("Fixture Guide")
@@ -483,6 +514,76 @@ fn with_session_driver_tools(router: McpRouter) -> McpRouter {
                 })
                 .build(),
         )
+}
+
+/// Text of at most `bytes` UTF-8 bytes from a fixed pattern. The pattern has
+/// a two-byte character, so a preview cut on a byte boundary would show up.
+fn bulk_text(bytes: usize) -> String {
+    const LINE: &str = "0123456789 bulk é\n";
+    let mut text = String::with_capacity(bytes);
+    for c in LINE.chars().cycle() {
+        if text.len() + c.len_utf8() > bytes {
+            break;
+        }
+        text.push(c);
+    }
+    text
+}
+
+/// The `bulk` tool's result. Every kind carries an extra `_meta` key, so the
+/// saved file can be checked for metadata the REPL does not interpret.
+fn bulk_result(kind: &str, bytes: usize) -> CallToolResult {
+    use tower_mcp::protocol::Content;
+
+    let mut result = match kind {
+        "structured" => {
+            let mut items = Vec::new();
+            let mut size = 0;
+            while size < bytes {
+                let item = serde_json::json!({"id": items.len(), "label": "bulk item"});
+                size += item.to_string().len() + 1;
+                items.push(item);
+            }
+            let total = items.len();
+            CallToolResult {
+                content: vec![Content::text(format!("{total} items"))],
+                is_error: false,
+                structured_content: Some(serde_json::json!({"items": items, "total": total})),
+                meta: None,
+            }
+        }
+        "media" => CallToolResult {
+            content: vec![
+                Content::text("media result"),
+                Content::Image {
+                    // All zero bytes in base64: valid, and the same every run.
+                    data: "A".repeat(bytes / 4 * 4),
+                    mime_type: "image/png".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+                Content::Audio {
+                    data: "AAAA".to_string(),
+                    mime_type: "audio/wav".to_string(),
+                    annotations: None,
+                    meta: None,
+                },
+            ],
+            is_error: false,
+            structured_content: None,
+            meta: None,
+        },
+        "empty" => CallToolResult {
+            content: Vec::new(),
+            is_error: false,
+            structured_content: None,
+            meta: None,
+        },
+        "error" => CallToolResult::error(bulk_text(bytes)),
+        _ => CallToolResult::text(bulk_text(bytes)),
+    };
+    result.meta = Some(serde_json::json!({"fixture/extra": "kept"}));
+    result
 }
 
 fn protocol_support() -> ProtocolSupport {

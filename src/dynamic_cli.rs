@@ -230,6 +230,12 @@ fn builtin_command(
                     .help("Include tools the tool policy denies")
                     .hide(!policy_active)
                     .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("brief")
+                    .long("brief")
+                    .help("Under --json, only names, titles, and descriptions")
+                    .action(ArgAction::SetTrue),
             ),
         name if LIST_BUILTINS.contains(&name) => Command::new(name.to_string())
             .about(format!("List the server's {name}"))
@@ -237,6 +243,12 @@ fn builtin_command(
                 Arg::new("full")
                     .long("full")
                     .help("Print the complete listing")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("brief")
+                    .long("brief")
+                    .help("Under --json, only names, titles, and descriptions")
                     .action(ArgAction::SetTrue),
             ),
         "read" => Command::new("read")
@@ -344,6 +356,9 @@ fn builtin_invocation(
         name if LIST_BUILTINS.contains(&name) => {
             if matches.get_flag("full") {
                 words.push("--full".to_string());
+            }
+            if matches.get_flag("brief") {
+                words.push("--brief".to_string());
             }
             if name == "tools" && matches.get_flag("all") {
                 words.push("--all".to_string());
@@ -705,6 +720,14 @@ mod tests {
             assert!(parsed.words.contains(&"message=hello world".to_string()));
             assert!(parsed.words.contains(&"repeat=2".to_string()));
         }
+    }
+
+    #[test]
+    fn list_flags_translate_to_the_repl_vocabulary() {
+        let tools = parse(&[], &[], &["tools".into(), "--brief".into()]).unwrap();
+        assert_eq!(tools.parsed().words, ["tools", "--brief"]);
+        let full = parse(&[], &[], &["resources".into(), "--full".into()]).unwrap();
+        assert_eq!(full.parsed().words, ["resources", "--full"]);
     }
 
     #[test]

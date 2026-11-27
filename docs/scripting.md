@@ -357,6 +357,136 @@ name exists. Process statuses are stable:
 | 5 | authentication or authorization failure reported by the server or the transport |
 | 6 | the run was interrupted with Ctrl-C |
 
+## Progressive discovery: find, describe, call
+
+A driver with a limited budget, such as an agent's context window, does not
+need every schema on a server to make one call. Search first, read the one
+definition you chose, then call it:
+
+```bash
+mcp-repl --demo --json -e 'find -m 5 convert'   # ranked names and descriptions, no schemas
+mcp-repl --demo --json -e 'describe convert'    # the full definition of one tool
+mcp-repl --demo --json -e 'convert value=100 from=celsius to=fahrenheit'
+```
+
+`find` ranks before `-m` caps the results, so the best matches survive the cap.
+When a listing is needed, `tools --brief` (also `prompts`, `resources`,
+`templates`) returns only names, titles, and descriptions (URIs for resources
+and templates) under `--json` and in captures. `describe <name>` still returns
+the full definition. On the demo server:
+
+| Command | stdout bytes |
+| --- | ---: |
+| `tools` | 5345 |
+| `tools --brief` | 1028 |
+| `find -m 5 convert` | 101 |
+| `describe convert` | 779 |
+
+## Bounded tool output
+
+`--max-output BYTES` caps how much of a tool result is printed. The size is
+the byte length of the compact JSON line `--json` would print, without its
+newline, in every output mode. A result at or under the limit is printed
+unchanged. A larger one is written whole to a new file, and a summary object
+is printed in its place:
+
+```bash
+mcp-repl --demo --json --max-output 320 --output-dir results -e 'echo message="hello world " repeat=60'
+```
+
+```json
+{"mcpRepl":"truncated/v1","tool":"echo","isError":false,"bytes":818,"maxOutput":320,"path":"/work/results/0001-echo-ksv08x.json","saveError":null,"content":[{"type":"text","textBytes":779,"preview":"hello world  hello world  hello world  hello world  hello world  hello world  hel"}],"blocksOmitted":0}
+```
+
+Without the flag nothing changes. Every summary has these fixed fields:
+
+| Field | Meaning |
+| --- | --- |
+| `mcpRepl` | `"truncated/v1"`. Test for this key to tell a summary from a `CallToolResult`. |
+| `tool` | the tool that was called |
+| `isError` | the result's `isError`; a tool error stays an error |
+| `bytes` | size of the full result line |
+| `maxOutput` | the limit |
+| `path` | absolute path of the saved file, or `null` when it could not be written |
+| `saveError` | why the file could not be written, or `null` |
+
+Then, only while they fit within the limit, these optional fields, added in
+this order:
+
+| Field | Meaning |
+| --- | --- |
+| `content`, `blocksOmitted` | for a whole tool result: one descriptor per content block, in order, and how many blocks have no descriptor. A descriptor has `type`, plus `textBytes` for text, `mimeType` and `base64Chars` for images and audio, `uri` for resources and links. At most 32 blocks are described. |
+| `value` | instead of `content`, for a filtered or captured value: `type` and `bytes`, plus `keyCount` for objects or `length` for arrays |
+| `structuredContent`, `meta` | present when the result has them, described like `value` |
+| `keys` | inside an object's descriptor: up to 32 of its keys |
+| `preview` | inside a text descriptor or a string `value`: the start of the text |
+
+Descriptors stop at the first one that does not fit, so entry `i` always
+describes block `i`, and `keyCount` says how many keys there are when
+`keys` is shorter. A summary is never larger than the limit when the fixed
+fields fit in it. When they do not, the fixed fields alone are printed:
+that is the floor, and the only case where a summary exceeds the limit. The
+floor is the serialized size of the fixed fields for that result, mostly the
+path or the save error.
+
+JSON is never cut: structured content is described, and only text is
+previewed, ending on a character boundary. Base64 in a whole result's image,
+audio, or blob is never previewed. A filter that selects such a field, for
+example `<tool> | [1].data` when the second block is an image, produces a
+plain string, and its `value` preview shows the start of the base64 text.
+
+The saved file holds exactly the line that would have been printed, plus a
+newline, so reading it is the same as running without the flag. It keeps
+every content block, `structuredContent`, `isError`, and `_meta`. Fields the
+protocol types do not define are dropped before mcp-repl sees the result, as
+they are in default `--json` output.
+
+The limit applies only to foreground tool calls: a tool word, `tool <name>`,
+`call`, aliases and `for` bodies that expand to those, and generated
+commands. Built-ins, `read`, `prompt`, and `wait` are not limited. A filter
+or a capture needs a bare or `tool`-qualified tool name, as it does without
+the flag; `call` cannot be filtered or captured. With a path filter,
+`<tool> | items`, the selected value is measured and saved, and the summary
+describes it under `value`. With a capture, `r = <tool>`, the variable keeps
+the whole value and only what is printed is limited, in human mode too. In
+human mode the summary prints as a `result truncated:` line, a `[tool error]`
+marker when `isError` is true, and the previews.
+
+In one-shot mode (`-e` and generated commands) a tool error still exits 3,
+and a result that could not be saved raises the status to at least 2. An
+interactive session does not return these statuses when it ends.
+
+Files and permissions:
+
+- `--output-dir DIR` chooses the directory, created owner-only (0700) if
+  missing. These are usage errors (exit 2) before connecting: a symbolic link
+  (with or without a trailing `/`), a non-directory, a path that is not valid
+  UTF-8 (it could not be named in the JSON summary), a directory mcp-repl
+  cannot write to, and on unix a directory owned by another account or
+  writable by group or others. A directory readable by group or others is
+  accepted with a warning on stderr.
+- Without `--output-dir`, a new `mcp-repl-out-*` directory (0700) is created
+  in the system temp directory when the first result goes over the limit.
+- Files are named `<sequence>-<tool>-<random>.json`, with the tool name
+  reduced to letters, digits, `_`, and `-`. Each is created new; an existing
+  file or symlink at that name is never opened, and another name is tried.
+  On unix the file mode is set to 0600, and a created directory to 0700,
+  after creation, so the umask does not change them.
+- Owner-only modes are a unix guarantee. On Windows, saved files and
+  directories inherit the access control list of the directory they are
+  created in.
+- Threat model: the directory and its parent directories must not be
+  replaceable by another account. The ownership and permission checks cover
+  the output directory itself, not its parents, so choose a location under a
+  directory you control. mcp-repl does not defend against a process running
+  as the same user, which could replace the directory between the check and
+  a write.
+- When a file cannot be written, the summary still prints, with `path: null`
+  and `saveError`, and the error goes to stderr. The full result is never
+  printed in its place.
+- Saved results are server output, unredacted, and can include credentials.
+  mcp-repl never deletes them; remove the directory when you are done.
+
 ### Tool policy denials
 
 A tool call refused by `allow_tools`, `deny_tools`, `--allow-tool`, or

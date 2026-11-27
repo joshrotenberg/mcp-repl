@@ -52,6 +52,7 @@
 //! details so consumers do not accidentally depend on terminal behavior.
 
 mod alias;
+mod artifact;
 mod bearer_fd;
 mod bench;
 mod bind;
@@ -358,6 +359,32 @@ struct Args {
     /// with an explicit target.
     #[arg(long)]
     json: bool,
+
+    /// Cap a tool result's printed size at this many bytes, measured as the
+    /// compact JSON `--json` prints. A larger result is saved whole to a new
+    /// file (owner-only on unix), and a summary object naming the file
+    /// (`"mcpRepl":"truncated/v1"`) is printed in its place.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = clap::value_parser!(u64).range(1..),
+        hide_short_help = true
+    )]
+    max_output: Option<u64>,
+
+    /// Directory for results saved by --max-output, created owner-only if
+    /// missing. Defaults to a new private directory under the system temp
+    /// directory. On unix it must be owned by you and not writable by
+    /// others; owner-only modes are a unix guarantee, and on Windows files
+    /// inherit the directory's access control. Saved files are never deleted
+    /// by mcp-repl.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "max_output",
+        hide_short_help = true
+    )]
+    output_dir: Option<std::path::PathBuf>,
 
     /// In human one-shot mode, still print the startup banner and surface
     /// listing. JSON stdout is always machine-only.
@@ -856,27 +883,28 @@ pub(crate) const BUILTINS: Builtins = Builtins(&[
     Builtin {
         name: "tools",
         summary: "list tools",
-        usage: "tools [--full]",
+        usage: "tools [--full] [--brief]",
         detail: "List the server's tools. Every tool is also a command: `<tool> \
          [k=v...]`. A long list is trimmed to the window; `--full` prints \
-         all of it.",
+         all of it. Under --json, `--brief` keeps only names, titles, and \
+         descriptions, without schemas.",
     },
     Builtin {
         name: "prompts",
         summary: "list prompts",
-        usage: "prompts [--full]",
+        usage: "prompts [--full] [--brief]",
         detail: "List the server's prompts.",
     },
     Builtin {
         name: "resources",
         summary: "list resources",
-        usage: "resources [--full]",
+        usage: "resources [--full] [--brief]",
         detail: "List concrete resources. Parameterized ones are under `templates`.",
     },
     Builtin {
         name: "templates",
         summary: "list resource templates",
-        usage: "templates [--full]",
+        usage: "templates [--full] [--brief]",
         detail: "List resource templates: URIs with `{variable}` parts, completed \
          by the server.",
     },
@@ -5064,6 +5092,18 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     let schema_contracts =
         schema_contract::ContractSet::load(&args.schema_contracts, args.schema_mode)
             .unwrap_or_else(|error| exit_with_error(ExitStatus::Usage, &error));
+    if let Some(max) = args.max_output {
+        let max = usize::try_from(max).unwrap_or(usize::MAX);
+        match artifact::Budget::new(max, args.output_dir.as_deref()) {
+            Ok((budget, warning)) => {
+                if let Some(warning) = warning {
+                    eprintln!("warning: {warning}");
+                }
+                artifact::install(budget);
+            }
+            Err(error) => exit_with_error(ExitStatus::Usage, &error),
+        }
+    }
     let profile = if imported.is_none() {
         resolve_profile(&args, &profiles, bearer_from_fd.is_some())
     } else {
@@ -6784,6 +6824,11 @@ async fn handle_line(
                     _ => serde_json::to_value(s.templates()),
                 }
                 .unwrap_or_default();
+                let v = if rest.contains(&"--brief") {
+                    brief_listing(cmd, v)
+                } else {
+                    v
+                };
                 emit_value(v, &output, || unreachable!("plain output handled below"));
                 // The value stays a plain array; the explanation goes to
                 // stderr with the other diagnostics.
@@ -8785,16 +8830,26 @@ async fn run_tool(
                 note_error(ExitStatus::Server);
             }
             if output.is_plain() {
-                if json_output() {
-                    print_json(&serde_json::to_value(&result).unwrap_or_default());
-                } else {
-                    if result.is_error {
-                        println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+                // Serialized only when something reads it: `--json` prints
+                // it, and `--max-output` measures it.
+                let value = (json_output() || artifact::active().is_some())
+                    .then(|| serde_json::to_value(&result).unwrap_or_default());
+                let truncation = value.as_ref().and_then(|value| {
+                    over_budget(name, result.is_error, artifact::Shape::Result, value)
+                });
+                match (truncation, value) {
+                    // The summary carries `isError`, and its renderer marks it.
+                    (Some(truncation), _) => print_truncation(truncation),
+                    (None, Some(value)) if json_output() => print_json(&value),
+                    _ => {
+                        if result.is_error {
+                            println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+                        }
+                        render_content(&result.content);
                     }
-                    render_content(&result.content);
                 }
             } else {
-                emit_result(result_value(&result), output);
+                emit_routed(result_value(&result), output, Some((name, result.is_error)));
             }
         }
         Err(e) => report_mcp_error(&e),
@@ -8802,6 +8857,31 @@ async fn run_tool(
     if !json_output() {
         println!("{}", timing(started.elapsed()));
     }
+}
+
+/// `<list> --brief` as a value: each entry cut to what is needed to choose
+/// one, without schemas. `describe <name>` returns the full definition. The
+/// human listing is already this short, so there the flag changes nothing.
+fn brief_listing(cmd: &str, listing: serde_json::Value) -> serde_json::Value {
+    let keys: &[&str] = match cmd {
+        "resources" => &["uri", "name", "title", "description"],
+        "templates" => &["uriTemplate", "name", "title", "description"],
+        _ => &["name", "title", "description"],
+    };
+    let serde_json::Value::Array(entries) = listing else {
+        return listing;
+    };
+    entries
+        .into_iter()
+        .map(|entry| {
+            let kept: serde_json::Map<String, serde_json::Value> = keys
+                .iter()
+                .filter_map(|key| Some((key.to_string(), entry.get(*key)?.clone())))
+                .collect();
+            serde_json::Value::Object(kept)
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 /// Extract a tool result's data value for capture or filtering: the structured
@@ -8848,7 +8928,14 @@ fn emit_value(value: serde_json::Value, output: &vars::Output, human: impl FnOnc
 
 /// Apply a capture/filter [`vars::Output`] to a result value: select a path,
 /// bind it to a variable, or print it (bare scalar or pretty JSON).
-fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
+fn emit_result(value: serde_json::Value, output: &vars::Output) {
+    emit_routed(value, output, None);
+}
+
+/// [`emit_result`] for a tool result, which `--max-output` bounds. `tool` is
+/// the tool's name and whether its result was an error; built-ins pass
+/// `None` and are never bounded.
+fn emit_routed(mut value: serde_json::Value, output: &vars::Output, tool: Option<(&str, bool)>) {
     if let Some(path) = &output.filter {
         match vars::get_path(&value, path) {
             Ok(Some(selected)) => value = selected,
@@ -8862,21 +8949,138 @@ fn emit_result(mut value: serde_json::Value, output: &vars::Output) {
             }
         }
     }
+    // Only what is printed is bounded: a captured variable keeps the whole
+    // value, after any path selection. What is measured is always a selected
+    // or unwrapped value here, never a whole `CallToolResult`.
+    let truncation = || {
+        tool.and_then(|(name, is_error)| {
+            over_budget(name, is_error, artifact::Shape::Value, &value)
+        })
+    };
     if let Some(name) = &output.capture {
         vars::set(name, value.clone());
-        if json_output() {
-            print_json(&value);
-        } else {
-            println!(
-                "{} {}",
-                paint(Style::new().fg(Color::Cyan), &format!("${name} =")),
-                value_summary(&value)
-            );
+        let label = paint(Style::new().fg(Color::Cyan), &format!("${name} ="));
+        match truncation() {
+            Some(truncation) => {
+                if !json_output() {
+                    println!("{label}");
+                }
+                print_truncation(truncation);
+            }
+            None if json_output() => print_json(&value),
+            None => println!("{label} {}", value_summary(&value)),
         }
+    } else if let Some(truncation) = truncation() {
+        print_truncation(truncation);
     } else if json_output() {
         print_json(&value);
     } else {
         render_value(&value);
+    }
+}
+
+/// Measure a tool result against `--max-output`. `None` means print it as
+/// usual: no budget was set, or the result fits.
+fn over_budget(
+    tool: &str,
+    is_error: bool,
+    shape: artifact::Shape,
+    value: &serde_json::Value,
+) -> Option<artifact::Truncation> {
+    artifact::active()?.apply(tool, is_error, shape, value)
+}
+
+/// Print the summary that stands in for an over-budget tool result.
+///
+/// The summary is still the command's one value. A result that could not be
+/// saved says so in `saveError`, on stderr, and in the exit status, so it is
+/// never silently dropped.
+fn print_truncation(truncation: artifact::Truncation) {
+    if let Some(error) = &truncation.save_error {
+        note_error(ExitStatus::Usage);
+        eprintln!(
+            "{}: the full result could not be saved: {}",
+            style::error_prefix(),
+            sanitize(error)
+        );
+    }
+    if json_output() {
+        print_json(&truncation.summary);
+        return;
+    }
+    let summary = &truncation.summary;
+    if summary["isError"] == true {
+        println!("{}", tag(Style::new().fg(Color::Red), "tool error"));
+    }
+    let bytes = summary["bytes"].as_u64().unwrap_or(0);
+    let max = summary["maxOutput"].as_u64().unwrap_or(0);
+    let place = match summary["path"].as_str() {
+        Some(path) => format!("saved to {}", sanitize(path)),
+        None => "not saved".to_string(),
+    };
+    println!(
+        "{}",
+        paint(
+            Style::new().dimmed(),
+            &format!(
+                "result truncated: {} over the {max}-byte limit, {place}",
+                plural(usize::try_from(bytes).unwrap_or(usize::MAX), "byte")
+            )
+        )
+    );
+    // Either may be missing when the budget left room only for the fixed
+    // fields.
+    let entries = match (summary["content"].as_array(), summary.get("value")) {
+        (Some(blocks), _) => blocks.clone(),
+        (None, Some(value)) => vec![value.clone()],
+        (None, None) => Vec::new(),
+    };
+    for entry in &entries {
+        match entry["preview"].as_str() {
+            Some(preview) => println!("{}", sanitize(preview)),
+            None => println!("{}", tag(Style::new(), &sanitize(&summary_facts(entry)))),
+        }
+    }
+    let omitted = summary["blocksOmitted"].as_u64().unwrap_or(0);
+    if omitted > 0 {
+        println!(
+            "{}",
+            paint(
+                Style::new().dimmed(),
+                &format!("... {omitted} more content blocks")
+            )
+        );
+    }
+    for key in ["structuredContent", "meta"] {
+        if let Some(described) = summary.get(key) {
+            println!(
+                "{}",
+                tag(
+                    Style::new(),
+                    &sanitize(&format!("{key} {}", summary_facts(described)))
+                )
+            );
+        }
+    }
+}
+
+/// One summary entry as `type key=value ...`, for human output.
+fn summary_facts(entry: &serde_json::Value) -> String {
+    let kind = entry["type"].as_str().unwrap_or("content");
+    let facts: Vec<String> = entry
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| !matches!(key.as_str(), "type" | "preview" | "keys"))
+        .map(|(key, value)| match value.as_str() {
+            Some(text) => format!("{key}={text}"),
+            None => format!("{key}={value}"),
+        })
+        .collect();
+    if facts.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind} {}", facts.join(" "))
     }
 }
 
@@ -9141,6 +9345,54 @@ mod tests {
         let surface = surface.read().unwrap();
         assert_eq!(describe_value(&surface, "wait").unwrap()["kind"], "tool");
         assert_eq!(describe_value(&surface, "jobs").unwrap()["kind"], "builtin");
+    }
+
+    #[test]
+    fn brief_listing_drops_schemas() {
+        let tools = serde_json::json!([{
+            "name": "scan",
+            "title": "Scan",
+            "description": "Scan things",
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": true},
+        }, {"name": "bare", "inputSchema": {"type": "object"}}]);
+        assert_eq!(
+            brief_listing("tools", tools),
+            serde_json::json!([
+                {"name": "scan", "title": "Scan", "description": "Scan things"},
+                {"name": "bare"},
+            ])
+        );
+        let templates =
+            serde_json::json!([{"uriTemplate": "x://{id}", "name": "x", "mimeType": "text/plain"}]);
+        assert_eq!(
+            brief_listing("templates", templates),
+            serde_json::json!([{"uriTemplate": "x://{id}", "name": "x"}])
+        );
+    }
+
+    #[test]
+    fn max_output_flags_parse_and_require_each_other() {
+        let args = Args::try_parse_from([
+            "mcp-repl",
+            "--max-output",
+            "8192",
+            "--output-dir",
+            "results",
+            "--demo",
+        ])
+        .unwrap();
+        assert_eq!(args.max_output, Some(8192));
+        assert_eq!(
+            args.output_dir.as_deref(),
+            Some(std::path::Path::new("results"))
+        );
+        assert!(Args::try_parse_from(["mcp-repl", "--max-output", "0", "--demo"]).is_err());
+        assert!(Args::try_parse_from(["mcp-repl", "--max-output", "lots", "--demo"]).is_err());
+        assert!(
+            Args::try_parse_from(["mcp-repl", "--output-dir", "results", "--demo"]).is_err(),
+            "--output-dir alone would silently do nothing"
+        );
     }
 
     #[tokio::test]
