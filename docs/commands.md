@@ -121,6 +121,12 @@ cratesio> tools
 `--full` prints every row. Truncation is interactive-only: `--exec` and
 `--json` output is a data stream and is never trimmed.
 
+Under `--json` or in a capture, `tools --brief` (likewise `prompts`,
+`resources`, `templates`) keeps only each entry's name, title, and
+description, plus the URI or URI template for resources and templates, and
+drops schemas and annotations. `describe <name>` returns the full definition
+of the one you pick. See [progressive discovery](scripting.md#progressive-discovery-find-describe-call).
+
 Under a tool policy (see
 [Connecting](connecting.md#restricting-tool-calls)), `tools`, `find`, `help`,
 completion, and the startup overview leave out tools whose calls are refused,
@@ -368,9 +374,9 @@ cratesio> find -E '^get_.*downloads$'     # a regular expression
 Run `help find` for every spelling and combination. The important behavior is
 the ranking: exact name, prefix, substring, description, then subsequence, so
 a loose match never buries the literal one. Search uses the cached surface and
-sends no request. JSON returns `{kind, name, description, score}` objects; no
-matches set the no-match status. Tools the tool policy denies are not
-returned; a note on stderr counts them.
+sends no request. JSON returns `{kind, name, description, score}` objects,
+without schemas; no matches set the no-match status. Tools the tool policy
+denies are not returned; a note on stderr counts them.
 
 A mistyped command word gets the nearest built-in, tool, or prompt name by
 edit distance:

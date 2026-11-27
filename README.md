@@ -158,6 +158,12 @@ $ mcp-repl --demo --json -e 'convert value=100 from=celsius to=fahrenheit' \
 212.00
 ```
 
+For a driver with a limited context, such as an agent, `find -m 5 <word>` and
+`describe <name>` read one definition instead of every schema, and
+`--max-output BYTES` saves a large tool result to a file (owner-only on unix) and
+prints a short, versioned summary in its place. See
+[Scripting](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/scripting.md#bounded-tool-output).
+
 ### Generated one-shot CLI
 
 Generated commands are included in normal builds and installations. With an
