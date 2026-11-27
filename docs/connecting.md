@@ -567,9 +567,13 @@ The retry is bounded to a single attempt, so a server that is really down
 fails fast with its original error rather than hanging the prompt. Active
 resource subscriptions are replayed on the replacement session before the
 command is retried. If the replacement server rejects one URI, the REPL warns
-and removes only that stale entry from `subscriptions`. Task ids do not survive
-a reconnect (they belong to the session that created them), so `task`, `wait`,
-and `cancel` never trigger one.
+and removes only that stale entry from `subscriptions`.
+
+On final-protocol HTTP connections, `wait` can reconnect once per task. If the
+replacement also uses the final protocol, `wait` continues with the same task
+ID within the original per-task deadline. Stable task IDs are usually scoped
+to the session that created them. `task` and `cancel` use the current
+connection only.
 
 An HTTP 404 while initially connecting still means the endpoint path is wrong
 and is reported with path guidance, without a reconnect. If 404 arrives on a
