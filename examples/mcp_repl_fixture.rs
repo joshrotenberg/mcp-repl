@@ -10,6 +10,7 @@
 mod plugin_provider;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -19,6 +20,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, oneshot};
 use tower_mcp::{
     BidirectionalStdioTransport, CallToolResult, HttpTransport, McpRouter, PromptBuilder,
     ProtocolSupport, RequestContext, ResourceBuilder, StdioTransport, TaskSupportMode, ToolBuilder,
@@ -393,6 +396,124 @@ fn form_result(answer: &ElicitResult) -> CallToolResult {
         return CallToolResult::error("fixture did not receive the expected form value");
     }
     CallToolResult::text(format!("form {}", action_name(answer.action)))
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct WorkerInput {
+    text: String,
+    fail: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct WorkerHandle {
+    handle: String,
+}
+
+struct Worker {
+    handle: String,
+    pending: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<Value>)>,
+    terminal: Option<Value>,
+}
+
+fn with_session_driver_tools(router: McpRouter) -> McpRouter {
+    let worker = Arc::new(Mutex::new(None::<Worker>));
+    let start = worker.clone();
+    let wait = worker.clone();
+    router
+        .tool(
+            ToolBuilder::new("worker_start")
+                .handler(move |input: WorkerInput| {
+                    let start = start.clone();
+                    async move {
+                        let mut worker = start.lock().await;
+                        if worker.is_some() {
+                            return Ok(CallToolResult::error("worker already exists"));
+                        }
+                        let handle = format!("worker:{} | $owner", std::process::id());
+                        let (release, ready) = oneshot::channel();
+                        let job = tokio::spawn(async move {
+                            ready.await.expect("wait releases this fixture worker");
+                            if input.fail {
+                                json!({"state": "failed", "error": "fixture application failure"})
+                            } else {
+                                json!({"state": "completed", "text": input.text})
+                            }
+                        });
+                        *worker = Some(Worker {
+                            handle: handle.clone(),
+                            pending: Some((release, job)),
+                            terminal: None,
+                        });
+                        Ok(CallToolResult::json(
+                            json!({"handle": handle, "state": "working"}),
+                        ))
+                    }
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("worker_wait")
+                .handler(move |input: WorkerHandle| {
+                    let wait = wait.clone();
+                    async move {
+                        let mut worker = wait.lock().await;
+                        let Some(worker) = worker.as_mut().filter(|job| job.handle == input.handle)
+                        else {
+                            return Ok(CallToolResult::error("unknown worker in this process"));
+                        };
+                        if let Some((release, job)) = worker.pending.take() {
+                            release.send(()).expect("fixture worker is still waiting");
+                            worker.terminal = Some(job.await.expect("fixture worker settled"));
+                        }
+                        Ok(CallToolResult::json(worker.terminal.clone().unwrap()))
+                    }
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("worker_read")
+                .handler(move |input: WorkerHandle| {
+                    let worker = worker.clone();
+                    async move {
+                        let worker = worker.lock().await;
+                        let terminal = worker
+                            .as_ref()
+                            .filter(|job| job.handle == input.handle)
+                            .and_then(|job| job.terminal.as_ref())
+                            .filter(|result| result["state"] == "completed");
+                        match terminal {
+                            Some(result) => Ok(CallToolResult::json(result.clone())),
+                            None => Ok(CallToolResult::error("no settled result for this worker")),
+                        }
+                    }
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("worker_disconnect")
+                .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                    increment_marker("MCP_REPL_FIXTURE_DRIVER_MUTATIONS_FILE");
+                    std::process::exit(23)
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("worker_stall")
+                .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                    write_marker("MCP_REPL_FIXTURE_DRIVER_STALL_FILE", b"started");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Ok(CallToolResult::text("late fixture result"))
+                })
+                .build(),
+        )
+        .tool(
+            ToolBuilder::new("task_pending")
+                .task_support(TaskSupportMode::Required)
+                .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                    std::future::pending::<Result<CallToolResult, tower_mcp::Error>>().await
+                })
+                .build(),
+        )
 }
 
 /// Text of at most `bytes` UTF-8 bytes from a fixed pattern. The pattern has
@@ -916,6 +1037,11 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         }
     }
     eprintln!("mcp-repl fixture ready");
+    increment_marker("MCP_REPL_FIXTURE_DRIVER_SPAWNS_FILE");
+    write_marker(
+        "MCP_REPL_FIXTURE_DRIVER_PID_FILE",
+        std::process::id().to_string(),
+    );
     init_trace_file();
     // Not a router: this mode speaks JSON-RPC by hand so it can reject the
     // methods it never advertised, the way a server from another SDK does.
@@ -930,7 +1056,10 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         write_marker("MCP_REPL_FIXTURE_EXIT_FILE", b"clean");
         return Ok(());
     }
-    let router = fixture_router();
+    let mut router = fixture_router();
+    if std::env::args().any(|arg| arg == "--session-driver") {
+        router = with_session_driver_tools(router);
+    }
     if std::env::args().any(|arg| arg == "--http") {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/", listener.local_addr()?);

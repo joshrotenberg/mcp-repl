@@ -21,6 +21,8 @@ jobs:
     name: Quality
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    env:
+      MCP_REPL_REQUIRE_PYTHON: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -53,6 +55,8 @@ jobs:
     name: Test (${{ matrix.os }})
     if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
+    env:
+      MCP_REPL_REQUIRE_PYTHON: "1"
     strategy:
       fail-fast: false
       matrix:

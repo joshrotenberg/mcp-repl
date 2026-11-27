@@ -102,6 +102,81 @@ default to decline on both command paths.
 The previous `unstable-dynamic-cli` Cargo feature is a compatibility alias;
 all builds, including `--no-default-features`, now include generated commands.
 
+## Result-dependent stdio workflows
+
+The [session driver](../src/plugin_assets/skills/mcp-repl/scripts/session_driver.py)
+ships with the mcp-repl plugin skill. Use a binary that supports piped JSON
+startup for the session driver. The installed helper checks for at least
+the mcp-repl version that bundled it. The source helper checks startup
+framing directly. CI uses the runners' default Python 3, and the helper
+avoids features newer than Python 3.8. Put the skill's
+`scripts` directory on Python's import path. Pass an explicit server argv to
+`Session` and use it as a context manager. The driver starts one REPL and
+keeps its stdio connection open for subsequent calls. Fixed `-e` batches
+continue after errors, so inspect each reply in Python when the next action
+depends on it.
+
+This example uses the repository's `mcp_repl_fixture` example binary built
+with `cargo build --example mcp_repl_fixture`. Set `fixture_path` to the path
+to that executable.
+
+```python
+from session_driver import Session
+
+with Session([fixture_path, "--session-driver"]) as session:
+    names = {tool["name"] for tool in session.discover().value}
+    if not {"worker_start", "worker_wait", "worker_read"} <= names:
+        raise RuntimeError("worker operations are unavailable")
+
+    started = session.call("worker_start", {"text": "hello", "fail": False})
+    worker = started.value["structuredContent"]
+    if worker["state"] != "working" or not isinstance(worker["handle"], str):
+        raise RuntimeError("worker did not start")
+    owned = {"handle": worker["handle"]}
+    terminal = session.call("worker_wait", owned).value["structuredContent"]
+    if terminal["state"] != "completed":
+        raise RuntimeError(terminal)
+    result = session.call("worker_read", owned).value["structuredContent"]
+    if result != {"state": "completed", "text": "hello"}:
+        raise RuntimeError(result)
+```
+
+Each reply has a local `request_id` and a protocol `value`. The driver checks
+client error envelopes and MCP `isError`; validate application fields against
+the server's contract. For MCP tasks, select the server's supported protocol
+and use `start_task(name, args)` followed by `wait_task(ref, timeout=30)`.
+The driver tracks one MCP task at a time on that connection.
+The wait must return a successful terminal tool result. If the REPL's wait
+deadline expires, `TaskPending` leaves the task and connection usable. Wait
+again or call `cancel_task(ref)` and inspect the returned task state. A
+nonterminal response leaves the task available to wait on. If you can no
+longer track a task, `abandon_task(ref)` releases the local reference.
+Abandoning leaves server work alone.
+An application worker handle goes to the server's documented lifecycle calls.
+Use `read(uri)` for an MCP resource. The helper rejects dollar signs in
+standalone URIs because the REPL expands variables in those tokens. Pass
+dollar signs in tool arguments as ordinary JSON string data.
+
+On Windows, point the driver at an executable. Batch launchers such as
+`npx.cmd`, and other `.cmd` or `.bat` files, are rejected to avoid shell
+evaluation.
+
+The driver has bounded startup, request, wait, and shutdown deadlines. It
+allows two extra seconds for the REPL to report a request or wait timeout.
+On session loss or interruption it invalidates the connection and never
+replays a request. `SessionLost.sent` means the command was queued for
+writing, so its outcome may be uncertain. Before a healthy close, use
+documented cleanup operations only for work you own. `close()`
+shuts down the owned connection. After a failed operation,
+`stderr_tail` contains bounded diagnostics and
+`cleanup_error` reports unconfirmed process cleanup.
+
+The driver targets mcp-repl when interrupting a command, with SIGINT on
+POSIX or Ctrl-Break when a Windows console is available. Forced POSIX
+shutdown kills the owned process group. A forced Windows kill reaches only
+mcp-repl. The server may keep running until it handles EOF or exits on
+its own.
+
 ## Host-mediated input on Unix
 
 A host can answer elicitation and sampling while an MCP operation is still
@@ -233,19 +308,20 @@ the task, not the work. What failed is in the result, which is why the exit
 status is the reliable thing for a script to check.
 
 In human `--exec` mode the banner and surface listing are suppressed by
-default; pass `--verbose` to keep them. Under `--json`, stdout is always a
-machine-only [NDJSON](https://github.com/ndjson/ndjson-spec) stream: every
-executed command emits exactly one compact, independently parseable value on
-one line. `--verbose` never adds a banner there. Timings, tracing, progress,
-notifications, reconnect notices, spawned-child diagnostics, warnings, and
-the banner, tool policy, and surface summary that a `connect` prints go to
-stderr.
+default; pass `--verbose` to keep them. With `--json` in one-shot mode or on
+piped stdin, startup stays quiet even under `--verbose`. Results are compact
+[NDJSON](https://github.com/ndjson/ndjson-spec) values. The driver uses
+commands that return one value each. General REPL commands can emit several
+values, for example `for` emits results for each item. Timings, tracing,
+progress, notifications, reconnect notices, spawned-child diagnostics,
+warnings, and the banner, tool policy, and surface summary that a `connect`
+prints go to stderr.
 
-`connect` is the one exception to one value per command: under `--json` a
-successful `connect` reports its banner, tool policy, and surface summary on
-stderr and emits no value on stdout. A failed `connect` emits the usual error
-envelope on stdout. This applies with or without a tool policy. Earlier
-releases printed the human banner on stdout here, which broke NDJSON parsing.
+Under `--json` a successful `connect` reports its banner, tool policy, and
+surface summary on stderr and emits no value on stdout. A failed `connect`
+emits the usual error envelope on stdout. This applies with or without a tool
+policy. Earlier releases printed the human banner on stdout here, which broke
+NDJSON parsing.
 
 Successful protocol operations preserve their MCP result shape: foreground
 tool calls return `CallToolResult`, `read` returns `ReadResourceResult`,
