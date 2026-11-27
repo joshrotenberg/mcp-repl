@@ -22,7 +22,7 @@ fn form() -> Question {
     }
 }
 
-fn frame(rx: &mut mpsc::Receiver<Outgoing>) -> Value {
+pub(super) fn frame(rx: &mut mpsc::Receiver<Outgoing>) -> Value {
     let Outgoing::Frame(bytes) = rx.try_recv().expect("queued frame") else {
         panic!("expected frame");
     };
@@ -30,7 +30,7 @@ fn frame(rx: &mut mpsc::Receiver<Outgoing>) -> Value {
     serde_json::from_slice(&bytes).expect("valid frame")
 }
 
-fn response(host: &Host, session: &str, id: u64, payload: Value) {
+pub(super) fn response(host: &Host, session: &str, id: u64, payload: Value) {
     let mut value = json!({
         "v": VERSION, "type": "response", "session": session, "id": id.to_string()
     });

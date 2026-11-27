@@ -70,6 +70,8 @@ pub struct Jobs {
     state: Mutex<State>,
     output: AsyncOutput,
     announce: bool,
+    /// Whether a status message carried by a notification is recorded.
+    notified_messages: bool,
 }
 
 impl Jobs {
@@ -78,7 +80,16 @@ impl Jobs {
             state: Mutex::new(State::default()),
             output,
             announce,
+            notified_messages: true,
         }
+    }
+
+    /// Drop status messages that arrive in notifications. With
+    /// `--host-input-fd`, a server can repeat a submitted answer there, and
+    /// only the bridge's redacting reader may supply task text.
+    pub fn without_notified_messages(mut self) -> Self {
+        self.notified_messages = false;
+        self
     }
 
     /// Record a task returned by a background tool call. If its notification
@@ -247,6 +258,7 @@ impl Jobs {
     }
 
     fn observe(&self, task_id: String, status: TaskStatus, status_message: Option<String>) {
+        let status_message = status_message.filter(|_| self.notified_messages);
         let transition = {
             let mut state = self.state.lock().unwrap();
             if let Some(transition) =
