@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use nu_ansi_term::{Color, Style};
 use serde::{Deserialize, Serialize};
 
+use crate::elicit::run_terminal_prompt;
 use crate::secure_file;
 use crate::style::{paint, tag};
 use crate::untrusted::sanitize;
@@ -201,7 +202,7 @@ pub enum Decision {
 /// recording. `interactive` is false under `--exec`/`--json` and when stdin
 /// is not a terminal, where there is nobody to ask: rather than blocking on
 /// a read that will never return, the run stops with the flag to pass.
-pub fn authorize(
+pub async fn authorize(
     plan: &ImportPlan,
     config_path: Option<&Path>,
     trusted: bool,
@@ -236,14 +237,20 @@ pub fn authorize(
             plan.source, plan.entry
         ));
     }
-    describe(plan);
-    match confirm() {
-        false => Decision::Refused(format!(
+    let prompt_plan = plan.clone();
+    let confirmed = run_terminal_prompt(move || {
+        describe(&prompt_plan);
+        confirm()
+    })
+    .await;
+    match confirmed {
+        Err(error) => Decision::Refused(format!("could not prompt for import approval: {error}")),
+        Ok(false) => Decision::Refused(format!(
             "not using {}:{}",
             plan.source,
             sanitize(&plan.entry)
         )),
-        true => {
+        Ok(true) => {
             match store {
                 Some(path) => {
                     if let Err(e) = remember(&path, plan) {
@@ -458,17 +465,17 @@ mod tests {
         assert!(!is_approved(None, &plan(&["server"])));
     }
 
-    #[test]
-    fn trust_import_skips_the_check_entirely() {
+    #[tokio::test]
+    async fn trust_import_skips_the_check_entirely() {
         assert!(matches!(
-            authorize(&plan(&["server"]), None, true, false),
+            authorize(&plan(&["server"]), None, true, false).await,
             Decision::Approved
         ));
     }
 
-    #[test]
-    fn a_non_interactive_session_refuses_with_guidance() {
-        match authorize(&plan(&["server"]), None, false, false) {
+    #[tokio::test]
+    async fn a_non_interactive_session_refuses_with_guidance() {
+        match authorize(&plan(&["server"]), None, false, false).await {
             Decision::Refused(message) => {
                 assert!(message.contains("--trust-import"));
                 assert!(message.contains("local"));

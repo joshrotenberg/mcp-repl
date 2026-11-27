@@ -47,6 +47,13 @@ impl ExitStatus {
             return Self::Transport;
         }
         match error {
+            // Refused locally by the tool policy before anything was sent:
+            // the command was invalid here, not rejected by the server, and
+            // not a credential problem that a new login would fix.
+            Error::ToolCallDenied { .. } => Self::Usage,
+            // A reset invalidated a pending policy decision; nothing was
+            // sent, and the connection is what changed.
+            Error::ToolCallContextChanged => Self::Transport,
             Error::Transport(message) if looks_like_auth_failure(message) => Self::Auth,
             Error::Transport(_) | Error::SessionExpired | Error::SseEventTooLarge { .. } => {
                 Self::Transport
@@ -141,6 +148,25 @@ mod tests {
         assert_eq!(
             ExitStatus::from_mcp_error(&Error::invalid_params("bad input")),
             ExitStatus::Server
+        );
+    }
+
+    /// A policy denial never reached the server, so it must not read as a
+    /// server rejection (3) or a credential failure (5).
+    #[test]
+    fn a_tool_policy_denial_is_a_local_usage_failure() {
+        assert_eq!(
+            ExitStatus::from_mcp_error(&Error::ToolCallDenied {
+                name: "purge".into(),
+                // Even a reason mentioning authorization is not an auth
+                // failure.
+                reason: "authorization: in the deny list (profile work)".into(),
+            }),
+            ExitStatus::Usage
+        );
+        assert_eq!(
+            ExitStatus::from_mcp_error(&Error::ToolCallContextChanged),
+            ExitStatus::Transport
         );
     }
 }

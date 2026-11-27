@@ -36,7 +36,7 @@ mcp-repl-demo> find note                   # keyword search across the surface
 mcp-repl-demo> describe convert            # input/output schemas, colored
 mcp-repl-demo> read note://ideas           # a resource template, completed by the server
 mcp-repl-demo> prompt greet name=<Tab>     # prompt args complete via completion/complete
-mcp-repl-demo> info                        # identity, instructions, counts, capabilities
+mcp-repl-demo> info                        # identity, instructions, counts, capabilities, tool policy
 ```
 
 The demo runs the server in this process over an in-memory pipe rather than
@@ -126,6 +126,22 @@ Under `--json` or in a capture, `tools --brief` (likewise `prompts`,
 description, plus the URI or URI template for resources and templates, and
 drops schemas and annotations. `describe <name>` returns the full definition
 of the one you pick. See [progressive discovery](scripting.md#progressive-discovery-find-describe-call).
+
+Under a tool policy (see
+[Connecting](connecting.md#restricting-tool-calls)), `tools`, `find`, `help`,
+completion, and the startup overview leave out tools whose calls are refused,
+and say so:
+
+```text
+work> tools
+search                   Search issues
+get_issue                Fetch one issue
+1 tool hidden: calls are denied by tool policy; `tools --all` lists them
+```
+
+Hiding is presentation only. Typing a hidden tool's name, in any spelling,
+still reaches the policy and gets the refusal, never a "no such tool" error.
+`tools --all` lists every tool.
 
 `history` lists recent commands from previous sessions, and Ctrl-R searches
 them. On Unix, history lives at `$XDG_STATE_HOME/mcp-repl/history` (falling
@@ -359,7 +375,8 @@ Run `help find` for every spelling and combination. The important behavior is
 the ranking: exact name, prefix, substring, description, then subsequence, so
 a loose match never buries the literal one. Search uses the cached surface and
 sends no request. JSON returns `{kind, name, description, score}` objects,
-without schemas; no matches set the no-match status.
+without schemas; no matches set the no-match status. Tools the tool policy
+denies are not returned; a note on stderr counts them.
 
 A mistyped command word gets the nearest built-in, tool, or prompt name by
 edit distance:
@@ -381,7 +398,9 @@ makes `describe wait` show a colliding server tool while `help wait` remains
 the built-in-only view:
 
 - Tools: behavior hints, task support, the input/output schemas as
-  syntax-colored JSON, and an `example:` line showing what to type.
+  syntax-colored JSON, and an `example:` line showing what to type. A tool
+  the tool policy denies is still described, with a line saying that calls to
+  it are refused and not sent.
 - Prompts: the argument table (name, required/optional, description).
 - Resources and templates: URI, name, MIME type, size, and description.
 

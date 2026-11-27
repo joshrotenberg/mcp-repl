@@ -257,6 +257,13 @@ typed exit statuses so a failure is distinguishable from an empty result.
 
 ![two JSON invocations piped through jq, followed by a schema violation exiting with status 3](https://raw.githubusercontent.com/joshrotenberg/mcp-repl/main/docs/media/scripting.png)
 
+**A bounded tool set.** A profile's `allow_tools` and `deny_tools`, or
+`--allow-tool` and `--deny-tool` for one invocation, restrict which tools can
+be called, by exact raw name. A refused call is never sent, whichever way it
+was spelled; a one-shot run reports it with status 2. This is a client-side
+control, not a sandbox; see
+[restricting tool calls](https://github.com/joshrotenberg/mcp-repl/blob/main/docs/connecting.md#restricting-tool-calls).
+
 ## Bundled agent skills
 
 mcp-repl embeds a skills-only plugin for Claude Code and Codex. It teaches an
