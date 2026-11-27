@@ -1,11 +1,11 @@
 //! Black-box coverage for the published `mcp-repl` process boundary.
 
-use std::io::{Read, Seek};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::io::Write;
@@ -642,12 +642,16 @@ async fn run_http(url: &str, case: &str, repl_args: &[&str]) -> Output {
 /// timeline next to the fixture trace. Use it only where the case asserts
 /// what stderr contains, not that it is empty or exact.
 async fn run_http_traced(url: &str, case: &str, repl_args: &[&str]) -> Output {
+    run(traced_http_repl_command(url, repl_args), case, CASE_TIMEOUT).await
+}
+
+fn traced_http_repl_command(url: &str, repl_args: &[&str]) -> Command {
     let mut command = repl_command();
     command
         .args(repl_args)
         .args(["--http", url])
         .env("RUST_LOG", "tower_mcp=debug,mcp_repl=debug");
-    run(command, case, CASE_TIMEOUT).await
+    command
 }
 
 async fn auth_failure_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -2681,43 +2685,132 @@ fn traced_request_id(trace: &str, method: &str) -> u64 {
         .unwrap_or_else(|| panic!("unparsable {method} request id in:\n{trace}"))
 }
 
+struct InteractiveTaskDiagnostics {
+    started: Instant,
+    timeline: Vec<String>,
+    subscription_marker_seen: bool,
+    stderr: tempfile::NamedTempFile,
+}
+
+impl InteractiveTaskDiagnostics {
+    fn record(&mut self, event: impl std::fmt::Display) {
+        self.timeline
+            .push(format!("+{:?} {event}", self.started.elapsed()));
+    }
+
+    async fn write_command(&mut self, stdin: &mut tokio::process::ChildStdin, line: &str) {
+        self.record(format_args!("writing {line:?}"));
+        stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap_or_else(|error| panic!("write {line:?}: {error}"));
+        self.record(format_args!("wrote {line:?}"));
+    }
+
+    fn report_stderr(&self) -> std::io::Result<()> {
+        const TAIL_BYTES: u64 = 64 * 1024;
+        let mut stderr = BufReader::new(std::fs::File::open(self.stderr.path())?);
+        // Scan the full snapshot for counts even when only its tail will fit
+        // in the failure output. The child may still be writing to the file.
+        let length = stderr.get_ref().metadata()?.len();
+        let mut snapshot = stderr.by_ref().take(length);
+        let mut piped_acks = 0;
+        let mut subscription_ack_seen = false;
+        let mut watcher_polls = 0;
+        let mut task_gets = 0;
+        let mut outgoing_frame = false;
+        let mut line = Vec::new();
+        while snapshot.read_until(b'\n', &mut line)? != 0 {
+            let entry = String::from_utf8_lossy(&line);
+            piped_acks += usize::from(entry.contains("piped command acknowledged"));
+            subscription_ack_seen |= entry.contains("task subscription acknowledged");
+            watcher_polls += usize::from(entry.contains("polling background task status"));
+            // `--color never` leaves the wire tags and the top-level JSON
+            // method readable. Ignore methods in incoming frames or payloads.
+            match entry.trim_end() {
+                header if header.starts_with("[wire ->] ") => outgoing_frame = true,
+                header if header.starts_with("[wire <-] ") => outgoing_frame = false,
+                "}" => outgoing_frame = false,
+                "  \"method\": \"tasks/get\"," | "  \"method\": \"tasks/get\""
+                    if outgoing_frame =>
+                {
+                    task_gets += 1;
+                }
+                _ => {}
+            }
+            line.clear();
+        }
+
+        let tail_start = length.saturating_sub(TAIL_BYTES);
+        stderr.seek(SeekFrom::Start(tail_start))?;
+        let mut tail = Vec::new();
+        stderr.take(length - tail_start).read_to_end(&mut tail)?;
+        eprintln!(
+            "piped command acknowledgments observed: {piped_acks}\n\
+             task subscription acknowledgment received by client: {subscription_ack_seen}\n\
+             background watcher poll attempts: {watcher_polls}, outgoing tasks/get frames: {task_gets}\n\
+             --- interactive final task stderr and wire trace (last {} of {length} bytes) ---\n{}",
+            tail.len(),
+            String::from_utf8_lossy(&tail),
+        );
+        Ok(())
+    }
+}
+
+impl Drop for InteractiveTaskDiagnostics {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "--- interactive final task timeline ---\n{}\n\
+                 task subscription fixture marker observed: {}",
+                self.timeline.join("\n"),
+                self.subscription_marker_seen,
+            );
+            if let Err(error) = self.report_stderr() {
+                eprintln!("could not read interactive stderr: {error}");
+            }
+            eprintln!("--- end interactive final task diagnostics ---");
+        }
+    }
+}
+
 async fn exercise_interactive_final_task(http: &HttpFixture) {
-    let mut command = repl_command();
-    command
-        .args([
+    // A file lets a timeout report the log without waiting for process exit.
+    let mut diagnostics = InteractiveTaskDiagnostics {
+        started: Instant::now(),
+        timeline: Vec::new(),
+        subscription_marker_seen: false,
+        stderr: tempfile::NamedTempFile::new().expect("create interactive stderr capture"),
+    };
+    let mut command = traced_http_repl_command(
+        &http.url,
+        &[
             "--protocol",
             "2026-07-28",
             "--no-history",
             "--color",
             "never",
-            "--http",
-            &http.url,
-        ])
+            "--trace",
+        ],
+    );
+    command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(
+            diagnostics
+                .stderr
+                .reopen()
+                .expect("open stderr capture for REPL"),
+        )
         .kill_on_drop(true);
     let mut child = command.spawn().expect("spawn interactive final mcp-repl");
     let mut stdin = child.stdin.take().expect("interactive stdin");
     let mut stdout = child.stdout.take().expect("interactive stdout");
-    let mut stderr = child.stderr.take().expect("interactive stderr");
-    let stderr_task = tokio::spawn(async move {
-        let mut captured = Vec::new();
-        stderr
-            .read_to_end(&mut captured)
-            .await
-            .expect("read interactive stderr");
-        captured
-    });
-
-    // Prove the piped editor is accepting and acknowledging commands before
+    // Prove the REPL is reading and dispatching piped commands before
     // starting the task. Writing immediately after spawn made the old test
     // depend on startup scheduling, and its subscription marker was already
     // satisfied by the final protocol's surface subscription.
-    stdin
-        .write_all(b"jobs\n")
-        .await
-        .expect("write readiness command");
+    diagnostics.write_command(&mut stdin, "jobs").await;
     let mut stdout_capture = Vec::new();
     wait_for_output(
         &mut stdout,
@@ -2726,11 +2819,10 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
         "interactive final readiness",
     )
     .await;
-
-    stdin
-        .write_all(b"slow_add a=2 b=3 &\n")
-        .await
-        .expect("write task command");
+    diagnostics.record("observed readiness command output");
+    diagnostics
+        .write_command(&mut stdin, "slow_add a=2 b=3 &")
+        .await;
     wait_for_output(
         &mut stdout,
         &mut stdout_capture,
@@ -2738,26 +2830,27 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
         "interactive final task start",
     )
     .await;
+    diagnostics.record("observed task start output");
     // One long-lived subscription follows surface changes and a second,
     // task-scoped subscription follows this task. Counting them prevents the
     // surface stream from impersonating proof that the task watcher opened.
     wait_for_file_count(&http.subscription_file, 2, "final task subscription").await;
-    stdin
-        .write_all(b"builtin wait 1\n")
-        .await
-        .expect("write task wait command");
+    diagnostics.subscription_marker_seen = true;
+    diagnostics.record("observed task subscription fixture marker");
+    diagnostics
+        .write_command(&mut stdin, "builtin wait 1")
+        .await;
     wait_for_output(
         &mut stdout,
         &mut stdout_capture,
-        "completed",
+        "status=completed",
         "interactive final task completion",
     )
     .await;
+    diagnostics.record("observed builtin wait completion output");
 
-    stdin
-        .write_all(b"jobs\nquit\n")
-        .await
-        .expect("write task status and quit commands");
+    diagnostics.write_command(&mut stdin, "jobs").await;
+    diagnostics.write_command(&mut stdin, "quit").await;
     drop(stdin);
     let status = tokio::time::timeout(CASE_TIMEOUT, child.wait())
         .await
@@ -2767,17 +2860,12 @@ async fn exercise_interactive_final_task(http: &HttpFixture) {
         .read_to_end(&mut stdout_capture)
         .await
         .expect("drain interactive stdout");
-    let stderr = tokio::time::timeout(CASE_TIMEOUT, stderr_task)
-        .await
-        .expect("interactive stderr capture timed out")
-        .expect("join interactive stderr capture");
-    let output = Output {
-        status,
-        stdout: stdout_capture,
-        stderr,
-    };
-    assert_success(&output, "interactive final task");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout_capture);
+    // The panic guard prints the bounded stderr and wire trace once.
+    assert!(
+        status.success(),
+        "interactive final task failed with {status}\nstdout:\n{stdout}"
+    );
     assert!(stdout.contains("started"), "{stdout}");
     assert!(stdout.contains("completed"), "{stdout}");
 }
