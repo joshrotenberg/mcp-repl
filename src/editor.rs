@@ -8,7 +8,6 @@
 //! `Handle::block_on` is safe here.
 
 use std::borrow::Cow;
-use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -23,6 +22,7 @@ use reedline::{
 };
 
 use crate::alias::Aliases;
+use crate::elicit::with_readline_terminal;
 use crate::style;
 use crate::{BUILTINS, Surface, command_set::CommandSet};
 
@@ -814,8 +814,8 @@ impl Highlighter for ReplHighlighter {
 
 /// Spawn the readline thread. Lines are sent over `line_tx`; after each
 /// line, the thread blocks on `ack_rx` until the command has finished
-/// printing. `at_prompt` is true while the editor owns the terminal
-/// (used to refuse elicitation prompts that would fight over stdin).
+/// printing. `at_prompt` is true while either reader owns stdin, so the
+/// handler can refuse requests during that read.
 ///
 /// When stdin is not a tty (piped input), falls back to a plain
 /// line-reader so non-interactive use keeps working.
@@ -829,15 +829,15 @@ pub fn spawn_readline_thread(
     line_tx: tokio::sync::mpsc::Sender<String>,
     ack_rx: std::sync::mpsc::Receiver<()>,
     at_prompt: Arc<AtomicBool>,
-    external_printer: ExternalPrinter<String>,
+    external_printer: Option<ExternalPrinter<String>>,
     persist_history: bool,
     history_capacity: usize,
 ) {
     std::thread::spawn(move || {
-        if !std::io::stdin().is_terminal() {
-            run_piped(&line_tx, &ack_rx);
+        let Some(external_printer) = external_printer else {
+            run_piped(&line_tx, &ack_rx, &at_prompt);
             return;
-        }
+        };
         run_interactive(
             server_name,
             surface,
@@ -944,18 +944,17 @@ fn migrate_legacy_history(destination: &std::path::Path) {
     }
 }
 
-fn run_piped(line_tx: &tokio::sync::mpsc::Sender<String>, ack_rx: &std::sync::mpsc::Receiver<()>) {
+fn run_piped(
+    line_tx: &tokio::sync::mpsc::Sender<String>,
+    ack_rx: &std::sync::mpsc::Receiver<()>,
+    at_prompt: &AtomicBool,
+) {
     let stdin = std::io::stdin();
     run_piped_with(
-        |buf| {
-            // Scope the stdin lock to one read: holding it while waiting on
-            // the ack channel would deadlock the elicitation handler, which
-            // reads stdin during a foreground tool call.
-            let mut lock = stdin.lock();
-            std::io::BufRead::read_line(&mut lock, buf)
-        },
+        |buf| std::io::BufRead::read_line(&mut stdin.lock(), buf),
         line_tx,
         ack_rx,
+        at_prompt,
     );
 }
 
@@ -963,11 +962,15 @@ fn run_piped_with(
     mut read_line: impl FnMut(&mut String) -> std::io::Result<usize>,
     line_tx: &tokio::sync::mpsc::Sender<String>,
     ack_rx: &std::sync::mpsc::Receiver<()>,
+    at_prompt: &AtomicBool,
 ) {
     let mut pending = String::new();
     loop {
         let mut line = String::new();
-        match read_line(&mut line) {
+        // The foreground handler can read the next line while this thread
+        // waits for the command's ack.
+        let read = with_readline_terminal(at_prompt, || read_line(&mut line));
+        match read {
             Ok(0) | Err(_) => {
                 if !pending.is_empty() && !dispatch_piped(&mut pending, line_tx, ack_rx) {
                     break;
@@ -1062,9 +1065,7 @@ fn run_interactive(
 
     let prompt = ReplPrompt { server_name };
     loop {
-        at_prompt.store(true, Ordering::SeqCst);
-        let sig = editor.read_line(&prompt);
-        at_prompt.store(false, Ordering::SeqCst);
+        let sig = with_readline_terminal(&at_prompt, || editor.read_line(&prompt));
         match sig {
             Ok(Signal::Success(line)) => {
                 // Flush history now: a typed `quit` exits the process from the
@@ -1094,6 +1095,7 @@ mod tests {
     use super::*;
     use crate::command_set::resolve_ref;
     use crate::directories::{Directories, Platform};
+    use crate::elicit::EDITOR_TURN_TEST_LOCK;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
 
@@ -1187,6 +1189,7 @@ mod tests {
 
     #[test]
     fn piped_input_accumulates_multiline_commands_and_keeps_command_boundaries() {
+        let _editor_test = EDITOR_TURN_TEST_LOCK.blocking_lock();
         let mut input =
             std::io::Cursor::new("call echo {\n  \"message\": \"hello from a pipe\"\n}\ntools\n");
         let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(4);
@@ -1198,6 +1201,7 @@ mod tests {
             |buf| std::io::BufRead::read_line(&mut input, buf),
             &line_tx,
             &ack_rx,
+            &AtomicBool::new(false),
         );
 
         assert_eq!(
@@ -1208,8 +1212,53 @@ mod tests {
         assert_eq!(line_rx.blocking_recv().as_deref(), Some("quit"));
     }
 
+    #[tokio::test]
+    async fn piped_input_can_answer_a_foreground_prompt_before_ack() {
+        use std::io::{BufRead, Cursor};
+        use std::sync::Mutex;
+
+        let _editor_test = EDITOR_TURN_TEST_LOCK.lock().await;
+        let input = Arc::new(Mutex::new(Cursor::new("call ask\nyes\n")));
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let editor_input = Arc::clone(&input);
+        let at_prompt = Arc::new(AtomicBool::new(false));
+        let reader_at_prompt = Arc::clone(&at_prompt);
+        let editor = std::thread::spawn(move || {
+            run_piped_with(
+                |buf| {
+                    assert!(reader_at_prompt.load(Ordering::SeqCst));
+                    editor_input.lock().unwrap().read_line(buf)
+                },
+                &line_tx,
+                &ack_rx,
+                &reader_at_prompt,
+            );
+        });
+
+        assert_eq!(line_rx.recv().await.as_deref(), Some("call ask"));
+        assert!(!at_prompt.load(Ordering::SeqCst));
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::elicit::run_terminal_prompt(move || {
+                let mut answer = String::new();
+                input.lock().unwrap().read_line(&mut answer).unwrap();
+                answer
+            }),
+        )
+        .await
+        .expect("foreground prompt can read before ack")
+        .expect("foreground prompt task");
+        assert_eq!(answer, "yes\n");
+
+        ack_tx.send(()).unwrap();
+        assert_eq!(line_rx.recv().await.as_deref(), Some("quit"));
+        editor.join().unwrap();
+    }
+
     #[test]
     fn piped_input_submits_an_unfinished_final_command_at_eof() {
+        let _editor_test = EDITOR_TURN_TEST_LOCK.blocking_lock();
         let mut input = std::io::Cursor::new("call echo {\n");
         let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(2);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
@@ -1219,6 +1268,7 @@ mod tests {
             |buf| std::io::BufRead::read_line(&mut input, buf),
             &line_tx,
             &ack_rx,
+            &AtomicBool::new(false),
         );
 
         assert_eq!(line_rx.blocking_recv().as_deref(), Some("call echo {"));

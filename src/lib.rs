@@ -1406,7 +1406,7 @@ async fn respond_to_task(client: &McpClient, id: &str, label: &str) {
                 responses.insert(key, InputResponse::Elicit(answer));
             }
             InputRequest::CreateMessage(params) => {
-                match tokio::task::spawn_blocking(move || sampling::prompt(&params)).await {
+                match elicit::run_terminal_prompt(move || sampling::prompt(&params)).await {
                     Ok(Ok(result)) => {
                         responses.insert(key, InputResponse::CreateMessage(result));
                     }
@@ -3427,7 +3427,8 @@ impl ConnectRuntime {
                         import_selector.as_ref(),
                         import_http_trust.as_ref(),
                         &url,
-                    )?;
+                    )
+                    .await?;
                     validate_bearer_fd_exclusive(
                         self.bearer_from_fd.is_some(),
                         false,
@@ -3556,7 +3557,7 @@ impl ConnectRuntime {
                             cwd.as_deref(),
                             &env,
                         );
-                        self.authorize_import(&plan)?;
+                        self.authorize_import(&plan).await?;
                     }
                     if command.is_empty() {
                         return Err(ConnectFailure::usage("stdio command is empty"));
@@ -3651,7 +3652,7 @@ impl ConnectRuntime {
             .map_err(|error| ConnectFailure::usage(format!("server profile {name:?}: {error}")))
     }
 
-    fn authorize_import_http(
+    async fn authorize_import_http(
         &self,
         selector: Option<&import_config::Selector>,
         trust: Option<&import_config::ImportedHttpTrust>,
@@ -3673,17 +3674,22 @@ impl ConnectRuntime {
                 .collect::<Vec<_>>(),
         )
         .map_err(ConnectFailure::usage)?;
-        self.authorize_import(&plan)
+        self.authorize_import(&plan).await
     }
 
-    fn authorize_import(&self, plan: &import_trust::ImportPlan) -> Result<(), ConnectFailure> {
+    async fn authorize_import(
+        &self,
+        plan: &import_trust::ImportPlan,
+    ) -> Result<(), ConnectFailure> {
         let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
         match import_trust::authorize(
             plan,
             self.config_file.as_deref(),
             self.trust_import,
             interactive,
-        ) {
+        )
+        .await
+        {
             import_trust::Decision::Approved => Ok(()),
             import_trust::Decision::Refused(reason) => Err(ConnectFailure::usage(reason)),
         }
@@ -4741,11 +4747,11 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // inject a human banner into it.
     let quiet = one_shot && (!args.verbose || args.json);
 
-    // True while the reedline editor owns the terminal; the elicitation
-    // handler declines form requests during that window instead of
-    // fighting over raw-mode stdin.
+    // The handler refuses terminal prompts while the command reader owns
+    // stdin. Only reedline consumes diagnostics from the external printer.
     let at_prompt = Arc::new(AtomicBool::new(false));
-    let async_output = AsyncOutput::new(at_prompt.clone(), !one_shot);
+    let use_reedline = !one_shot && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let async_output = AsyncOutput::new(at_prompt.clone(), use_reedline);
     // Automatic task transitions are an interactive convenience. `--exec`
     // and `--json` retain deterministic output; their manual task commands
     // remain authoritative.
@@ -5005,7 +5011,9 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                         trust_store_config.as_deref(),
                         args.trust_import,
                         interactive,
-                    ) {
+                    )
+                    .await
+                    {
                         import_trust::Decision::Approved => {}
                         import_trust::Decision::Refused(reason) => {
                             exit_with_error(ExitStatus::Usage, &reason);
@@ -5209,7 +5217,9 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                         trust_store_config.as_deref(),
                         args.trust_import,
                         interactive,
-                    ) {
+                    )
+                    .await
+                    {
                         import_trust::Decision::Approved => {}
                         import_trust::Decision::Refused(reason) => {
                             exit_with_error(ExitStatus::Usage, &reason);
@@ -5447,9 +5457,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         line_tx,
         ack_rx,
         at_prompt,
-        async_output
-            .external_printer()
-            .expect("interactive sessions have an external printer"),
+        async_output.external_printer(),
         !args.no_history && history_capacity > 0,
         history_capacity,
     );
