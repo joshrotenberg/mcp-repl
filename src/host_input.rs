@@ -3,6 +3,7 @@
 mod final_protocol;
 #[cfg(unix)]
 mod socket;
+mod task;
 #[cfg(test)]
 mod tests;
 
@@ -23,6 +24,7 @@ use tower_mcp::protocol::{
 };
 
 pub(crate) use final_protocol::call_tool;
+pub(crate) use task::{deadline_after, inspect_task, respond_task, wait_task};
 
 const VERSION: u32 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
@@ -108,6 +110,30 @@ pub(crate) async fn command_request<T>(request: impl Future<Output = T>) -> T {
     result
 }
 
+/// Run one command request so that, if the host answered any of the
+/// server's questions while it was open, an error from it has the server's
+/// text withheld: the server may repeat the answer there. Tool calls, `read`,
+/// and `prompt` all reach the server through this, on either lifecycle.
+pub(crate) async fn answer_aware<T>(
+    request: impl Future<Output = tower_mcp::Result<T>>,
+) -> tower_mcp::Result<T> {
+    let Some(host) = HOST.get() else {
+        return request.await;
+    };
+    let before = host.answered();
+    request
+        .await
+        .map_err(|error| redact_if_answered(host, before, error))
+}
+
+fn redact_if_answered(host: &Host, before: u64, error: tower_mcp::Error) -> tower_mcp::Error {
+    if host.answered() > before {
+        peer_error(error, "the request")
+    } else {
+        error
+    }
+}
+
 pub(crate) fn lost_error() -> tower_mcp::Error {
     transport_error(CHANNEL_CLOSED)
 }
@@ -124,6 +150,99 @@ pub(crate) async fn finish() {
 
 fn transport_error(message: &'static str) -> tower_mcp::Error {
     tower_mcp::Error::Transport(message.into())
+}
+
+/// The exit status a local host-input failure was given when it was built,
+/// and the JSON-RPC code of a redacted server error. It travels as the source
+/// of a `ToolError`, so the classifier never reads the message, which can
+/// contain server-chosen request keys.
+#[derive(Debug)]
+struct ExplicitStatus {
+    status: crate::exit_status::ExitStatus,
+    code: Option<i32>,
+}
+
+impl std::fmt::Display for ExplicitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.status.label())
+    }
+}
+
+impl std::error::Error for ExplicitStatus {}
+
+/// A local host-input failure with a fixed exit status.
+pub(crate) fn failure(
+    status: crate::exit_status::ExitStatus,
+    message: impl Into<String>,
+) -> tower_mcp::Error {
+    explicit(status, None, message.into())
+}
+
+fn explicit(
+    status: crate::exit_status::ExitStatus,
+    code: Option<i32>,
+    message: String,
+) -> tower_mcp::Error {
+    tower_mcp::Error::Tool(tower_mcp::error::ToolError {
+        tool: None,
+        message,
+        source: Some(Box::new(ExplicitStatus { status, code })),
+    })
+}
+
+/// An error built by [`failure`] or [`peer_error`].
+pub(crate) struct ExplicitFailure<'a> {
+    pub(crate) status: crate::exit_status::ExitStatus,
+    /// The server's JSON-RPC code, when the error was one.
+    pub(crate) code: Option<i32>,
+    pub(crate) message: &'a str,
+}
+
+pub(crate) fn explicit_failure(error: &tower_mcp::Error) -> Option<ExplicitFailure<'_>> {
+    let tower_mcp::Error::Tool(tool) = error else {
+        return None;
+    };
+    let marker = tool.source.as_ref()?.downcast_ref::<ExplicitStatus>()?;
+    Some(ExplicitFailure {
+        status: marker.status,
+        code: marker.code,
+        message: &tool.message,
+    })
+}
+
+/// Render an error the peer returned on a bridge task path or after host
+/// answers were sent.
+///
+/// A server can copy a submitted value into a JSON-RPC error message or its
+/// `data`, so the text is replaced. The exit status is computed from the
+/// original error first, because some transport failures arrive as JSON-RPC
+/// `-32000` and are recognized by their message, and the JSON-RPC code is
+/// kept alongside it.
+pub(crate) fn peer_error(error: tower_mcp::Error, what: &str) -> tower_mcp::Error {
+    match error {
+        tower_mcp::Error::Transport(message) if message == CHANNEL_CLOSED => lost_error(),
+        error if explicit_failure(&error).is_some() => error,
+        error => {
+            let status = crate::exit_status::ExitStatus::from_mcp_error(&error);
+            let (code, message) = match &error {
+                tower_mcp::Error::JsonRpc(rpc) => (
+                    Some(rpc.code),
+                    format!(
+                        "{what} was rejected by the server; its error text is withheld in \
+                         bridge mode"
+                    ),
+                ),
+                _ => (
+                    None,
+                    format!(
+                        "{what} failed ({}); the error text is withheld in bridge mode",
+                        status.label()
+                    ),
+                ),
+            };
+            explicit(status, code, message)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -185,6 +304,10 @@ struct Source {
     client: Option<Weak<McpClient>>,
     name: String,
     protocol: String,
+    /// What the bridge knows about each task, by task id. Owned by the
+    /// connection, so a new connection starts empty.
+    #[serde(skip)]
+    tasks: HashMap<String, task::TaskRecord>,
 }
 
 impl Source {
@@ -467,6 +590,9 @@ struct Pending {
 struct Ledger {
     next_connection: u64,
     next_id: u64,
+    /// Host answers delivered to waiting requests, for telling whether a
+    /// command submitted any.
+    answered: u64,
     source: Option<Source>,
     pending: HashMap<u64, Pending>,
     retired: VecDeque<(u64, &'static str)>,
@@ -509,7 +635,32 @@ impl Host {
             client,
             name: name.into(),
             protocol: protocol.into(),
+            tasks: HashMap::new(),
         });
+    }
+
+    /// Run `f` on the record of task `id` while `connection` is the active
+    /// connection, creating the record on first use.
+    fn with_task<T>(
+        &self,
+        connection: Connection,
+        id: &str,
+        f: impl FnOnce(&mut task::TaskRecord) -> T,
+    ) -> Option<T> {
+        let mut ledger = self.ledger.lock().unwrap();
+        let source = ledger
+            .source
+            .as_mut()
+            .filter(|source| source.connection == connection.0)?;
+        let now = Instant::now();
+        source
+            .tasks
+            .retain(|task, record| task == id || !record.prunable(now));
+        Some(f(source.tasks.entry(id.to_owned()).or_default()))
+    }
+
+    fn answered(&self) -> u64 {
+        self.ledger.lock().unwrap().answered
     }
 
     fn connection(&self) -> Option<Connection> {
@@ -672,6 +823,7 @@ impl Host {
         }
         pending.expected.validate(&answer)?;
         let pending = ledger.pending.remove(&id).expect("pending under lock");
+        ledger.answered += 1;
         ledger.retire(id, "duplicate");
         let _ = pending.reply.send(Ok(answer));
         Ok(())

@@ -43,6 +43,9 @@ impl ExitStatus {
     }
 
     pub fn from_mcp_error(error: &Error) -> Self {
+        if let Some(failure) = crate::host_input::explicit_failure(error) {
+            return failure.status;
+        }
         if crate::session::is_reconnectable_http_error(error) {
             return Self::Transport;
         }

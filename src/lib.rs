@@ -748,6 +748,12 @@ fn describe_mcp_error(error: &tower_mcp::Error) -> String {
             untrusted::sanitize_inline(reason)
         );
     }
+    if let Some(failure) = host_input::explicit_failure(error) {
+        return match failure.code {
+            Some(code) => format!("{} (code {code})", failure.message),
+            None => failure.message.to_owned(),
+        };
+    }
     let tower_mcp::Error::JsonRpc(rpc) = error else {
         return collapse_repeated_label(&error.to_string()).to_string();
     };
@@ -1411,15 +1417,37 @@ fn render_task(task: &TaskObject, label: &str) {
     }
 }
 
+/// `tasks/get` for `task`, `jobs`, and `cancel`. With `--host-input-fd` the
+/// read goes through the bridge's reader, which withholds server error text
+/// that can repeat a submitted answer.
+async fn get_task(client: &McpClient, id: &str) -> tower_mcp::Result<TaskObject> {
+    if host_input::enabled() {
+        host_input::inspect_task(client, id).await
+    } else {
+        client.task_get(id).await
+    }
+}
+
 /// Block until one task settles, honoring `wait`'s own deadline.
+///
+/// With `--host-input-fd`, input the task asks for goes to the host, and its
+/// questions expire no later than that deadline.
 async fn wait_for_one(
     client: &McpClient,
+    jobs: &Jobs,
     id: &str,
     limit: Option<Duration>,
 ) -> tower_mcp::Result<TaskObject> {
+    let wait = async {
+        if host_input::enabled() {
+            host_input::wait_task(client, jobs, id, host_input::deadline_after(limit)).await
+        } else {
+            client.task_wait(id).await
+        }
+    };
     match limit {
-        None => client.task_wait(id).await,
-        Some(limit) => match tokio::time::timeout(limit, client.task_wait(id)).await {
+        None => wait.await,
+        Some(limit) => match tokio::time::timeout(limit, wait).await {
             Ok(result) => result,
             Err(_) => Err(tower_mcp::Error::Transport(format!(
                 "task {id} was still running after {}s (--timeout)",
@@ -1472,16 +1500,26 @@ async fn wait_for_all(
         );
         return;
     }
+    // With the bridge, a task's failure is an entry in the array, so the
+    // command still prints exactly one value.
+    let outcomes_in_array = host_input::enabled() && json_output();
     let mut settled = Vec::new();
     for id in &ids {
-        match wait_for_one(client, id, limit).await {
+        match wait_for_one(client, jobs, id, limit).await {
             Ok(task) => {
                 jobs.sync(id, task.status, task.status_message.clone());
                 note_settled_task(&task);
                 if !json_output() {
                     render_task(&task, &jobs.label_for(&task.task_id));
                 }
-                settled.push(task);
+                settled.push(serde_json::to_value(&task).unwrap_or_default());
+            }
+            Err(e) if outcomes_in_array => {
+                let status = ExitStatus::from_mcp_error(&e);
+                note_error(status);
+                let mut outcome = error_json(status, &describe_mcp_error(&e));
+                outcome["taskId"] = serde_json::json!(id);
+                settled.push(outcome);
             }
             // Keep going: one unreachable task should not hide the outcome of
             // the others a script is also waiting on.
@@ -1503,7 +1541,9 @@ async fn wait_for_all(
 /// Only the 2026-07-28 lifecycle reports outstanding requests: on the stable
 /// lifecycle a server asks by sending `elicitation/create` itself, so there
 /// is nothing parked to look up. Answering is a foreground read of stdin,
-/// which is safe here because the editor is waiting on this command.
+/// which is safe here because the editor is waiting on this command. With
+/// `--host-input-fd`, stdin carries commands, so the requests go to the host
+/// over the bridge instead.
 async fn respond_to_task(client: &McpClient, id: &str, label: &str) {
     use tower_mcp::protocol::{InputRequest, InputResponse, InputResponses};
 
@@ -1520,6 +1560,18 @@ async fn respond_to_task(client: &McpClient, id: &str, label: &str) {
              itself, which is declined while the editor holds the terminal, so run the tool in \
              the foreground instead of as a task",
         );
+        return;
+    }
+    if host_input::enabled() {
+        // One deadline bounds the reads, the host's answers, and the update.
+        let deadline = host_input::deadline_after(request_timeout());
+        match with_deadline(host_input::respond_task(client, id, label, deadline)).await {
+            Ok(task) if json_output() => {
+                print_json(&serde_json::to_value(&task).unwrap_or_default());
+            }
+            Ok(task) => render_task(&task, label),
+            Err(e) => report_mcp_error(&e),
+        }
         return;
     }
     let detailed = match client.task_get_detailed(id).await {
@@ -1602,8 +1654,12 @@ async fn respond_to_task(client: &McpClient, id: &str, label: &str) {
         report_mcp_error(&e);
         return;
     }
-    // The handler resumes asynchronously, so report what the task says now
-    // rather than claiming it finished.
+    report_task_now(client, id, label).await;
+}
+
+/// The handler resumes asynchronously after `tasks/update`, so report what
+/// the task says now rather than claiming it finished.
+async fn report_task_now(client: &McpClient, id: &str, label: &str) {
     match client.task_get(id).await {
         Ok(task) if json_output() => print_json(&serde_json::to_value(&task).unwrap_or_default()),
         Ok(task) => render_task(&task, label),
@@ -2198,7 +2254,13 @@ where
     let seen = session.generation();
     // Each attempt gets its own deadline: the retry only happens after a
     // reconnect, so it is a fresh request rather than a continuation.
-    let err = match with_deadline(host_input::command_request(op(session.client()))).await {
+    // `answer_aware` withholds the server's error text when the host answered
+    // one of its questions during the request.
+    let err = match with_deadline(host_input::command_request(host_input::answer_aware(op(
+        session.client(),
+    ))))
+    .await
+    {
         Ok(value) => return Ok(value),
         Err(e) => e,
     };
@@ -2218,7 +2280,7 @@ where
     // being piped somewhere.
     eprintln!("{}", paint(Style::new().dimmed(), "[reconnected]"));
 
-    let retried = with_deadline(op(session.client())).await;
+    let retried = with_deadline(host_input::answer_aware(op(session.client()))).await;
     if let Err(e) = &retried
         && is_session_lost(e)
     {
@@ -5139,10 +5201,15 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // Automatic task transitions are an interactive convenience. `--exec`
     // and `--json` retain deterministic output; their manual task commands
     // remain authoritative.
-    let jobs = Arc::new(Jobs::new(
+    let jobs = Jobs::new(
         async_output.clone(),
         automatic_task_updates(one_shot, args.json),
-    ));
+    );
+    let jobs = Arc::new(if bridged {
+        jobs.without_notified_messages()
+    } else {
+        jobs
+    });
 
     // Notifications print inline and trigger surface refreshes.
     // The sender is held for the life of the process: `changed()` errors once
@@ -7253,11 +7320,7 @@ async fn handle_line(
             if json_output() {
                 let mut rendered = Vec::new();
                 for job in jobs.list() {
-                    match client
-                        .as_deref()
-                        .expect("connected above")
-                        .task_get(&job.task_id)
-                        .await
+                    match get_task(client.as_deref().expect("connected above"), &job.task_id).await
                     {
                         Ok(task) => {
                             jobs.sync(&job.task_id, task.status, task.status_message.clone());
@@ -7270,10 +7333,15 @@ async fn handle_line(
                         Err(error) => {
                             let status = ExitStatus::from_mcp_error(&error);
                             note_error(status);
+                            let message = if host_input::enabled() {
+                                describe_mcp_error(&error)
+                            } else {
+                                error.to_string()
+                            };
                             rendered.push(serde_json::json!({
                                 "taskId": job.task_id,
                                 "tool": job.tool,
-                                "error": error.to_string(),
+                                "error": message,
                                 "kind": status.label(),
                                 "exitStatus": status.code(),
                             }));
@@ -7293,12 +7361,7 @@ async fn handle_line(
                 );
             }
             for job in jobs.list() {
-                match client
-                    .as_deref()
-                    .expect("connected above")
-                    .task_get(&job.task_id)
-                    .await
-                {
+                match get_task(client.as_deref().expect("connected above"), &job.task_id).await {
                     Ok(task) => {
                         jobs.sync(&job.task_id, task.status, task.status_message.clone());
                         println!(
@@ -7376,10 +7439,6 @@ async fn handle_line(
             // question was asked while the editor held the terminal, so
             // nothing could answer it at the time.
             if cmd == "task" && rest.get(1).is_some_and(|word| *word == "respond") {
-                if host_input::enabled() {
-                    command_error("manual task input is unavailable with --host-input-fd");
-                    return false;
-                }
                 respond_to_task(
                     client.as_deref().expect("connected above"),
                     id,
@@ -7392,24 +7451,30 @@ async fn handle_line(
                 return false;
             }
             let outcome = match cmd {
-                "task" => {
-                    client
-                        .as_deref()
-                        .expect("connected above")
-                        .task_get(id)
-                        .await
-                }
+                "task" => get_task(client.as_deref().expect("connected above"), id).await,
                 "wait" => {
-                    wait_for_one(client.as_deref().expect("connected above"), id, wait_limit).await
+                    wait_for_one(
+                        client.as_deref().expect("connected above"),
+                        jobs,
+                        id,
+                        wait_limit,
+                    )
+                    .await
                 }
                 _ => {
                     let client = client.as_deref().expect("connected above");
                     with_deadline(async {
-                        client.task_cancel(id, None).await?;
+                        client.task_cancel(id, None).await.map_err(|error| {
+                            if host_input::enabled() {
+                                host_input::peer_error(error, "tasks/cancel")
+                            } else {
+                                error
+                            }
+                        })?;
                         if !json_output() {
                             println!("cancel acknowledged");
                         }
-                        client.task_get(id).await
+                        get_task(client, id).await
                     })
                     .await
                 }
@@ -8819,9 +8884,10 @@ async fn run_tool(
         return;
     }
     let started = std::time::Instant::now();
+    let deadline = host_input::deadline_after(request_timeout());
     match with_reconnect(session, surface, |c| {
         let arguments = arguments.clone();
-        async move { host_input::call_tool(&c, name, arguments).await }
+        async move { host_input::call_tool(&c, jobs, name, arguments, deadline).await }
     })
     .await
     {
