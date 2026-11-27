@@ -3528,6 +3528,7 @@ struct ConnectRuntime {
     make_handler: Arc<dyn Fn() -> ReplClientHandler + Send + Sync>,
     async_output: AsyncOutput,
     server_label: elicit::ServerLabel,
+    piped_prompts: elicit::PipedPrompts,
     bearer: Option<String>,
     bearer_from_fd: Option<String>,
     headers: Vec<String>,
@@ -5135,6 +5136,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
     // stdin. Only reedline consumes diagnostics from the external printer.
     let at_prompt = Arc::new(AtomicBool::new(false));
     let use_reedline = !one_shot && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let piped_prompts = elicit::PipedPrompts::new(!one_shot && !use_reedline);
     let async_output = AsyncOutput::new(at_prompt.clone(), use_reedline);
     // Automatic task transitions are an interactive convenience. `--exec`
     // and `--json` retain deterministic output; their manual task commands
@@ -5164,6 +5166,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         let async_output = async_output.clone();
         let jobs = jobs.clone();
         let server_label = server_label.clone();
+        let piped_prompts = piped_prompts.clone();
         Arc::new(move || {
             ReplClientHandler::new(
                 notification_handler(refresh_tx.clone(), async_output.clone(), jobs.clone()),
@@ -5171,6 +5174,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 server_label.clone(),
                 async_output.clone(),
             )
+            .with_piped_prompts(piped_prompts.clone())
         })
     };
     let connect_runtime = Arc::new(ConnectRuntime {
@@ -5180,6 +5184,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         make_handler: make_handler.clone(),
         async_output: async_output.clone(),
         server_label: server_label.clone(),
+        piped_prompts,
         bearer: args.bearer.clone(),
         bearer_from_fd: bearer_from_fd.clone(),
         headers: args.headers.clone(),
@@ -6642,6 +6647,7 @@ async fn handle_line(
         return false;
     }
     let client = session.try_client();
+    let piped_prompts = &connect_runtime.piped_prompts;
 
     if namespace == CommandNamespace::Tool {
         dispatch_direct_tool(
@@ -6650,6 +6656,7 @@ async fn handle_line(
             binds,
             jobs,
             schema_contracts,
+            piped_prompts,
             cmd,
             rest,
             background,
@@ -7074,11 +7081,9 @@ async fn handle_line(
                 return false;
             }
             let started = std::time::Instant::now();
-            match with_reconnect(
-                session,
-                surface,
-                |c| async move { c.read_resource(uri).await },
-            )
+            match with_reconnect(session, surface, |c| async move {
+                piped_prompts.foreground(c.read_resource(uri)).await
+            })
             .await
             {
                 // Saving is the whole command when --out is given: the
@@ -7179,7 +7184,11 @@ async fn handle_line(
             let started = std::time::Instant::now();
             match with_reconnect(session, surface, |c| {
                 let prompt_args = prompt_args.clone();
-                async move { c.get_prompt(name, Some(prompt_args)).await }
+                async move {
+                    piped_prompts
+                        .foreground(c.get_prompt(name, Some(prompt_args)))
+                        .await
+                }
             })
             .await
             {
@@ -7228,6 +7237,7 @@ async fn handle_line(
                 surface,
                 jobs,
                 schema_contracts,
+                piped_prompts,
                 name,
                 arguments,
                 background,
@@ -7241,6 +7251,7 @@ async fn handle_line(
                 surface,
                 binds,
                 schema_contracts,
+                piped_prompts,
                 rest,
                 background,
             )
@@ -7345,13 +7356,14 @@ async fn handle_line(
             // inside an earlier `-e` command, so without this there is no way
             // for one to wait on its own work.
             if cmd == "wait" && rest.is_empty() {
-                wait_for_all(
-                    client.as_deref().expect("connected above"),
-                    jobs,
-                    wait_limit,
-                    started,
-                )
-                .await;
+                piped_prompts
+                    .foreground(wait_for_all(
+                        client.as_deref().expect("connected above"),
+                        jobs,
+                        wait_limit,
+                        started,
+                    ))
+                    .await;
                 return false;
             }
             let Some(typed) = rest.first() else {
@@ -7380,6 +7392,8 @@ async fn handle_line(
                     command_error("manual task input is unavailable with --host-input-fd");
                     return false;
                 }
+                // The final lifecycle returns these questions in tasks/get.
+                // respond_to_task reads their answers directly under the terminal lock.
                 respond_to_task(
                     client.as_deref().expect("connected above"),
                     id,
@@ -7400,7 +7414,13 @@ async fn handle_line(
                         .await
                 }
                 "wait" => {
-                    wait_for_one(client.as_deref().expect("connected above"), id, wait_limit).await
+                    piped_prompts
+                        .foreground(wait_for_one(
+                            client.as_deref().expect("connected above"),
+                            id,
+                            wait_limit,
+                        ))
+                        .await
                 }
                 _ => {
                     let client = client.as_deref().expect("connected above");
@@ -7805,6 +7825,7 @@ async fn handle_line(
                 binds,
                 jobs,
                 schema_contracts,
+                piped_prompts,
                 tool_name,
                 rest,
                 background,
@@ -7823,6 +7844,7 @@ async fn dispatch_direct_tool(
     binds: &Arc<RwLock<Binds>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
+    piped_prompts: &elicit::PipedPrompts,
     tool_name: &str,
     rest: &[&str],
     background: bool,
@@ -7863,6 +7885,7 @@ async fn dispatch_direct_tool(
         surface,
         jobs,
         schema_contracts,
+        piped_prompts,
         tool_name,
         arguments,
         background,
@@ -7880,6 +7903,7 @@ async fn handle_bench(
     surface: &Arc<RwLock<Surface>>,
     binds: &Arc<RwLock<Binds>>,
     schema_contracts: &schema_contract::ContractSet,
+    piped_prompts: &elicit::PipedPrompts,
     rest: &[&str],
     background: bool,
 ) {
@@ -7933,7 +7957,15 @@ async fn handle_bench(
     };
     let arguments = tool_args::apply_binds(&schema, &binds.read().unwrap(), arguments);
 
-    let outcome = bench::run(client, &plan.tool, arguments, plan.n, plan.concurrency).await;
+    let outcome = piped_prompts
+        .foreground(bench::run(
+            client,
+            &plan.tool,
+            arguments,
+            plan.n,
+            plan.concurrency,
+        ))
+        .await;
     // A policy denial, or a connection change that voided a policy decision,
     // is reported once with the same message, JSON, and status as calling
     // the tool directly, rather than as a run of failures.
@@ -8769,6 +8801,7 @@ async fn run_tool(
     surface: &Arc<RwLock<Surface>>,
     jobs: &Arc<Jobs>,
     schema_contracts: &schema_contract::ContractSet,
+    piped_prompts: &elicit::PipedPrompts,
     name: &str,
     arguments: serde_json::Value,
     background: bool,
@@ -8821,7 +8854,11 @@ async fn run_tool(
     let started = std::time::Instant::now();
     match with_reconnect(session, surface, |c| {
         let arguments = arguments.clone();
-        async move { host_input::call_tool(&c, name, arguments).await }
+        async move {
+            piped_prompts
+                .foreground(host_input::call_tool(&c, name, arguments))
+                .await
+        }
     })
     .await
     {
@@ -11716,6 +11753,7 @@ world",
             &surface,
             &jobs,
             &schema_contracts,
+            &elicit::PipedPrompts::default(),
             "slow_add",
             serde_json::json!({ "a": 2, "b": 3 }),
             true,

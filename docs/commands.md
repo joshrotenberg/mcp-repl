@@ -600,10 +600,12 @@ Tools that request user input via `elicitation/create` prompt for each
 field at the terminal during a foreground call: the field's type, default,
 and description are shown, empty input accepts the default, and EOF
 cancels. Fields are asked in the order the server declared them, which is
-part of the schema rather than incidental. Try `sign_in` in `--demo`. If a
-background task elicits while the editor owns the terminal, the request is
-declined rather than fighting the editor for stdin; on the 2026-07-28
-lifecycle the question is parked instead, and `task <id> respond` asks it.
+part of the schema rather than incidental. Try `sign_in` in `--demo`. On
+the stable lifecycle, a background request is declined while the editor
+owns the terminal. A piped session also declines requests when no foreground
+operation can answer. Use `wait` for the task to let it ask during a piped
+session. On the 2026-07-28 lifecycle, the question is parked and
+`task <id> respond` asks it. See the [piped stdin rules](scripting.md#prompts-on-piped-stdin).
 
 Everything in a form comes from the server: the message, the field names,
 and their descriptions. The REPL is only the terminal it arrives at, so:

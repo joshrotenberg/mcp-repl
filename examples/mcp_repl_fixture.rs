@@ -28,9 +28,9 @@ use tower_mcp::{
     extract::{Context, RawArgs},
     protocol::{
         CreateMessageParams, ElicitAction, ElicitFieldValue, ElicitFormParams, ElicitFormSchema,
-        ElicitMode, ElicitRequestParams, ElicitResult, ElicitUrlParams, InputRequest,
-        InputRequiredResult, InputResponse, LogLevel, LoggingMessageParams, RequestOutcome,
-        SamplingMessage,
+        ElicitMode, ElicitRequestParams, ElicitResult, ElicitUrlParams, GetPromptResult,
+        InputRequest, InputRequiredResult, InputResponse, LogLevel, LoggingMessageParams,
+        RequestOutcome, SamplingMessage,
     },
 };
 
@@ -388,11 +388,13 @@ fn action_name(action: ElicitAction) -> &'static str {
     }
 }
 
+fn has_fixture_form_value(answer: &ElicitResult) -> bool {
+    matches!(answer.content.as_ref().and_then(|values| values.get("apiKey")),
+        Some(ElicitFieldValue::String(value)) if value == SEEDED_ANSWER)
+}
+
 fn form_result(answer: &ElicitResult) -> CallToolResult {
-    if answer.action == ElicitAction::Accept
-        && !matches!(answer.content.as_ref().and_then(|values| values.get("apiKey")),
-            Some(ElicitFieldValue::String(value)) if value == SEEDED_ANSWER)
-    {
+    if answer.action == ElicitAction::Accept && !has_fixture_form_value(answer) {
         return CallToolResult::error("fixture did not receive the expected form value");
     }
     CallToolResult::text(format!("form {}", action_name(answer.action)))
@@ -1022,6 +1024,158 @@ fn serve_raw_tools_only(
     Ok(())
 }
 
+/// Script stable callbacks on a detached task. The ping round trip puts the
+/// background callbacks between task creation and the next foreground call.
+/// The first task poll lets a separate script answer the task during `wait`.
+fn serve_piped_prompts() -> Result<(), tower_mcp::BoxError> {
+    use std::io::{BufRead, Write};
+
+    fn send_frame(stdout: &mut impl Write, frame: Value) -> std::io::Result<()> {
+        writeln!(stdout, "{frame}")?;
+        stdout.flush()
+    }
+
+    fn ask_form(stdout: &mut impl Write, id: &str) -> std::io::Result<()> {
+        send_frame(
+            stdout,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "elicitation/create", "params": host_form(),
+            }),
+        )
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    let mut task_started = false;
+    let mut task_asked = false;
+    let mut task_result = None;
+    let mut pending = Value::Null;
+    let working_task = json!({
+        "taskId": "background",
+        "status": "working",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "lastUpdatedAt": "2026-01-01T00:00:00Z",
+        "ttl": null,
+        "pollInterval": 50,
+    });
+    for line in std::io::stdin().lock().lines() {
+        let request: Value = serde_json::from_str(&line?)?;
+        let id = &request["id"];
+        let result = match (request["method"].as_str(), id.as_str()) {
+            (Some("initialize"), _) => json!({
+                "protocolVersion": request["params"]["protocolVersion"],
+                "capabilities": {"tools": {}, "tasks": {"requests": {"tools": {"call": {}}}}},
+                "serverInfo": {"name": "piped-prompts", "version": "1.0.0"},
+            }),
+            (Some("tools/list"), _) => json!({"tools": [{
+                "name": "ask",
+                "inputSchema": {"type": "object"},
+                "execution": {"taskSupport": "optional"},
+            }]}),
+            (Some("tools/call"), _) if request["params"].get("task").is_some() => {
+                task_started = true;
+                json!({"task": working_task})
+            }
+            (Some("ping"), _) if task_started => {
+                pending = id.clone();
+                ask_form(&mut stdout, "background-form")?;
+                continue;
+            }
+            (None, Some("background-form")) => {
+                if request["result"]["action"] != "decline" {
+                    return Err("expected the background form during ping to be declined".into());
+                }
+                send_frame(
+                    &mut stdout,
+                    json!({
+                        "jsonrpc": "2.0", "id": "background-sample", "method": "sampling/createMessage",
+                        "params": host_sample(),
+                    }),
+                )?;
+                continue;
+            }
+            (Some("tools/call"), _) => {
+                pending = id.clone();
+                ask_form(&mut stdout, "foreground-form")?;
+                continue;
+            }
+            (Some("tasks/get"), _)
+                if task_started && request["params"]["taskId"] == "background" =>
+            {
+                if !task_asked {
+                    task_asked = true;
+                    ask_form(&mut stdout, "task-form")?;
+                }
+                let mut task = working_task.clone();
+                if let Some(result) = &task_result {
+                    task["status"] = json!("completed");
+                    task["result"] = serde_json::to_value(result)?;
+                }
+                task
+            }
+            (None, Some("task-form")) => {
+                let answer = serde_json::from_value(request["result"].clone())?;
+                task_result = Some(form_result(&answer));
+                continue;
+            }
+            (None, Some("background-sample")) => {
+                if request["error"]["code"] != -32007 {
+                    return Err(
+                        "expected the background sampling request during ping to be declined"
+                            .into(),
+                    );
+                }
+                json!({})
+            }
+            (None, Some("foreground-form")) => {
+                let answer = serde_json::from_value(request["result"].clone())?;
+                serde_json::to_value(form_result(&answer))?
+            }
+            _ if id.is_null() => continue,
+            _ => return Err(format!("unexpected piped prompts fixture request: {request}").into()),
+        };
+        let id = if request["method"].is_null() {
+            &pending
+        } else {
+            id
+        };
+        send_frame(
+            &mut stdout,
+            json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )?;
+    }
+    Ok(())
+}
+
+fn with_piped_final_prompt(router: McpRouter) -> McpRouter {
+    router.prompt(
+        PromptBuilder::new("ask_prompt")
+            .mrtr_handler(|ctx: RequestContext, _args| async move {
+                let Some(responses) = ctx.input_responses() else {
+                    let request = InputRequest::Elicit(ElicitRequestParams::Form(host_form()));
+                    return Ok(RequestOutcome::input_required(
+                        InputRequiredResult::with_requests(
+                            [("form".into(), request)].into_iter().collect(),
+                        ),
+                    ));
+                };
+                let accepted = matches!(
+                    responses.get("form"),
+                    Some(InputResponse::Elicit(answer))
+                        if answer.action == ElicitAction::Accept && has_fixture_form_value(answer)
+                );
+                let message = if accepted {
+                    "final form accept"
+                } else {
+                    "final form unexpected answer"
+                };
+                Ok(RequestOutcome::Complete(GetPromptResult::user_message(
+                    message,
+                )))
+            })
+            .build(),
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), tower_mcp::BoxError> {
     if std::env::var_os("MCP_REPL_PLUGIN_FIXTURE").is_some() {
@@ -1043,6 +1197,9 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         std::process::id().to_string(),
     );
     init_trace_file();
+    if std::env::args().any(|arg| arg == "--piped-prompts") {
+        return serve_piped_prompts();
+    }
     // Not a router: this mode speaks JSON-RPC by hand so it can reject the
     // methods it never advertised, the way a server from another SDK does.
     if std::env::args().any(|arg| arg == "--tools-only") {
@@ -1057,6 +1214,9 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
         return Ok(());
     }
     let mut router = fixture_router();
+    if std::env::args().any(|arg| arg == "--piped-prompts-final") {
+        router = with_piped_final_prompt(router);
+    }
     if std::env::args().any(|arg| arg == "--session-driver") {
         router = with_session_driver_tools(router);
     }

@@ -2425,6 +2425,102 @@ async fn exercise_elicitation_field_order() {
     );
 }
 
+async fn run_piped_prompt_case(
+    fixture: &Path,
+    protocol: &str,
+    fixture_mode: &str,
+    script: &str,
+    case: &str,
+) -> Output {
+    let mut command = repl_command();
+    command
+        .args([
+            "--json",
+            "--no-history",
+            "--color",
+            "never",
+            "--protocol",
+            protocol,
+            "--elicitation",
+            "prompt",
+            "--sampling",
+            "prompt",
+            "--",
+        ])
+        .arg(fixture)
+        .arg(fixture_mode);
+    let output = run_with_input(command, script, case, CASE_TIMEOUT).await;
+    assert_success(&output, case);
+    output
+}
+
+async fn exercise_piped_foreground_prompts(fixture: &Path) {
+    let case = "piped foreground prompts";
+    let output = run_piped_prompt_case(
+        fixture,
+        "stable",
+        "--piped-prompts",
+        "ask &\nping\nask\nbridge-private-answer\nquit\n",
+        case,
+    )
+    .await;
+    let values = json_lines(&output, case);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let details = format!("{values:?}\nstderr:\n{stderr}");
+    assert_eq!(values.len(), 4, "{details}");
+    assert_eq!(values[0]["task"]["taskId"], "background", "{details}");
+    assert_eq!(values[1]["ok"], true, "{details}");
+    assert_eq!(values[2]["content"][0]["text"], "form accept", "{details}");
+    assert_eq!(values[3]["exit"], true, "{details}");
+    let decline = "No foreground operation can answer on piped stdin. Run the tool in the foreground, \
+                   or `wait` for the task on the stable lifecycle, to answer it.";
+    assert_eq!(stderr.matches(decline).count(), 2, "{stderr}");
+
+    let case = "piped stable task elicitation during wait";
+    let output = run_piped_prompt_case(
+        fixture,
+        "stable",
+        "--piped-prompts",
+        "ask &\nwait 1\nbridge-private-answer\nquit\n",
+        case,
+    )
+    .await;
+    let values = json_lines(&output, case);
+    let details = format!(
+        "{values:?}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(values.len(), 3, "{details}");
+    assert_eq!(values[0]["task"]["status"], "working", "{details}");
+    assert_eq!(values[1]["status"], "completed", "{details}");
+    assert_eq!(
+        values[1]["result"]["content"][0]["text"], "form accept",
+        "{details}"
+    );
+    assert_eq!(values[2]["exit"], true, "{details}");
+
+    let case = "piped final prompt continuation";
+    let output = run_piped_prompt_case(
+        fixture,
+        "2026-07-28",
+        "--piped-prompts-final",
+        "prompt ask_prompt\nbridge-private-answer\nquit\n",
+        case,
+    )
+    .await;
+    let values = json_lines(&output, case);
+    let details = format!(
+        "{values:?}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(values.len(), 2, "{details}");
+    assert_eq!(
+        values[0]["messages"][0]["content"]["text"], "final form accept",
+        "{details}"
+    );
+    assert_eq!(values[1]["exit"], true, "{details}");
+}
+
 /// `respond` only works where a task can report what it is waiting for, and
 /// the refusal has to explain the protocol rather than leak the framework's
 /// "task_get_detailed requires ..." transport error.
@@ -5332,6 +5428,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
     tokio::time::timeout(SUITE_TIMEOUT, async {
         let temp = TempDir::new().expect("temporary fixture directory");
         let fixture = build_fixture().await;
+        exercise_piped_foreground_prompts(&fixture).await;
         exercise_json_piped_startup(&fixture, &temp).await;
         exercise_session_driver(&fixture).await;
         #[cfg(unix)]
