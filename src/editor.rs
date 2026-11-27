@@ -981,14 +981,21 @@ fn run_piped_with(
     at_prompt: &AtomicBool,
 ) {
     let mut pending = String::new();
+    let mut command_number = 0;
     loop {
         let mut line = String::new();
         // The foreground handler can read the next line while this thread
         // waits for the command's ack.
-        let read = with_readline_terminal(at_prompt, || read_line(&mut line));
+        let read = with_readline_terminal(at_prompt, || {
+            tracing::debug!(command_number = command_number + 1, "reading piped input");
+            read_line(&mut line)
+        });
         match read {
             Ok(0) | Err(_) => {
-                if !pending.is_empty() && !dispatch_piped(&mut pending, line_tx, ack_rx) {
+                tracing::debug!(?read, "piped reader stopped reading");
+                if !pending.is_empty()
+                    && !dispatch_piped(&mut pending, line_tx, ack_rx, command_number + 1)
+                {
                     break;
                 }
                 let _ = line_tx.blocking_send("quit".to_string());
@@ -999,7 +1006,8 @@ fn run_piped_with(
                 if crate::command::is_incomplete(&pending) {
                     continue;
                 }
-                if !dispatch_piped(&mut pending, line_tx, ack_rx) {
+                command_number += 1;
+                if !dispatch_piped(&mut pending, line_tx, ack_rx, command_number) {
                     break;
                 }
             }
@@ -1011,6 +1019,7 @@ fn dispatch_piped(
     pending: &mut String,
     line_tx: &tokio::sync::mpsc::Sender<String>,
     ack_rx: &std::sync::mpsc::Receiver<()>,
+    command_number: usize,
 ) -> bool {
     let mut command = std::mem::take(pending);
     if command.ends_with('\n') {
@@ -1019,7 +1028,17 @@ fn dispatch_piped(
             command.pop();
         }
     }
-    line_tx.blocking_send(command).is_ok() && ack_rx.recv().is_ok()
+    tracing::debug!(command_number, "piped command read");
+    if line_tx.blocking_send(command).is_err() {
+        tracing::debug!(command_number, "piped command channel closed");
+        return false;
+    }
+    tracing::debug!(command_number, "piped command queued");
+    let acknowledged = ack_rx.recv().is_ok();
+    if acknowledged {
+        tracing::debug!(command_number, "piped command acknowledged");
+    }
+    acknowledged
 }
 
 #[allow(clippy::too_many_arguments)]

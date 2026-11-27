@@ -1417,7 +1417,8 @@ async fn wait_for_one(
     id: &str,
     limit: Option<Duration>,
 ) -> tower_mcp::Result<TaskObject> {
-    match limit {
+    tracing::debug!(task_id = ?id, "waiting for task via polling");
+    let result = match limit {
         None => client.task_wait(id).await,
         Some(limit) => match tokio::time::timeout(limit, client.task_wait(id)).await {
             Ok(result) => result,
@@ -1426,7 +1427,9 @@ async fn wait_for_one(
                 limit.as_secs()
             ))),
         },
-    }
+    };
+    tracing::debug!(task_id = ?id, success = result.is_ok(), "foreground task wait returned");
+    result
 }
 
 /// Record what a settled task means for the process exit status.
@@ -3387,38 +3390,15 @@ fn server_stderr_policy() -> std::process::Stdio {
 /// task-scoped `subscriptions/listen` stream for immediate notifications; the
 /// bounded polling loop remains authoritative for stable servers and for a
 /// final notification that is unavailable or dropped.
-fn watch_task(session: Arc<Session>, jobs: Arc<Jobs>, task_id: String, poll_interval: Option<u64>) {
-    if !jobs.automatic_updates_enabled() || jobs.is_terminal(&task_id) {
-        return;
-    }
-    tokio::spawn(async move {
-        let generation = session.generation();
-        let client = session.client();
-        let _subscription =
-            if client.selected_protocol_version().await.as_deref() == Some("2026-07-28") {
-                match client
-                    .listen_subscriptions(SubscriptionFilter {
-                        task_ids: Some(vec![task_id.clone()]),
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    Ok(mut handle) => match handle.acknowledged().await {
-                        Ok(accepted)
-                            if accepted
-                                .task_ids
-                                .as_ref()
-                                .is_some_and(|ids| ids.iter().any(|id| id == &task_id)) =>
-                        {
-                            Some(handle)
-                        }
-                        _ => None,
-                    },
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
+async fn watch_task(
+    session: Arc<Session>,
+    jobs: Arc<Jobs>,
+    task_id: String,
+    poll_interval: Option<u64>,
+) {
+    let generation = session.generation();
+    let client = session.client();
+    let poll = async {
         let mut interval_ms = poll_interval.unwrap_or(1000).clamp(50, 30_000);
         let mut consecutive_errors = 0;
         loop {
@@ -3429,6 +3409,7 @@ fn watch_task(session: Arc<Session>, jobs: Arc<Jobs>, task_id: String, poll_inte
             if jobs.is_terminal(&task_id) {
                 break;
             }
+            tracing::debug!(?task_id, interval_ms, "polling background task status");
             match client.task_get(&task_id).await {
                 Ok(task) => {
                     consecutive_errors = 0;
@@ -3447,7 +3428,46 @@ fn watch_task(session: Arc<Session>, jobs: Arc<Jobs>, task_id: String, poll_inte
                 }
             }
         }
-    });
+    };
+    // Keep the subscription alive alongside polling. Neither opening the
+    // stream nor receiving its first frame can hold up the polling timer.
+    tokio::pin!(poll);
+    tokio::select! {
+        // The client loop assigns the listen ID before handling subsequent
+        // polls. Take the handle first if both branches are ready so it can
+        // cancel the stream on drop. An early exit can still beat ID delivery
+        // during a session replacement, when the old transport is retiring.
+        biased;
+        () = subscribe_to_task(&client, &task_id) => poll.await,
+        () = &mut poll => {}
+    }
+}
+
+async fn subscribe_to_task(client: &McpClient, task_id: &str) {
+    if client.selected_protocol_version().await.as_deref() != Some("2026-07-28") {
+        return;
+    }
+    tracing::debug!("opening task subscription");
+    let Ok(mut handle) = client
+        .listen_subscriptions(SubscriptionFilter {
+            task_ids: Some(vec![task_id.to_owned()]),
+            ..Default::default()
+        })
+        .await
+    else {
+        return;
+    };
+    tracing::debug!(subscription_id = ?handle.id(), "task subscription request registered");
+    let Ok(accepted) = handle.acknowledged().await else {
+        return;
+    };
+    let task_accepted = accepted
+        .task_ids
+        .is_some_and(|ids| ids.iter().any(|id| id == task_id));
+    tracing::debug!(subscription_id = ?handle.id(), task_accepted, "task subscription acknowledged");
+    if task_accepted {
+        let _ = handle.wait().await;
+    }
 }
 
 /// The recipe for rebuilding an `--http` connection: a brand new transport
@@ -5915,6 +5935,7 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
         history_capacity,
     );
 
+    let mut command_number = 0;
     let host_lost = loop {
         tokio::select! {
             () = host_input::lost() => break true,
@@ -5937,6 +5958,8 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
             }
             maybe_line = line_rx.recv() => {
                 let Some(line) = maybe_line else { break false };
+                command_number += 1;
+                tracing::debug!(command_number, "dispatching editor command");
                 let ran = run_cancellable(
                     &session,
                     &surface,
@@ -5952,7 +5975,8 @@ async fn run(mut args: Args, bearer_from_fd: Option<String>) -> tower_mcp::Resul
                 // The editor is parked on this ack, so it has to be sent
                 // whether the command finished or was interrupted, or the
                 // prompt never comes back.
-                let _ = ack_tx.send(());
+                let sent = ack_tx.send(()).is_ok();
+                tracing::debug!(command_number, sent, "editor command finished");
                 match ran {
                     Ran::HostLost => break true,
                     Ran::Completed(true) => break false,
@@ -8812,7 +8836,14 @@ async fn run_tool(
                         )
                     );
                 }
-                watch_task(session.clone(), jobs.clone(), task_id, poll_interval);
+                if jobs.automatic_updates_enabled() && !jobs.is_terminal(&task_id) {
+                    tokio::spawn(watch_task(
+                        session.clone(),
+                        jobs.clone(),
+                        task_id,
+                        poll_interval,
+                    ));
+                }
             }
             Err(e) => report_mcp_error(&e),
         }
@@ -9721,22 +9752,22 @@ mod tests {
         );
     }
 
-    /// A single-response transport for pinning the final discovery wire shape.
-    struct DiscoveryTransport {
-        result: serde_json::Value,
+    /// A transport with scripted responses and a record of outgoing frames.
+    struct ScriptedTransport<F> {
+        respond: F,
         incoming_tx: tokio::sync::mpsc::Sender<String>,
         incoming_rx: tokio::sync::mpsc::Receiver<String>,
         outgoing: Arc<Mutex<Vec<serde_json::Value>>>,
         connected: bool,
     }
 
-    impl DiscoveryTransport {
-        fn new(result: serde_json::Value) -> (Self, Arc<Mutex<Vec<serde_json::Value>>>) {
+    impl<F: FnMut(&serde_json::Value) -> Option<serde_json::Value>> ScriptedTransport<F> {
+        fn new(respond: F) -> (Self, Arc<Mutex<Vec<serde_json::Value>>>) {
             let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(4);
             let outgoing = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
-                    result,
+                    respond,
                     incoming_tx,
                     incoming_rx,
                     outgoing: outgoing.clone(),
@@ -9774,17 +9805,22 @@ mod tests {
     }
 
     #[async_trait]
-    impl ClientTransport for DiscoveryTransport {
+    impl<F> ClientTransport for ScriptedTransport<F>
+    where
+        F: FnMut(&serde_json::Value) -> Option<serde_json::Value> + Send + 'static,
+    {
         async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
             let request: serde_json::Value = serde_json::from_str(message)?;
             self.outgoing.lock().unwrap().push(request.clone());
-            if let Some(id) = request.get("id") {
+            if let Some(id) = request.get("id")
+                && let Some(result) = (self.respond)(&request)
+            {
                 self.incoming_tx
                     .send(
                         serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": self.result,
+                            "result": result,
                         })
                         .to_string(),
                     )
@@ -10021,7 +10057,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_selection_uses_discover_with_required_metadata() {
-        let (transport, outgoing) = DiscoveryTransport::new(serde_json::json!({
+        let result = serde_json::json!({
             "resultType": "complete",
             "supportedVersions": ["2026-07-28"],
             "capabilities": {"tools": {}},
@@ -10033,7 +10069,8 @@ mod tests {
                     "version": "1.0.0"
                 }
             }
-        }));
+        });
+        let (transport, outgoing) = ScriptedTransport::new(move |_| Some(result.clone()));
         let client = client_builder(ProtocolMode::Final, None)
             .unwrap()
             .connect_simple(transport)
@@ -10074,7 +10111,7 @@ mod tests {
     /// `initialize` is never sent at all.
     #[tokio::test]
     async fn auto_prefers_discover_and_never_sends_initialize_when_it_succeeds() {
-        let (transport, outgoing) = DiscoveryTransport::new(serde_json::json!({
+        let result = serde_json::json!({
             "resultType": "complete",
             "supportedVersions": ["2026-07-28"],
             "capabilities": {"tools": {}},
@@ -10086,7 +10123,8 @@ mod tests {
                     "version": "1.0.0"
                 }
             }
-        }));
+        });
+        let (transport, outgoing) = ScriptedTransport::new(move |_| Some(result.clone()));
         // `Fn` cannot move a captured value out on each call; `Option::take`
         // both supplies the single transport this scenario needs and turns a
         // second, unexpected attempt into an immediate panic instead of a
@@ -11739,6 +11777,96 @@ world",
             jobs.list()[0].status,
             tower_mcp::protocol::TaskStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn final_task_watcher_polls_without_subscription_acknowledgment() {
+        use serde_json::{Value, json};
+        use tower_mcp::protocol::TaskStatus;
+
+        let mut polls = 0;
+        let (transport, outgoing) = ScriptedTransport::new(move |request: &Value| {
+            match request["method"].as_str().unwrap() {
+                "server/discover" => Some(json!({
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"tasks": {}},
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                    "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "task-test", "version": "0"}},
+                })),
+                // Keep the connection open without sending a subscription ack
+                // or any notifications. Only tasks/get can report progress.
+                "subscriptions/listen" => None,
+                "tasks/get" => {
+                    assert_eq!(request["params"]["taskId"], "task-1");
+                    polls += 1;
+                    let mut response = json!({
+                        "resultType": "complete",
+                        "taskId": "task-1",
+                        "status": "working",
+                        "createdAt": "2026-07-28T00:00:00Z",
+                        "lastUpdatedAt": "2026-07-28T00:00:01Z",
+                        "ttlMs": null,
+                        "pollIntervalMs": 75,
+                    });
+                    if polls == 2 {
+                        response["status"] = json!("completed");
+                        response["result"] = json!({"resultType": "complete", "content": []});
+                    }
+                    Some(response)
+                }
+                method => panic!("unexpected request: {method}"),
+            }
+        });
+        let client = client_builder(ProtocolMode::Final, None)
+            .unwrap()
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        establish_connection(&client, ProtocolMode::Final)
+            .await
+            .unwrap();
+        let session = Arc::new(Session::new(client, None));
+        let jobs = Arc::new(Jobs::new(
+            AsyncOutput::new(Arc::new(AtomicBool::new(false)), false),
+            true,
+        ));
+        jobs.register(
+            "task-1".into(),
+            "slow_add".into(),
+            TaskStatus::Working,
+            None,
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            watch_task(session.clone(), jobs.clone(), "task-1".into(), Some(50)),
+        )
+        .await
+        .expect("a pending subscription must not block task polling");
+
+        assert_eq!(jobs.list()[0].status, TaskStatus::Completed);
+        // Shutdown follows the cancellation in the client command queue.
+        session.close().await.unwrap();
+        let sent = outgoing.lock().unwrap();
+        let listen = sent
+            .iter()
+            .find(|frame| frame["method"] == "subscriptions/listen")
+            .expect("the watcher opened a subscription");
+        assert_eq!(
+            listen["params"]["notifications"]["taskIds"],
+            json!(["task-1"])
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|frame| frame["method"] == "tasks/get")
+                .count(),
+            2
+        );
+        let cancel = sent.last().expect("the watcher cancelled the subscription");
+        assert_eq!(cancel["method"], "notifications/cancelled");
+        assert_eq!(cancel["params"]["requestId"], listen["id"]);
     }
 
     /// A session whose connector builds a fresh demo client, counting how
