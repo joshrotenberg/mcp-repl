@@ -148,8 +148,15 @@ cratesio> tools
 ... 80 more of 100; `tools --full` shows everything
 ```
 
-`--full` prints every row. Truncation is interactive-only: `--exec` and
-`--json` output is a data stream and is never trimmed.
+`--full` prints every row. The row limit applies only when stdout is a terminal.
+Piped and `--json` output list every row.
+
+Text listings, including `find`, bare `help`, and the startup tool overview,
+show the first non-empty line of each description, with whitespace trimmed and
+runs of whitespace collapsed to a single space. When stdout is a terminal,
+descriptions end in `…` if they exceed the space left on the row. Piped text
+keeps the whole normalized line. JSON output and captures keep the full
+description, as do `describe <name>` and `help <command>`.
 
 Under `--json` or in a capture, `tools --brief` (likewise `prompts`,
 `resources`, `templates`) keeps only each entry's name, title, and

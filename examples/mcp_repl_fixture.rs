@@ -59,7 +59,7 @@ fn fixture_router() -> McpRouter {
         )
         .tool(
             ToolBuilder::new("add")
-                .description("Add two integers")
+                .description("\n  Add two integers  \n\nThe arguments a and b are required.")
                 .handler(|input: AddInput| async move {
                     Ok(CallToolResult::text((input.a + input.b).to_string()))
                 })

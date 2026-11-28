@@ -4,6 +4,7 @@
 //! All color degrades to plain text when `NO_COLOR` is set or stdout is
 //! not a terminal, so piped output stays clean.
 
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 
@@ -37,7 +38,8 @@ pub fn init(mode: ColorMode) {
 }
 
 fn auto_detect() -> bool {
-    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+    // Keep unit test output stable when the test runner has a terminal.
+    !cfg!(test) && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
 }
 
 /// Whether ANSI styling is active.
@@ -61,6 +63,49 @@ pub fn paint(style: Style, text: &str) -> String {
 /// adds are not drawn at all.
 pub fn display_width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// Normalize whitespace on the first non-empty line and fit the description
+/// to the available columns. With no width, keep the whole line for piped text.
+pub fn listing_description(text: &str, width: Option<usize>) -> Cow<'_, str> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let line = sanitize(line);
+    let line = if line.contains("  ") || line.chars().any(|c| c != ' ' && c.is_whitespace()) {
+        Cow::Owned(line.split_whitespace().collect::<Vec<_>>().join(" "))
+    } else {
+        line
+    };
+    truncate_width(line, width)
+}
+
+/// Fit sanitized single-line text to the given width. Truncation uses
+/// code-point boundaries and may split a grapheme cluster.
+pub fn truncate_width(line: Cow<'_, str>, width: Option<usize>) -> Cow<'_, str> {
+    let Some(width) = width else { return line };
+    if display_width(&line) <= width {
+        return line;
+    }
+
+    const ELLIPSIS: &str = "…";
+    let Some(content_width) = width.checked_sub(display_width(ELLIPSIS)) else {
+        return Cow::Borrowed("");
+    };
+    let mut end = 0;
+    let mut upper = line.len();
+    while end < upper {
+        let middle = line.ceil_char_boundary(end + (upper - end).div_ceil(2));
+        if display_width(&line[..middle]) <= content_width {
+            end = middle;
+        } else {
+            upper = line.floor_char_boundary(middle - 1);
+        }
+    }
+    let prefix = line[..end].trim_end();
+    Cow::Owned(format!("{prefix}{ELLIPSIS}"))
 }
 
 /// A styled left-aligned column of `width` visible columns.
@@ -331,6 +376,37 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn listing_description_keeps_only_the_first_nonempty_line() {
+        assert_eq!(listing_description("  first  \nsecond", None), "first");
+        assert_eq!(
+            listing_description("\r\n \t\r\n  first  \r\nsecond", None),
+            "first"
+        );
+        assert_eq!(listing_description("", None), "");
+        assert_eq!(listing_description(" \n\t\r\n", Some(4)), "");
+    }
+
+    #[test]
+    fn listing_description_fits_the_available_columns() {
+        let text = "名前 e\u{301}xyz\nDetails";
+        assert_eq!(listing_description(text, None), "名前 e\u{301}xyz");
+        assert_eq!(listing_description(text, Some(9)), "名前 e\u{301}xyz");
+        assert_eq!(listing_description(text, Some(7)), "名前 e\u{301}…");
+        assert_eq!(listing_description(text, Some(5)), "名前…");
+        assert_eq!(listing_description(text, Some(1)), "…");
+        assert_eq!(listing_description(text, Some(0)), "");
+        assert!(display_width(&listing_description("x❤️ more", Some(3))) <= 3);
+    }
+
+    #[test]
+    fn listing_description_sanitizes_before_measuring() {
+        let text = "a\t  \u{a0}\u{1b}[2Jb\rc\nignored";
+        assert_eq!(listing_description(text, None), "a �b�c");
+        assert_eq!(listing_description(text, Some(5)), "a �b…");
+        assert_eq!(listing_description(r"a\tb", None), r"a\tb");
     }
 
     #[test]

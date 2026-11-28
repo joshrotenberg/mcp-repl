@@ -2116,6 +2116,105 @@ fn listing_limit() -> Option<usize> {
     Some(rows.saturating_sub(RESERVED).max(5))
 }
 
+fn listing_terminal_width() -> Option<usize> {
+    if json_output() || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return None;
+    }
+    let (columns, _) = crossterm::terminal::size().ok()?;
+    (columns > 0).then_some(usize::from(columns))
+}
+
+fn listing_row(
+    (name, column_width): (&str, usize),
+    (detail, detail_style, detail_column_width): (&str, Style, Option<usize>),
+    description: &str,
+    tags: &str,
+    width: Option<usize>,
+) -> String {
+    let name = untrusted::sanitize_inline(name);
+    let detail = style::truncate_width(untrusted::sanitize_inline(detail), detail_column_width);
+    let detail_width = detail_column_width.unwrap_or_else(|| style::display_width(&detail));
+    let has_detail = detail_width > 0 || !detail.is_empty();
+    let occupied = column_width.max(style::display_width(&name))
+        + detail_width
+        + usize::from(has_detail)
+        + style::display_width(tags)
+        + usize::from(!tags.is_empty());
+    let description = style::listing_description(
+        description,
+        width.map(|width| width.saturating_sub(occupied + 1)),
+    );
+
+    let mut row = style::column(Style::new().fg(Color::Green), &name, column_width);
+    if has_detail {
+        row.push(' ');
+        row.push_str(&style::column(detail_style, &detail, detail_width));
+    }
+    if !description.is_empty() {
+        row.push(' ');
+        row.push_str(&description);
+    }
+    if !tags.is_empty() {
+        row.push(' ');
+        row.push_str(&paint(Style::new().dimmed(), tags));
+    }
+    row.truncate(row.trim_end().len());
+    row
+}
+
+fn tool_listing_row(tool: &ToolDefinition, width: Option<usize>) -> String {
+    let tags = tool_tags(tool);
+    let tags = if tags.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", tags.join(" "))
+    };
+    listing_row(
+        (&tool.name, 24),
+        ("", Style::new(), None),
+        tool.description.as_deref().unwrap_or_default(),
+        &tags,
+        width,
+    )
+}
+
+fn resource_column_widths<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a str)>,
+    width: Option<usize>,
+) -> (usize, usize) {
+    const MIN_URI_WIDTH: usize = 40;
+    const MAX_NAME_WIDTH: usize = 24;
+    let mut uri_width = MIN_URI_WIDTH;
+    let mut name_width = 0;
+    for (uri, name) in entries {
+        uri_width = uri_width.max(style::display_width(&untrusted::sanitize_inline(uri)));
+        name_width = name_width.max(style::display_width(&untrusted::sanitize_inline(name)));
+    }
+    let name_width = name_width.min(MAX_NAME_WIDTH);
+    if let Some(width) = width {
+        // Keep an oversized URI from pushing other rows past the terminal.
+        let reserved = name_width + usize::from(name_width > 0) + 2;
+        uri_width = uri_width.min(width.saturating_sub(reserved).max(MIN_URI_WIDTH));
+    }
+    (uri_width, name_width)
+}
+
+fn resource_listing_row(
+    uri: &str,
+    name: &str,
+    (uri_width, name_width): (usize, usize),
+    description: Option<&str>,
+    width: Option<usize>,
+) -> String {
+    listing_row(
+        (uri, uri_width),
+        (name, Style::new(), Some(name_width)),
+        description.unwrap_or_default(),
+        "",
+        width,
+    )
+}
+
 /// Print at most `limit` of `total` rows, and say what was held back.
 ///
 /// `full` is the flag the user passes to see the rest, named in the notice
@@ -2163,13 +2262,9 @@ fn print_tool_overview(surface: &Surface) {
     // Half the window: the banner shares the first screen with the counts,
     // the hint line, and the prompt.
     let cap = listing_limit().map_or(listed.len(), |rows| (rows / 2).max(5));
+    let width = listing_terminal_width();
     for t in listed.iter().take(cap) {
-        diag_println!(
-            "{} {}{}",
-            style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-            sanitize(t.description.as_deref().unwrap_or("")),
-            tool_tag_suffix(t)
-        );
+        diag_println!("{}", tool_listing_row(t, width));
     }
     if listed.len() > cap {
         diag_println!(
@@ -2232,13 +2327,19 @@ fn print_find(surface: &Surface, query: &find::Query, output: &vars::Output) {
         return;
     }
     let total = hits.len();
+    let width = listing_terminal_width().map(|width| width.saturating_sub(2));
     for (kind, group) in find::grouped(hits) {
         println!("{}:", paint(Style::new().bold(), kind.heading()));
         for hit in group {
             println!(
-                "  {} {}",
-                style::column(Style::new().fg(Color::Green), &sanitize(&hit.name), 24),
-                sanitize(&hit.description)
+                "  {}",
+                listing_row(
+                    (&hit.name, 24),
+                    ("", Style::new(), None),
+                    &hit.description,
+                    "",
+                    width,
+                )
             );
         }
     }
@@ -7054,11 +7155,17 @@ async fn handle_line(
             let (listed, hidden) = tool_policy::listed_tools(s.tools(), policy.as_deref(), false);
             if !listed.is_empty() {
                 println!("tools:");
+                let width = listing_terminal_width().map(|width| width.saturating_sub(2));
                 for t in listed {
                     println!(
-                        "  {} {}",
-                        style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-                        sanitize(t.description.as_deref().unwrap_or(""))
+                        "  {}",
+                        listing_row(
+                            (&t.name, 24),
+                            ("", Style::new(), None),
+                            t.description.as_deref().unwrap_or_default(),
+                            "",
+                            width,
+                        )
                     );
                 }
             }
@@ -7118,17 +7225,13 @@ async fn handle_line(
             // trimmed to the window so the prompt stays in view.
             let full = rest.contains(&"--full");
             let limit = if full { None } else { listing_limit() };
+            let width = listing_terminal_width();
             match cmd {
                 "tools" => {
                     let total = listed.len();
                     let shown = limit.unwrap_or(total).min(total);
                     for t in listed.iter().take(shown) {
-                        println!(
-                            "{} {}{}",
-                            style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-                            sanitize(t.description.as_deref().unwrap_or("")),
-                            tool_tag_suffix(t)
-                        );
+                        println!("{}", tool_listing_row(t, width));
                     }
                     note_truncation(shown, total, "tools --full");
                     print_hidden_note(hidden, Some("tools --all"));
@@ -7142,17 +7245,21 @@ async fn handle_line(
                             .iter()
                             .map(|a| {
                                 if a.required {
-                                    format!("<{}>", sanitize(&a.name))
+                                    format!("<{}>", untrusted::sanitize_inline(&a.name))
                                 } else {
-                                    format!("[{}]", sanitize(&a.name))
+                                    format!("[{}]", untrusted::sanitize_inline(&a.name))
                                 }
                             })
                             .collect();
                         println!(
-                            "{} {} {}",
-                            style::column(Style::new().fg(Color::Green), &sanitize(&p.name), 24),
-                            paint(Style::new().fg(Color::Cyan), &args.join(" ")),
-                            sanitize(p.description.as_deref().unwrap_or(""))
+                            "{}",
+                            listing_row(
+                                (&p.name, 24),
+                                (&args.join(" "), Style::new().fg(Color::Cyan), None),
+                                p.description.as_deref().unwrap_or_default(),
+                                "",
+                                width,
+                            )
                         );
                     }
                     note_truncation(shown, total, "prompts --full");
@@ -7160,11 +7267,23 @@ async fn handle_line(
                 "resources" => {
                     let total = s.resources().len();
                     let shown = limit.unwrap_or(total).min(total);
+                    let columns = resource_column_widths(
+                        s.resources()
+                            .iter()
+                            .take(shown)
+                            .map(|r| (r.uri.as_str(), r.name.as_str())),
+                        width,
+                    );
                     for r in s.resources().iter().take(shown) {
                         println!(
-                            "{} {}",
-                            style::column(Style::new().fg(Color::Green), &sanitize(&r.uri), 40),
-                            sanitize(&r.name)
+                            "{}",
+                            resource_listing_row(
+                                &r.uri,
+                                &r.name,
+                                columns,
+                                r.description.as_deref(),
+                                width,
+                            )
                         );
                     }
                     note_truncation(shown, total, "resources --full");
@@ -7186,15 +7305,23 @@ async fn handle_line(
                 _ => {
                     let total = s.templates().len();
                     let shown = limit.unwrap_or(total).min(total);
+                    let columns = resource_column_widths(
+                        s.templates()
+                            .iter()
+                            .take(shown)
+                            .map(|t| (t.uri_template.as_str(), t.name.as_str())),
+                        width,
+                    );
                     for t in s.templates().iter().take(shown) {
                         println!(
-                            "{} {}",
-                            style::column(
-                                Style::new().fg(Color::Green),
-                                &sanitize(&t.uri_template),
-                                40
-                            ),
-                            sanitize(&t.name)
+                            "{}",
+                            resource_listing_row(
+                                &t.uri_template,
+                                &t.name,
+                                columns,
+                                t.description.as_deref(),
+                                width,
+                            )
                         );
                     }
                     note_truncation(shown, total, "templates --full");
@@ -8821,19 +8948,6 @@ fn parse_wait_timeout<'a>(
     Ok((limit, remaining))
 }
 
-/// The tags as they trail a listing row, or empty when the server declared
-/// none.
-fn tool_tag_suffix(tool: &ToolDefinition) -> String {
-    let tags = tool_tags(tool);
-    if tags.is_empty() {
-        return String::new();
-    }
-    format!(
-        " {}",
-        paint(Style::new().dimmed(), &format!("[{}]", tags.join(" ")))
-    )
-}
-
 /// A ready-to-run invocation synthesized from a tool's input schema:
 /// required arguments first with their types as placeholders, then optional
 /// ones in brackets. Long argument lists are trimmed, since the point is to
@@ -9440,6 +9554,78 @@ mod tests {
 
     use async_trait::async_trait;
     use tower_mcp::client::ClientTransport;
+
+    #[test]
+    fn listing_row_fits_descriptions_around_names_arguments_and_tags() {
+        assert!(!style::colors_enabled());
+        let width = 44;
+        let description = "Description that needs to be shortened.";
+        let long_name = "a-tool-name-longer-than-24";
+        let rows = [
+            listing_row(
+                ("read", 24),
+                ("", Style::new(), None),
+                description,
+                "[read-only]",
+                Some(width),
+            ),
+            listing_row(
+                ("greet", 24),
+                ("<who>\t[place]", Style::new().fg(Color::Cyan), None),
+                description,
+                "",
+                Some(width),
+            ),
+            listing_row(
+                (long_name, 24),
+                ("", Style::new(), None),
+                description,
+                "",
+                Some(width),
+            ),
+        ];
+        for row in &rows {
+            assert!(row.contains('…'), "{row}");
+            assert!(style::display_width(row) <= width, "{row}");
+        }
+        assert!(rows[0].ends_with(" [read-only]"));
+        assert!(rows[1].contains(r"<who>\t[place]"));
+        assert!(rows[2].starts_with(long_name));
+    }
+
+    #[test]
+    fn resource_listing_row_aligns_descriptions_after_the_name_column() {
+        let short_uri = "mcp://guide";
+        let long_uri = "mcp://a/resource/whose/uri/exceeds/forty/columns";
+        let short_name = "Guide";
+        let long_name = "A resource name longer than its column";
+        let entries = [(short_uri, short_name), (long_uri, long_name)];
+        let columns = resource_column_widths(entries.into_iter(), Some(96));
+        let description = "Documentation";
+        let short_row =
+            resource_listing_row(short_uri, short_name, columns, Some(description), Some(96));
+        let long_row =
+            resource_listing_row(long_uri, long_name, columns, Some(description), Some(96));
+        assert_eq!(columns, (long_uri.len(), 24));
+        assert!(long_row.starts_with(long_uri));
+        assert!(long_row.contains('…'));
+        for row in [short_row, long_row] {
+            let prefix = row.strip_suffix(description).expect("full description");
+            assert_eq!(style::display_width(prefix), long_uri.len() + 1 + 24 + 1);
+        }
+
+        let width = 70;
+        let columns = resource_column_widths(entries.into_iter(), Some(width));
+        let short_row = resource_listing_row(
+            short_uri,
+            short_name,
+            columns,
+            Some(description),
+            Some(width),
+        );
+        assert!(short_row.ends_with('…'));
+        assert!(style::display_width(&short_row) <= width);
+    }
 
     #[test]
     fn generated_tail_requires_an_explicit_selector_and_preserves_child_argv() {
