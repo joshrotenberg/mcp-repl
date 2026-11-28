@@ -98,6 +98,10 @@ session. A worker handle goes to its own tool's lifecycle API.
 mcp-repl --demo --json -e 'slow_add a=1 b=2 &' -e 'wait last --timeout 30'
 ```
 
+A wait that runs out exits with status 4 and an error with `kind: "timeout"`,
+`pending: true` and the `taskId`, unlike `kind: "transport"` for a failed
+connection. The task is still running, so wait on it again or cancel it.
+
 An accepted start or a timed-out wait leaves the outcome open. Wait for
 settlement and read the authoritative result before reporting completion. On
 interruption or failure, use documented cancel or cleanup operations only for

@@ -457,6 +457,41 @@ cancelled sets the process exit status (3 and 6 respectively), so a script can
 tell the work failed rather than only that it finished. `--timeout` on `wait`
 applies per task.
 
+When that deadline passes while the connection is healthy, the task is still
+running: `wait` on it again or `cancel` it. The exit status is 4, as in
+earlier releases, but the `--json` envelope has `kind: "timeout"`, the
+`taskId`, and `pending: true`, so a script can tell it from a broken
+connection without reading the message:
+
+```json
+{"error":"task 0123abcd did not settle within 1s (--timeout)","kind":"timeout","exitStatus":4,"taskId":"0123abcd","pending":true}
+```
+
+In human mode the same message goes to stderr with a hint:
+
+```console
+error: task 0123abcd did not settle within 1s (--timeout)
+  hint: the task is still running; `wait` on it again or `cancel` it
+```
+
+With `--host-input-fd`, a host can answer a parked task too late: the next
+poll slot falls after the deadline, so the answers cannot be checked against
+the task and none are sent. `wait` then reports the same `timeout` envelope
+with `"answersSent": false`, and the message names `task <id> respond`.
+
+A deadline that interrupts a reconnect after a lost connection is a
+connection failure, not a pending task. It has exit status 4 and
+`kind: "transport"`, with a message saying the reconnect did not finish
+within the `--timeout`.
+
+One case still reports `kind: "transport"` for a healthy connection: in
+bridge mode, if the read that checks the host's answers succeeds but finishes
+after the deadline, the answers are not sent and the error is a transport
+error.
+
+Releases up to 0.5.0 reported every wait deadline as `kind: "transport"` with
+a message starting `Transport error:`.
+
 The demo server's `fail` tool is task-capable and always fails, so both halves
 of that are visible without a server of your own:
 
@@ -515,7 +550,7 @@ name exists. Process statuses are stable:
 | 1 | no-match: the command ran and the thing asked about is not there (`find` matched nothing, `describe`/`bench` named something absent) |
 | 2 | local invocation or command usage error, including an unrecognized command word and a tool call refused by the tool policy |
 | 3 | server rejection or tool error result |
-| 4 | transport or protocol connection failure (including a `--timeout`) |
+| 4 | transport or protocol connection failure (including a `--timeout`); also a `wait --timeout` that ran out on a healthy connection, which has `kind: "timeout"` and `pending: true` under `--json` |
 | 5 | authentication or authorization failure reported by the server or the transport |
 | 6 | the run was interrupted with Ctrl-C |
 
