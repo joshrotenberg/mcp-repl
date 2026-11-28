@@ -570,6 +570,60 @@ async fn no_update_is_sent_without_a_check_before_the_deadline() {
     client.shutdown().await.unwrap();
 }
 
+/// #390: when `wait` drops host answers because the next poll slot falls
+/// after its deadline, the connection is healthy and the task is still
+/// parked, so it is a pending wait (which the session driver keeps) rather
+/// than a transport failure (which ends the session). A foreground call
+/// keeps the transport failure.
+#[tokio::test]
+async fn an_unchecked_answer_during_wait_is_a_pending_wait_deadline() {
+    for tool in [None, Some("probe")] {
+        let (host, mut frames, connection) = host();
+        let (client, mut server) = connect().await;
+        let jobs = jobs();
+        let session = host.session(connection.0);
+        let id = "unchecked-wait-task";
+        server.set(parked(id, &["a"], 20_000));
+        let deadline = Some(Instant::now() + Duration::from_secs(5));
+        let script = async {
+            let question = next(&mut frames, "needs_input").await;
+            response(&host, &session, frame_id(&question), accept());
+        };
+        let (result, ()) = within(async {
+            tokio::join!(
+                wait_for_task(&client, &host, &jobs, tool, id, deadline),
+                script
+            )
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(ExitStatus::from_mcp_error(&error), ExitStatus::Transport);
+        match tool {
+            None => {
+                let (marker, message) =
+                    crate::jobs::wait_deadline(&error).expect("a pending wait deadline");
+                assert_eq!(marker.task_id, id);
+                assert!(marker.answers_unsent);
+                assert!(message.contains("answers were not sent"), "{message}");
+                assert!(message.contains("respond"), "{message}");
+                assert!(super::super::explicit_failure(&error).is_none());
+            }
+            Some(_) => {
+                assert!(crate::jobs::wait_deadline(&error).is_none());
+                let failure = super::super::explicit_failure(&error).unwrap();
+                assert!(
+                    failure.message.contains("nothing was sent"),
+                    "{}",
+                    failure.message
+                );
+            }
+        }
+        assert_eq!(server.drain_reads().len(), 1);
+        server.assert_no_request();
+        client.shutdown().await.unwrap();
+    }
+}
+
 /// Review finding 1: a check that finishes after the command deadline does
 /// not lead to an update.
 #[tokio::test]

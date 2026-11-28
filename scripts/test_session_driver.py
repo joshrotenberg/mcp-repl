@@ -45,6 +45,47 @@ MARKERS = {
 }
 
 
+# A `wait --timeout` that ran out, as each mcp-repl release reports it. The
+# structured envelopes use wording no legacy matcher accepts, so only their
+# fields can make them pending. Then 0.5.0, then the wording before it.
+PENDING_ENVELOPES = (
+    {"error": "the wait for this task ran out; fields decide", "kind": "timeout",
+     "exitStatus": 4, "taskId": "t1", "pending": True},
+    {"error": "task 1 (t1) did not settle before --timeout; the host's answers were not sent",
+     "kind": "timeout", "exitStatus": 4, "taskId": "t1", "pending": True,
+     "answersSent": False},
+    {"error": "Transport error: task t1 did not settle within 1s (--timeout)",
+     "kind": "transport", "exitStatus": 4},
+    {"error": "task t1 was still running after 1s (--timeout)",
+     "kind": "transport", "exitStatus": 4},
+)
+LEGACY_TEXT = "task t1 did not settle within 1s (--timeout)"
+# Exit status 4 envelopes that do not describe this task still pending.
+NOT_PENDING_ENVELOPES = {
+    "pending-other-task": {"error": LEGACY_TEXT, "kind": "timeout", "exitStatus": 4,
+                           "taskId": "t2", "pending": True},
+    "pending-unmarked-timeout": {"error": LEGACY_TEXT, "kind": "timeout",
+                                 "exitStatus": 4, "taskId": "t1"},
+    "pending-not-true": {"error": LEGACY_TEXT, "kind": "timeout", "exitStatus": 4,
+                         "taskId": "t1", "pending": "true"},
+    "pending-transport": {"error": "Transport error: connection closed",
+                          "kind": "transport", "exitStatus": 4},
+    # A transport envelope with structured fields is not a legacy one, even
+    # with the legacy wording.
+    "pending-transport-flagged": {"error": "Transport error: " + LEGACY_TEXT,
+                                  "kind": "transport", "exitStatus": 4, "pending": True},
+    "pending-transport-other-task": {"error": LEGACY_TEXT, "kind": "transport",
+                                     "exitStatus": 4, "taskId": "t2"},
+    "pending-transport-same-task": {"error": LEGACY_TEXT, "kind": "transport",
+                                    "exitStatus": 4, "taskId": "t1"},
+    # The reconnect a wait deadline interrupted is a connection failure.
+    "pending-reconnect": {"error": "Transport error: the connection was lost while waiting "
+                                   "for task t1, and the reconnect did not finish within 1s "
+                                   "(--timeout)",
+                          "kind": "transport", "exitStatus": 4},
+}
+
+
 class ApplicationError(Exception):
     pass
 
@@ -177,6 +218,11 @@ class DriverTests(_FixtureTests):
                 session.wait_task(task, timeout=0.1)
             self.assertEqual(pending.exception.request_id, task.request_id + 1)
             self.assertEqual(str(pending.exception), pending.exception.response["error"])
+            self.assertNotIn("Transport error", str(pending.exception))
+            self.assertEqual(pending.exception.response["kind"], "timeout")
+            self.assertIs(pending.exception.response["pending"], True)
+            self.assertEqual(pending.exception.response["taskId"], task.task_id)
+            self.assertEqual(pending.exception.response["exitStatus"], 4)
             with self.assertRaises(ValueError):
                 session.start_task("task_pending", {})
             cancelled = session.cancel_task(task)
@@ -631,6 +677,19 @@ def fake_peer(mode, fd=None):
         send(b'{"task":{"taskId":"new"}}\n')
         expect("builtin cancel last")
         send(b'{"taskId":"new","status":"cancelled"}\n')
+    elif mode == "pending-task":
+        expect('builtin call "probe" {} &')
+        send(b'{"task":{"taskId":"t1"}}\n')
+        for envelope in PENDING_ENVELOPES:
+            expect("builtin wait last --timeout 1")
+            send(json.dumps(envelope).encode("utf-8") + b"\n")
+        expect("builtin cancel last")
+        send(b'{"taskId":"t1","status":"cancelled"}\n')
+    elif mode in NOT_PENDING_ENVELOPES:
+        expect('builtin call "probe" {} &')
+        send(b'{"task":{"taskId":"t1"}}\n')
+        expect("builtin wait last --timeout 1")
+        send(json.dumps(NOT_PENDING_ENVELOPES[mode]).encode("utf-8") + b"\n")
     elif mode == "cooperative-cancel":
         expect('builtin call "probe" {} &')
         send(b'{"task":{"taskId":"old"}}\n')
@@ -751,6 +810,29 @@ class PipeTests(unittest.TestCase):
             new = session.start_task("probe", {})
             self.assertEqual(new.request_id, error.exception.request_id + 1)
             self.assertEqual(session.cancel_task(new).value["taskId"], "new")
+
+    def test_wait_timeout_is_pending_for_current_and_older_builds(self):
+        with self.session("pending-task") as session:
+            task = session.start_task("probe", {})
+            for envelope in PENDING_ENVELOPES:
+                with self.subTest(kind=envelope["kind"], error=envelope["error"]):
+                    with self.assertRaises(TaskPending) as pending:
+                        session.wait_task(task, timeout=1)
+                    self.assertEqual(str(pending.exception), envelope["error"])
+                    self.assertEqual(pending.exception.response, envelope)
+            self.assertEqual(session.cancel_task(task).value["status"], "cancelled")
+        self.assertEqual(session.returncode, 0)
+
+    def test_wait_failure_that_is_not_this_task_pending_ends_session(self):
+        for mode in NOT_PENDING_ENVELOPES:
+            with self.subTest(mode=mode), patch(
+                "session_driver.subprocess.Popen", side_effect=fake_popen(mode),
+            ):
+                with Session([sys.executable], repl=sys.executable) as session:
+                    task = session.start_task("probe", {})
+                    with self.assertRaises(SessionLost) as lost:
+                        session.wait_task(task, timeout=1)
+                self.assertEqual(session.returncode, 0)
 
     def test_nonterminal_cancel_keeps_task_for_wait(self):
         with self.session("cooperative-cancel") as session:

@@ -1297,6 +1297,87 @@ async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
     );
 }
 
+async fn exercise_listing_descriptions(fixture: &Path, temp: &TempDir) {
+    let description = "\n  Add two integers  \n\nThe arguments a and b are required.";
+    let query = "find --tools arguments a and b are required";
+    let text = run_stdio(
+        fixture,
+        temp,
+        "listing-descriptions-text",
+        &[
+            "--verbose",
+            "--color",
+            "never",
+            "-e",
+            "tools",
+            "-e",
+            "help",
+            "-e",
+            query,
+            "-e",
+            "describe add",
+        ],
+    )
+    .await;
+    assert_success(&text, "text listing descriptions");
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| {
+                line.trim_start()
+                    .split_once(' ')
+                    .is_some_and(|(name, text)| name == "add" && text.trim() == "Add two integers")
+            })
+            .count(),
+        4,
+        "startup, tools, help, and find should each show one line: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("tool add  {description}")),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("The arguments a and b are required.")
+            .count(),
+        1
+    );
+
+    let json = run_stdio(
+        fixture,
+        temp,
+        "listing-descriptions-json",
+        &[
+            "--json",
+            "-e",
+            "tools",
+            "-e",
+            "tools --brief",
+            "-e",
+            query,
+            "-e",
+            &format!("found = {query}"),
+            "-e",
+            "vars",
+        ],
+    )
+    .await;
+    assert_success(&json, "JSON listing descriptions");
+    let values = json_lines(&json, "JSON listing descriptions");
+    assert_eq!(values.len(), 5);
+    for listing in &values[..4] {
+        let tool = listing
+            .as_array()
+            .expect("listing array")
+            .iter()
+            .find(|tool| tool["name"] == "add")
+            .expect("add in listing");
+        assert_eq!(tool["description"], description);
+    }
+    assert_eq!(values[4]["found"], values[2]);
+}
+
 /// `last` ran after a refused prompt call: it must show an earlier request,
 /// proving it had something to show, and that request must not be the
 /// refused `prompts/get`.
@@ -1758,6 +1839,60 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
         stdout.contains("tool error"),
         "a failed task settles as `completed`, so the error needs saying:\n{stdout}"
     );
+
+    // #390: a `wait --timeout` that runs out leaves a healthy connection and
+    // a usable task, so it keeps exit status 4 but must not call itself a
+    // transport failure. The fixture's `task_pending` never settles, so the
+    // deadline always wins; the `cancel` after it shows the task still works.
+    let exit_file = temp.path().join("exec-wait-timeout.exit");
+    let mut command = repl_command();
+    command
+        .args([
+            "--protocol",
+            "2026-07-28",
+            "--no-history",
+            "--color",
+            "never",
+            "--json",
+            "--exec",
+            "task_pending &",
+            "--exec",
+            "builtin wait last --timeout 1",
+            "--exec",
+            "builtin cancel last",
+            "--",
+        ])
+        .arg(fixture)
+        .arg("--session-driver")
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let pending = run(command, "exec-wait-timeout", CASE_TIMEOUT).await;
+    assert_eq!(
+        wait_for_file(&exit_file, "stdio fixture shutdown").await,
+        "clean",
+        "mcp-repl left its stdio child running"
+    );
+    assert_status(&pending, 4, "exec wait timeout");
+    let values = json_lines(&pending, "exec wait timeout");
+    assert_eq!(values.len(), 3, "{values:?}");
+    let task_id = values[0]["task"]["taskId"]
+        .as_str()
+        .expect("task-creation result names the task");
+    let timeout = &values[1];
+    assert_eq!(timeout["kind"], "timeout", "{timeout}");
+    assert_eq!(timeout["pending"], true, "{timeout}");
+    assert_eq!(timeout["taskId"], task_id, "{timeout}");
+    assert_eq!(timeout["exitStatus"], 4, "{timeout}");
+    assert_eq!(
+        timeout["error"],
+        format!("task {task_id} did not settle within 1s (--timeout)"),
+    );
+    assert!(
+        !String::from_utf8_lossy(&pending.stdout).contains("Transport error"),
+        "{}",
+        String::from_utf8_lossy(&pending.stdout)
+    );
+    assert_eq!(values[2]["taskId"], task_id, "the task is still usable");
+    assert_eq!(values[2]["status"], "cancelled", "{}", values[2]);
 
     // Nothing to wait for is a distinct outcome from a task that failed.
     let empty = run_stdio(
@@ -5832,6 +5967,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         #[cfg(unix)]
         exercise_stdio_group_cancellation(&fixture, true).await;
         exercise_json_contract(&fixture, &temp).await;
+        exercise_listing_descriptions(&fixture, &temp).await;
         exercise_bounded_output(&fixture, &temp).await;
         exercise_colliding_tool_names(&fixture, &temp).await;
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;

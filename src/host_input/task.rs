@@ -565,6 +565,12 @@ enum Round {
     Continue,
     /// The task settled while the host was answering. Nothing was sent.
     Settled(Box<TaskObject>),
+    /// The host answered, but the next poll slot falls after the command
+    /// deadline, so the answers could not be checked against the task and
+    /// nothing was sent. The task is still parked. Each caller reports this
+    /// in its own terms: for `wait` it is the wait running out, not a
+    /// connection failure.
+    Unchecked,
 }
 
 /// Ask the host for `requests`, check what the task still lists, and send the
@@ -626,7 +632,7 @@ async fn answer_round(
         }
     }
     if last.is_none() && !input.responses.is_empty() {
-        return Err(unchecked(reader, label));
+        return Ok(Round::Unchecked);
     }
     // An unanswered key is reported only while the task still lists it.
     let removed = reader.removed();
@@ -781,11 +787,27 @@ pub(super) async fn wait_for_task(
             ));
         }
         rounds += 1;
-        if let Round::Settled(task) =
-            answer_round(&reader, &label, requests, snapshot.stamp, deadline).await?
-        {
-            jobs.sync(id, task.status, task.status_message.clone());
-            return Ok(*task);
+        match answer_round(&reader, &label, requests, snapshot.stamp, deadline).await? {
+            Round::Settled(task) => {
+                jobs.sync(id, task.status, task.status_message.clone());
+                return Ok(*task);
+            }
+            Round::Continue => {}
+            // Only `wait` calls without `tool`. Its deadline ran out with the
+            // connection healthy and the task still usable, so it reports a
+            // pending wait. A foreground call keeps the transport failure.
+            Round::Unchecked if tool.is_none() => {
+                return Err(crate::jobs::wait_deadline_unsent_error(
+                    id,
+                    &format!(
+                        "task {label} did not settle before --timeout; the host's answers were \
+                         not sent, because the deadline passed before they could be checked \
+                         against the task; it is still waiting for input; {}",
+                        respond_hint(id)
+                    ),
+                ));
+            }
+            Round::Unchecked => return Err(unchecked(&reader, &label)),
         }
     }
 }
@@ -838,6 +860,7 @@ async fn respond_with(
         }
         return match answer_round(&reader, label, requests, snapshot.stamp, deadline).await? {
             Round::Settled(task) => Ok(*task),
+            Round::Unchecked => Err(unchecked(&reader, label)),
             // The handler resumes asynchronously, so report what the task
             // says at the next poll slot. When that slot is after the
             // deadline, the snapshot the answers were based on is reported.

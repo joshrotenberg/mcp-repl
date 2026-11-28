@@ -634,7 +634,47 @@ fn report_error_with_details(
     eprintln!("{line}");
 }
 
+/// What a person can do about a `wait` that ran out of time.
+const WAIT_DEADLINE_HINT: &str = "the task is still running; `wait` on it again or `cancel` it";
+
+/// The `--json` envelope for a `wait` that ran out of time.
+///
+/// The exit status stays 4, as in earlier releases, but `kind` is `timeout`
+/// rather than `transport`: the connection is healthy and the task is still
+/// usable. `pending` and `taskId` let a script recognize it and keep the task
+/// without parsing the message. `answersSent: false` appears only when a
+/// bridge `wait` dropped host answers unsent.
+fn wait_deadline_json(deadline: &jobs::WaitDeadline, message: &str) -> serde_json::Value {
+    let mut value = error_json(ExitStatus::Transport, message);
+    value["kind"] = serde_json::json!("timeout");
+    value["taskId"] = serde_json::json!(deadline.task_id);
+    value["pending"] = serde_json::json!(true);
+    if deadline.answers_unsent {
+        value["answersSent"] = serde_json::json!(false);
+    }
+    value
+}
+
+/// Report a `wait` deadline: the `timeout` envelope under `--json`, the
+/// message and a hint otherwise.
+fn report_wait_deadline(deadline: &jobs::WaitDeadline, message: &str) {
+    note_error(ExitStatus::Transport);
+    if json_output() {
+        print_json(&wait_deadline_json(deadline, message));
+        return;
+    }
+    eprintln!(
+        "{}: {}\n  hint: {WAIT_DEADLINE_HINT}",
+        style::error_prefix(),
+        sanitize(message)
+    );
+}
+
 fn report_mcp_error(error: &tower_mcp::Error) {
+    if let Some((deadline, message)) = jobs::wait_deadline(error) {
+        report_wait_deadline(deadline, message);
+        return;
+    }
     report_error_with_details(
         ExitStatus::from_mcp_error(error),
         &describe_mcp_error(error),
@@ -754,6 +794,11 @@ fn describe_mcp_error(error: &tower_mcp::Error) -> String {
             Some(code) => format!("{} (code {code})", failure.message),
             None => failure.message.to_owned(),
         };
+    }
+    // Without this the framework's `Tool error:` prefix would replace the
+    // `Transport error:` one this error used to carry, and be just as wrong.
+    if let Some((_, message)) = jobs::wait_deadline(error) {
+        return sanitize(message).into_owned();
     }
     let tower_mcp::Error::JsonRpc(rpc) = error else {
         return collapse_repeated_label(&error.to_string()).to_string();
@@ -1458,20 +1503,28 @@ async fn wait_for_one(
 ) -> tower_mcp::Result<TaskObject> {
     tracing::debug!(task_id = ?id, "waiting for task via polling");
     let deadline = host_input::deadline_after(limit);
+    // Set while the wait is recovering from a lost connection, so a deadline
+    // that interrupts the reconnect is reported as the connection failure it
+    // is, not as a task that is merely still running.
+    let recovering = AtomicBool::new(false);
     let wait = async {
         if host_input::enabled() {
             host_input::wait_task(&session.client(), jobs, id, deadline).await
         } else {
-            wait_with_reconnect(session, surface, id).await
+            wait_with_reconnect(session, surface, id, &recovering).await
         }
     };
     let result = match (deadline, limit) {
         (Some(deadline), Some(limit)) => match tokio::time::timeout_at(deadline, wait).await {
             Ok(result) => result,
-            Err(_) => Err(tower_mcp::Error::Transport(format!(
-                "task {id} did not settle within {}s (--timeout)",
-                limit.as_secs()
-            ))),
+            Err(_) if recovering.load(Ordering::SeqCst) => {
+                Err(tower_mcp::Error::Transport(format!(
+                    "the connection was lost while waiting for task {id}, and the reconnect did \
+                     not finish within {}s (--timeout)",
+                    limit.as_secs()
+                )))
+            }
+            Err(_) => Err(crate::jobs::wait_deadline_error(id, limit.as_secs())),
         },
         _ => wait.await,
     };
@@ -1479,10 +1532,16 @@ async fn wait_for_one(
     result
 }
 
+/// Wait for `id`, reconnecting once if the connection is lost.
+///
+/// `recovering` is set from the moment the loss is seen until the
+/// replacement connection is installed. A caller's deadline that fires in
+/// between interrupts a reconnect, not a healthy wait.
 async fn wait_with_reconnect(
     session: &Session,
     surface: &RwLock<Surface>,
     id: &str,
+    recovering: &AtomicBool,
 ) -> tower_mcp::Result<TaskObject> {
     let (client, seen, target) = session.client_snapshot().expect("connected above");
     let can_resume = session.can_reconnect() && uses_final_tasks(&client).await;
@@ -1491,7 +1550,10 @@ async fn wait_with_reconnect(
         result => return result,
     };
     drop(client);
-    if reconnect_for_command(session, surface, seen).await.is_err() {
+    recovering.store(true, Ordering::SeqCst);
+    let reconnected = reconnect_for_command(session, surface, seen).await;
+    recovering.store(false, Ordering::SeqCst);
+    if reconnected.is_err() {
         return Err(error);
     }
     let (client, _, current_target) = session.client_snapshot().expect("reconnected above");
@@ -1574,8 +1636,14 @@ async fn wait_for_all(
             Err(e) if outcomes_in_array => {
                 let status = ExitStatus::from_mcp_error(&e);
                 note_error(status);
-                let mut outcome = error_json(status, &describe_mcp_error(&e));
-                outcome["taskId"] = serde_json::json!(id);
+                let outcome = match jobs::wait_deadline(&e) {
+                    Some((deadline, message)) => wait_deadline_json(deadline, message),
+                    None => {
+                        let mut outcome = error_json(status, &describe_mcp_error(&e));
+                        outcome["taskId"] = serde_json::json!(id);
+                        outcome
+                    }
+                };
                 settled.push(outcome);
             }
             // Keep going: one unreachable task should not hide the outcome of
@@ -2074,6 +2142,105 @@ fn listing_limit() -> Option<usize> {
     Some(rows.saturating_sub(RESERVED).max(5))
 }
 
+fn listing_terminal_width() -> Option<usize> {
+    if json_output() || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return None;
+    }
+    let (columns, _) = crossterm::terminal::size().ok()?;
+    (columns > 0).then_some(usize::from(columns))
+}
+
+fn listing_row(
+    (name, column_width): (&str, usize),
+    (detail, detail_style, detail_column_width): (&str, Style, Option<usize>),
+    description: &str,
+    tags: &str,
+    width: Option<usize>,
+) -> String {
+    let name = untrusted::sanitize_inline(name);
+    let detail = style::truncate_width(untrusted::sanitize_inline(detail), detail_column_width);
+    let detail_width = detail_column_width.unwrap_or_else(|| style::display_width(&detail));
+    let has_detail = detail_width > 0 || !detail.is_empty();
+    let occupied = column_width.max(style::display_width(&name))
+        + detail_width
+        + usize::from(has_detail)
+        + style::display_width(tags)
+        + usize::from(!tags.is_empty());
+    let description = style::listing_description(
+        description,
+        width.map(|width| width.saturating_sub(occupied + 1)),
+    );
+
+    let mut row = style::column(Style::new().fg(Color::Green), &name, column_width);
+    if has_detail {
+        row.push(' ');
+        row.push_str(&style::column(detail_style, &detail, detail_width));
+    }
+    if !description.is_empty() {
+        row.push(' ');
+        row.push_str(&description);
+    }
+    if !tags.is_empty() {
+        row.push(' ');
+        row.push_str(&paint(Style::new().dimmed(), tags));
+    }
+    row.truncate(row.trim_end().len());
+    row
+}
+
+fn tool_listing_row(tool: &ToolDefinition, width: Option<usize>) -> String {
+    let tags = tool_tags(tool);
+    let tags = if tags.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", tags.join(" "))
+    };
+    listing_row(
+        (&tool.name, 24),
+        ("", Style::new(), None),
+        tool.description.as_deref().unwrap_or_default(),
+        &tags,
+        width,
+    )
+}
+
+fn resource_column_widths<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a str)>,
+    width: Option<usize>,
+) -> (usize, usize) {
+    const MIN_URI_WIDTH: usize = 40;
+    const MAX_NAME_WIDTH: usize = 24;
+    let mut uri_width = MIN_URI_WIDTH;
+    let mut name_width = 0;
+    for (uri, name) in entries {
+        uri_width = uri_width.max(style::display_width(&untrusted::sanitize_inline(uri)));
+        name_width = name_width.max(style::display_width(&untrusted::sanitize_inline(name)));
+    }
+    let name_width = name_width.min(MAX_NAME_WIDTH);
+    if let Some(width) = width {
+        // Keep an oversized URI from pushing other rows past the terminal.
+        let reserved = name_width + usize::from(name_width > 0) + 2;
+        uri_width = uri_width.min(width.saturating_sub(reserved).max(MIN_URI_WIDTH));
+    }
+    (uri_width, name_width)
+}
+
+fn resource_listing_row(
+    uri: &str,
+    name: &str,
+    (uri_width, name_width): (usize, usize),
+    description: Option<&str>,
+    width: Option<usize>,
+) -> String {
+    listing_row(
+        (uri, uri_width),
+        (name, Style::new(), Some(name_width)),
+        description.unwrap_or_default(),
+        "",
+        width,
+    )
+}
+
 /// Print at most `limit` of `total` rows, and say what was held back.
 ///
 /// `full` is the flag the user passes to see the rest, named in the notice
@@ -2121,13 +2288,9 @@ fn print_tool_overview(surface: &Surface) {
     // Half the window: the banner shares the first screen with the counts,
     // the hint line, and the prompt.
     let cap = listing_limit().map_or(listed.len(), |rows| (rows / 2).max(5));
+    let width = listing_terminal_width();
     for t in listed.iter().take(cap) {
-        diag_println!(
-            "{} {}{}",
-            style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-            sanitize(t.description.as_deref().unwrap_or("")),
-            tool_tag_suffix(t)
-        );
+        diag_println!("{}", tool_listing_row(t, width));
     }
     if listed.len() > cap {
         diag_println!(
@@ -2190,13 +2353,19 @@ fn print_find(surface: &Surface, query: &find::Query, output: &vars::Output) {
         return;
     }
     let total = hits.len();
+    let width = listing_terminal_width().map(|width| width.saturating_sub(2));
     for (kind, group) in find::grouped(hits) {
         println!("{}:", paint(Style::new().bold(), kind.heading()));
         for hit in group {
             println!(
-                "  {} {}",
-                style::column(Style::new().fg(Color::Green), &sanitize(&hit.name), 24),
-                sanitize(&hit.description)
+                "  {}",
+                listing_row(
+                    (&hit.name, 24),
+                    ("", Style::new(), None),
+                    &hit.description,
+                    "",
+                    width,
+                )
             );
         }
     }
@@ -7017,11 +7186,17 @@ async fn handle_line(
             let (listed, hidden) = tool_policy::listed_tools(s.tools(), policy.as_deref(), false);
             if !listed.is_empty() {
                 println!("tools:");
+                let width = listing_terminal_width().map(|width| width.saturating_sub(2));
                 for t in listed {
                     println!(
-                        "  {} {}",
-                        style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-                        sanitize(t.description.as_deref().unwrap_or(""))
+                        "  {}",
+                        listing_row(
+                            (&t.name, 24),
+                            ("", Style::new(), None),
+                            t.description.as_deref().unwrap_or_default(),
+                            "",
+                            width,
+                        )
                     );
                 }
             }
@@ -7056,17 +7231,13 @@ async fn handle_line(
             // trimmed to the window so the prompt stays in view.
             let full = rest.contains(&"--full");
             let limit = if full { None } else { listing_limit() };
+            let width = listing_terminal_width();
             match cmd {
                 "tools" => {
                     let total = listed.len();
                     let shown = limit.unwrap_or(total).min(total);
                     for t in listed.iter().take(shown) {
-                        println!(
-                            "{} {}{}",
-                            style::column(Style::new().fg(Color::Green), &sanitize(&t.name), 24),
-                            sanitize(t.description.as_deref().unwrap_or("")),
-                            tool_tag_suffix(t)
-                        );
+                        println!("{}", tool_listing_row(t, width));
                     }
                     note_truncation(shown, total, "tools --full");
                     print_hidden_note(hidden, Some("tools --all"));
@@ -7080,17 +7251,21 @@ async fn handle_line(
                             .iter()
                             .map(|a| {
                                 if a.required {
-                                    format!("<{}>", sanitize(&a.name))
+                                    format!("<{}>", untrusted::sanitize_inline(&a.name))
                                 } else {
-                                    format!("[{}]", sanitize(&a.name))
+                                    format!("[{}]", untrusted::sanitize_inline(&a.name))
                                 }
                             })
                             .collect();
                         println!(
-                            "{} {} {}",
-                            style::column(Style::new().fg(Color::Green), &sanitize(&p.name), 24),
-                            paint(Style::new().fg(Color::Cyan), &args.join(" ")),
-                            sanitize(p.description.as_deref().unwrap_or(""))
+                            "{}",
+                            listing_row(
+                                (&p.name, 24),
+                                (&args.join(" "), Style::new().fg(Color::Cyan), None),
+                                p.description.as_deref().unwrap_or_default(),
+                                "",
+                                width,
+                            )
                         );
                     }
                     note_truncation(shown, total, "prompts --full");
@@ -7098,11 +7273,23 @@ async fn handle_line(
                 "resources" => {
                     let total = s.resources().len();
                     let shown = limit.unwrap_or(total).min(total);
+                    let columns = resource_column_widths(
+                        s.resources()
+                            .iter()
+                            .take(shown)
+                            .map(|r| (r.uri.as_str(), r.name.as_str())),
+                        width,
+                    );
                     for r in s.resources().iter().take(shown) {
                         println!(
-                            "{} {}",
-                            style::column(Style::new().fg(Color::Green), &sanitize(&r.uri), 40),
-                            sanitize(&r.name)
+                            "{}",
+                            resource_listing_row(
+                                &r.uri,
+                                &r.name,
+                                columns,
+                                r.description.as_deref(),
+                                width,
+                            )
                         );
                     }
                     note_truncation(shown, total, "resources --full");
@@ -7124,15 +7311,23 @@ async fn handle_line(
                 _ => {
                     let total = s.templates().len();
                     let shown = limit.unwrap_or(total).min(total);
+                    let columns = resource_column_widths(
+                        s.templates()
+                            .iter()
+                            .take(shown)
+                            .map(|t| (t.uri_template.as_str(), t.name.as_str())),
+                        width,
+                    );
                     for t in s.templates().iter().take(shown) {
                         println!(
-                            "{} {}",
-                            style::column(
-                                Style::new().fg(Color::Green),
-                                &sanitize(&t.uri_template),
-                                40
-                            ),
-                            sanitize(&t.name)
+                            "{}",
+                            resource_listing_row(
+                                &t.uri_template,
+                                &t.name,
+                                columns,
+                                t.description.as_deref(),
+                                width,
+                            )
                         );
                     }
                     note_truncation(shown, total, "templates --full");
@@ -8814,19 +9009,6 @@ fn parse_wait_timeout<'a>(
     Ok((limit, remaining))
 }
 
-/// The tags as they trail a listing row, or empty when the server declared
-/// none.
-fn tool_tag_suffix(tool: &ToolDefinition) -> String {
-    let tags = tool_tags(tool);
-    if tags.is_empty() {
-        return String::new();
-    }
-    format!(
-        " {}",
-        paint(Style::new().dimmed(), &format!("[{}]", tags.join(" ")))
-    )
-}
-
 /// A ready-to-run invocation synthesized from a tool's input schema:
 /// required arguments first with their types as placeholders, then optional
 /// ones in brackets. Long argument lists are trimmed, since the point is to
@@ -9470,6 +9652,78 @@ mod tests {
 
     use async_trait::async_trait;
     use tower_mcp::client::ClientTransport;
+
+    #[test]
+    fn listing_row_fits_descriptions_around_names_arguments_and_tags() {
+        assert!(!style::colors_enabled());
+        let width = 44;
+        let description = "Description that needs to be shortened.";
+        let long_name = "a-tool-name-longer-than-24";
+        let rows = [
+            listing_row(
+                ("read", 24),
+                ("", Style::new(), None),
+                description,
+                "[read-only]",
+                Some(width),
+            ),
+            listing_row(
+                ("greet", 24),
+                ("<who>\t[place]", Style::new().fg(Color::Cyan), None),
+                description,
+                "",
+                Some(width),
+            ),
+            listing_row(
+                (long_name, 24),
+                ("", Style::new(), None),
+                description,
+                "",
+                Some(width),
+            ),
+        ];
+        for row in &rows {
+            assert!(row.contains('…'), "{row}");
+            assert!(style::display_width(row) <= width, "{row}");
+        }
+        assert!(rows[0].ends_with(" [read-only]"));
+        assert!(rows[1].contains(r"<who>\t[place]"));
+        assert!(rows[2].starts_with(long_name));
+    }
+
+    #[test]
+    fn resource_listing_row_aligns_descriptions_after_the_name_column() {
+        let short_uri = "mcp://guide";
+        let long_uri = "mcp://a/resource/whose/uri/exceeds/forty/columns";
+        let short_name = "Guide";
+        let long_name = "A resource name longer than its column";
+        let entries = [(short_uri, short_name), (long_uri, long_name)];
+        let columns = resource_column_widths(entries.into_iter(), Some(96));
+        let description = "Documentation";
+        let short_row =
+            resource_listing_row(short_uri, short_name, columns, Some(description), Some(96));
+        let long_row =
+            resource_listing_row(long_uri, long_name, columns, Some(description), Some(96));
+        assert_eq!(columns, (long_uri.len(), 24));
+        assert!(long_row.starts_with(long_uri));
+        assert!(long_row.contains('…'));
+        for row in [short_row, long_row] {
+            let prefix = row.strip_suffix(description).expect("full description");
+            assert_eq!(style::display_width(prefix), long_uri.len() + 1 + 24 + 1);
+        }
+
+        let width = 70;
+        let columns = resource_column_widths(entries.into_iter(), Some(width));
+        let short_row = resource_listing_row(
+            short_uri,
+            short_name,
+            columns,
+            Some(description),
+            Some(width),
+        );
+        assert!(short_row.ends_with('…'));
+        assert!(style::display_width(&short_row) <= width);
+    }
 
     #[test]
     fn generated_tail_requires_an_explicit_selector_and_preserves_child_argv() {
@@ -12058,6 +12312,45 @@ world",
         assert!(parse_wait_timeout("task", &["t", "--timeout", "5"]).is_err());
     }
 
+    /// #390: the connection is healthy and the task is still usable when
+    /// `wait --timeout` runs out, so neither the text nor the envelope may
+    /// call it a transport failure. Exit status 4 is kept for old scripts.
+    #[test]
+    fn a_wait_deadline_is_a_pending_timeout_not_a_transport_failure() {
+        let error = jobs::wait_deadline_error("abc123", 1);
+        let message = describe_mcp_error(&error);
+        assert_eq!(message, "task abc123 did not settle within 1s (--timeout)");
+        assert_eq!(ExitStatus::from_mcp_error(&error), ExitStatus::Transport);
+
+        let (deadline, raw) = jobs::wait_deadline(&error).unwrap();
+        assert_eq!(
+            wait_deadline_json(deadline, raw),
+            serde_json::json!({
+                "error": "task abc123 did not settle within 1s (--timeout)",
+                "kind": "timeout",
+                "exitStatus": 4,
+                "taskId": "abc123",
+                "pending": true,
+            })
+        );
+
+        // A bridge `wait` that dropped host answers says so in a field.
+        let unsent = jobs::wait_deadline_unsent_error("abc123", "answers were not sent");
+        let (deadline, raw) = jobs::wait_deadline(&unsent).unwrap();
+        let envelope = wait_deadline_json(deadline, raw);
+        assert_eq!(envelope["kind"], "timeout");
+        assert_eq!(envelope["pending"], true);
+        assert_eq!(envelope["taskId"], "abc123");
+        assert_eq!(envelope["answersSent"], false);
+        assert_eq!(describe_mcp_error(&unsent), "answers were not sent");
+
+        // Recognized by type only: the same words from a real transport
+        // failure, or from a server's tool error, stay what they are.
+        let words = "task abc123 did not settle within 1s (--timeout)";
+        assert!(jobs::wait_deadline(&tower_mcp::Error::Transport(words.into())).is_none());
+        assert!(jobs::wait_deadline(&tower_mcp::Error::tool(words)).is_none());
+    }
+
     #[test]
     fn automatic_task_updates_are_interactive_text_only() {
         assert!(automatic_task_updates(false, false));
@@ -12410,9 +12703,14 @@ world",
             let connector = once_connector(scripted_task_client(fresh, replacement).await);
             let session = Session::new(client, Some(connector));
             let surface = RwLock::new(Surface::default());
-            let error = wait_with_reconnect(&session, &surface, "task-1")
+            let recovering = AtomicBool::new(false);
+            let error = wait_with_reconnect(&session, &surface, "task-1", &recovering)
                 .await
                 .unwrap_err();
+            assert!(
+                !recovering.load(Ordering::SeqCst),
+                "a finished reconnect no longer counts as recovering"
+            );
             assert!(
                 is_session_lost(&error),
                 "{initial:?} to {replacement:?}: {error}"
@@ -12566,9 +12864,20 @@ world",
         .await
         .expect("the wait deadline must interrupt the reconnect")
         .unwrap_err();
+        // The deadline cut a reconnect short, with the disconnected client
+        // still installed: that is a connection failure, not a pending task.
         assert!(
-            matches!(error, tower_mcp::Error::Transport(message) if message.contains("did not settle within 1s (--timeout)"))
+            jobs::wait_deadline(&error).is_none(),
+            "an interrupted reconnect is not a pending wait: {error}"
         );
+        assert!(
+            matches!(&error, tower_mcp::Error::Transport(message)
+                if message == "the connection was lost while waiting for task task-1, and the \
+                               reconnect did not finish within 1s (--timeout)"),
+            "{error}"
+        );
+        assert_eq!(ExitStatus::from_mcp_error(&error), ExitStatus::Transport);
+        assert_eq!(ExitStatus::from_mcp_error(&error).label(), "transport");
         assert!(
             fetching.load(Ordering::SeqCst),
             "the replacement reached the surface fetch"
