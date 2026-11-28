@@ -34,6 +34,7 @@ mcp-repl-demo> sign_in                     # the server asks *you* (elicitation)
 mcp-repl-demo> summarize text="..."        # the server asks your *client* (sampling)
 mcp-repl-demo> find note                   # keyword search across the surface
 mcp-repl-demo> describe convert            # input/output schemas, colored
+mcp-repl-demo> surface                     # counts by kind, JSON export with --json
 mcp-repl-demo> read note://ideas           # a resource template, completed by the server
 mcp-repl-demo> prompt greet name=<Tab>     # prompt args complete via completion/complete
 mcp-repl-demo> info                        # identity, instructions, counts, capabilities, tool policy
@@ -158,14 +159,26 @@ descriptions end in `…` if they exceed the space left on the row. Piped text
 keeps the whole normalized line. JSON output and captures keep the full
 description, as do `describe <name>` and `help <command>`.
 
+A failed fetch makes a listing unavailable, including when the server
+rejects the request as not initialized. The listing command reports a
+transport error. Run `refresh` to try fetching the listings again.
+
 Under `--json` or in a capture, `tools --brief` (likewise `prompts`,
 `resources`, `templates`) keeps only each entry's name, title, and
 description, plus the URI or URI template for resources and templates, and
 drops schemas and annotations. `describe <name>` returns the full definition
 of the one you pick. See [progressive discovery](scripting.md#progressive-discovery-find-describe-call).
 
+`surface [--brief]` reports counts by kind in text mode. Under `--json`
+or in a capture, it returns one object with server info and all four
+listings. `surface --brief` keeps the same fields in each listing as the
+individual `--brief` commands. If any listing is unavailable, `surface`
+reports each unavailable listing as part of a transport error.
+The export includes the time the listings were fetched. The server's
+surface can change at any time.
+
 Under a tool policy (see
-[Connecting](connecting.md#restricting-tool-calls)), `tools`, `find`, `help`,
+[Connecting](connecting.md#restricting-tool-calls)), `tools`, `surface`, `find`, `help`,
 completion, and the startup overview leave out tools whose calls are refused,
 and say so:
 
@@ -548,7 +561,7 @@ mcp-repl -e "x = search_crates query=serde" \
 ```
 
 Capture and filtering act on tool calls and on the built-ins that return a
-documented value: `tools`, `prompts`, `resources`, `templates`, `describe`,
+documented value: `tools`, `prompts`, `resources`, `templates`, `surface`, `describe`,
 `read`, `find`, and `info`.
 
 `for` walks an array selected from a captured value. The demo's `notes` result

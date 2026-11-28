@@ -7,6 +7,7 @@
 //! contains no clap, reedline, quoting, or dispatch behavior.
 
 use std::collections::HashSet;
+use std::time::SystemTime;
 
 use tower_mcp::protocol::{
     PromptDefinition, ResourceDefinition, ResourceTemplateDefinition, ToolDefinition,
@@ -23,6 +24,7 @@ pub(crate) struct Surface {
     resources: Vec<ResourceDefinition>,
     templates: Vec<ResourceTemplateDefinition>,
     unavailable: Vec<&'static str>,
+    fetched_at: Option<SystemTime>,
     command_set: std::sync::OnceLock<CommandSet>,
 }
 
@@ -40,6 +42,7 @@ impl Surface {
             resources,
             templates,
             unavailable,
+            fetched_at: Some(SystemTime::now()),
             command_set: std::sync::OnceLock::new(),
         }
     }
@@ -58,6 +61,10 @@ impl Surface {
 
     pub fn templates(&self) -> &[ResourceTemplateDefinition] {
         &self.templates
+    }
+
+    pub fn fetched_at(&self) -> Option<SystemTime> {
+        self.fetched_at
     }
 
     /// Whether a named part failed to load rather than coming back empty.
@@ -361,6 +368,30 @@ mod tests {
     fn one_surface_reuses_one_normalized_command_set() {
         let surface = Surface::default();
         assert!(std::ptr::eq(surface.commands(), surface.commands()));
+    }
+
+    #[tokio::test]
+    async fn refreshing_the_surface_updates_its_fetch_time() {
+        let client = crate::client_builder(crate::ProtocolMode::Stable, None)
+            .unwrap()
+            .connect_simple(tower_mcp::client::ChannelTransport::new(
+                crate::demo_router(),
+            ))
+            .await
+            .unwrap();
+        crate::establish_connection(&client, crate::ProtocolMode::Stable)
+            .await
+            .unwrap();
+        let session = crate::Session::new(client, None);
+        let previous = std::time::UNIX_EPOCH;
+        let surface = std::sync::RwLock::new(Surface {
+            fetched_at: Some(previous),
+            ..Surface::default()
+        });
+
+        crate::refresh_surface(&session, &surface).await;
+
+        assert!(surface.read().unwrap().fetched_at().unwrap() > previous);
     }
 
     #[test]

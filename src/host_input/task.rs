@@ -74,7 +74,8 @@ impl Snapshot {
         } else {
             InputRequests::new()
         };
-        let stamp = stamp(&result.task.metadata().last_updated_at);
+        // A snapshot without a usable stamp never proves a key gone.
+        let stamp = crate::timestamp::parse_rfc3339(&result.task.metadata().last_updated_at);
         Ok(Self {
             task: task_object(result)?,
             stamp,
@@ -86,79 +87,6 @@ impl Snapshot {
 
 /// A `lastUpdatedAt` timestamp as nanoseconds since the Unix epoch.
 type Stamp = i128;
-
-/// Parse an RFC 3339 timestamp such as `2026-07-28T00:00:01.5Z`.
-///
-/// Conservative on purpose: a leap second, a fraction longer than nine
-/// digits, a day the month does not have, or an offset that is not `HH:MM`
-/// within range is `None`. A snapshot without a usable stamp never proves a
-/// key gone.
-fn stamp(text: &str) -> Option<Stamp> {
-    let digits = |part: &str| -> Option<i64> {
-        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())).then(|| part.parse().ok())?
-    };
-    let field = |range: std::ops::Range<usize>| text.get(range).and_then(digits);
-    let bytes = text.as_bytes();
-    if bytes.len() < 20
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !matches!(bytes[10], b'T' | b't')
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-    {
-        return None;
-    }
-    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
-    let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
-    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap_year => 29,
-        2 => 28,
-        _ => return None,
-    };
-    if !(1..=month_days).contains(&day) || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let mut rest = &text[19..];
-    let mut nanos: i128 = 0;
-    if let Some(fraction) = rest.strip_prefix('.') {
-        let len = fraction.bytes().take_while(u8::is_ascii_digit).count();
-        if !(1..=9).contains(&len) {
-            return None;
-        }
-        nanos = i128::from(digits(&fraction[..len])?) * 10i128.pow(9 - len as u32);
-        rest = &fraction[len..];
-    }
-    let offset = match rest {
-        "Z" | "z" => 0,
-        zone if zone.len() == 6 && zone.is_ascii() && &zone[3..4] == ":" => {
-            let sign = match &zone[..1] {
-                "+" => 1,
-                "-" => -1,
-                _ => return None,
-            };
-            let hours = digits(&zone[1..3])?;
-            let minutes = digits(&zone[4..6])?;
-            if hours > 23 || minutes > 59 {
-                return None;
-            }
-            sign * (hours * 3600 + minutes * 60)
-        }
-        _ => return None,
-    };
-    // Days from the civil date (Howard Hinnant's algorithm).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
-    Some(i128::from(seconds) * 1_000_000_000 + nanos)
-}
 
 /// What the bridge knows about one task on the active connection.
 ///

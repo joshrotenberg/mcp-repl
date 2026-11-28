@@ -18,6 +18,7 @@ const ONE_SHOT_BUILTINS: &[&str] = &[
     "prompts",
     "resources",
     "templates",
+    "surface",
     "find",
     "describe",
     "snapshot",
@@ -251,6 +252,14 @@ fn builtin_command(
                     .help("Under --json, only names, titles, and descriptions")
                     .action(ArgAction::SetTrue),
             ),
+        "surface" => Command::new("surface")
+            .about("Export server info and all listings as one JSON document with --json")
+            .arg(
+                Arg::new("brief")
+                    .long("brief")
+                    .help("Keep only names, titles, descriptions, and URIs")
+                    .action(ArgAction::SetTrue),
+            ),
         "read" => Command::new("read")
             .about("Read a resource")
             .arg(
@@ -296,7 +305,7 @@ fn builtin_command(
             .about("Show schemas and metadata for a surface item")
             .arg(Arg::new("name").value_name("NAME").required(true)),
         "snapshot" => Command::new("snapshot")
-            .about("Export a tool or prompt schema contract")
+            .about("Export a tool or prompt compatibility contract for validate")
             .arg(Arg::new("name").value_name("NAME").required(true))
             .arg(Arg::new("path").value_name("PATH")),
         "validate" => Command::new("validate")
@@ -362,6 +371,11 @@ fn builtin_invocation(
             }
             if name == "tools" && matches.get_flag("all") {
                 words.push("--all".to_string());
+            }
+        }
+        "surface" => {
+            if matches.get_flag("brief") {
+                words.push("--brief".to_string());
             }
         }
         "read" => {
@@ -773,6 +787,23 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn surface_and_a_same_named_tool_use_explicit_namespaces() {
+        let tools = [tool("surface", json!({"type": "object"}))];
+        let error = parse(&tools, &[], &["surface".into()]).unwrap_err();
+        assert!(error.to_string().contains("tool surface"));
+        assert!(error.to_string().contains("builtin surface"));
+        let tool = parse(&tools, &[], &["tool", "surface"].map(String::from)).unwrap();
+        assert_eq!(tool.parsed().words, ["tool", "surface"]);
+        let builtin = parse(
+            &tools,
+            &[],
+            &["builtin", "surface", "--brief"].map(String::from),
+        )
+        .unwrap();
+        assert_eq!(builtin.parsed().words, ["builtin", "surface", "--brief"]);
     }
 
     #[test]

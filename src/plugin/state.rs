@@ -575,6 +575,7 @@ mod tests {
                 }
             }
             assert!(files["skills/mcp-repl/SKILL.md"].contains("describe <name>"));
+            assert!(files["skills/mcp-repl/SKILL.md"].contains("--json surface"));
         }
     }
 
