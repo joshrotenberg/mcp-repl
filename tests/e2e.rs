@@ -979,6 +979,133 @@ async fn exercise_imported_stdio_config(fixture: &Path, temp: &TempDir) {
     );
 }
 
+async fn exercise_surface(fixture: &Path, temp: &TempDir) {
+    for (protocol, version) in [("stable", "2025-11-25"), ("2026-07-28", "2026-07-28")] {
+        let label = format!("surface-{protocol}");
+        let output = run_stdio(
+            fixture,
+            temp,
+            &label,
+            &[
+                "--json",
+                "--protocol",
+                protocol,
+                "-e",
+                "surface",
+                "-e",
+                "info",
+                "-e",
+                "tools",
+                "-e",
+                "prompts",
+                "-e",
+                "resources",
+                "-e",
+                "templates",
+            ],
+        )
+        .await;
+        assert_success(&output, &label);
+        let values = json_lines(&output, &label);
+        assert_eq!(values.len(), 6);
+        let surface = &values[0];
+        assert_eq!(surface.as_object().unwrap().len(), 7);
+        assert_eq!(surface["mcpRepl"], "surface/v1");
+        let timestamp = surface["fetchedAt"].as_str().unwrap();
+        assert_eq!(timestamp.len(), 20, "{timestamp}");
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+        let server = &surface["server"];
+        assert_eq!(server.as_object().unwrap().len(), 4);
+        assert_eq!(server["protocolVersion"], version);
+        assert_eq!(server["serverInfo"]["name"], "mcp-repl-fixture");
+        for field in [
+            "protocolVersion",
+            "serverInfo",
+            "capabilities",
+            "instructions",
+        ] {
+            assert_eq!(server.get(field), values[1].get(field));
+            assert!(server.get(field).is_some(), "{field}");
+        }
+        for (kind, listing) in ["tools", "prompts", "resources", "templates"]
+            .into_iter()
+            .zip(&values[2..])
+        {
+            assert!(listing.is_array(), "{kind}");
+            assert_eq!(&surface[kind], listing, "{kind}");
+        }
+    }
+
+    let label = "generated paginated surface";
+    let mut command = repl_command();
+    command.args(["--demo", "--json", "surface"]);
+    let output = run(command, label, CASE_TIMEOUT).await;
+    assert_success(&output, label);
+    let surface: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tools = surface["tools"].as_array().unwrap();
+    assert!(tools.len() > 4, "the demo serves four tools per page");
+    assert!(tools.iter().any(|tool| tool["name"] == "toggle_extra"));
+    let convert = tools.iter().find(|tool| tool["name"] == "convert").unwrap();
+    assert!(convert["inputSchema"].is_object());
+    assert!(convert["annotations"].is_object());
+
+    let label = "generated brief surface with tool policy";
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "--json",
+        "--deny-tool",
+        "echo",
+        "surface",
+        "--brief",
+    ]);
+    let output = run(command, label, CASE_TIMEOUT).await;
+    assert_success(&output, label);
+    let brief: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("1 tool hidden: calls are denied by tool policy; `tools --all` lists them")
+    );
+    let brief_tools = brief["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "echo"));
+    assert_eq!(brief_tools.len(), tools.len() - 1);
+    assert!(brief_tools.iter().all(|tool| tool["name"] != "echo"));
+    let convert = brief_tools
+        .iter()
+        .find(|tool| tool["name"] == "convert")
+        .unwrap();
+    assert!(convert["description"].is_string());
+    assert!(convert.get("inputSchema").is_none());
+    assert!(convert.get("outputSchema").is_none());
+    assert!(convert.get("annotations").is_none());
+    assert!(brief["prompts"][0].get("arguments").is_none());
+    assert!(brief["resources"][0]["uri"].is_string());
+    assert!(brief["templates"][0]["uriTemplate"].is_string());
+
+    let label = "surface counts and path selection";
+    let mut command = repl_command();
+    command.args([
+        "--demo",
+        "-e",
+        "surface",
+        "-e",
+        "surface | .server.serverInfo.name",
+    ]);
+    let output = run(command, label, CASE_TIMEOUT).await;
+    assert_success(&output, label);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{} tools, 1 prompt, 2 resources, 1 template\nmcp-repl-demo\n",
+            tools.len()
+        )
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Run with --json, or capture it (s = surface), to get the definitions.")
+    );
+}
+
 async fn exercise_schema_contracts(fixture: &Path, temp: &TempDir) {
     let snapshot_path = temp.path().join("add.schema.json");
     let snapshot_command = format!("snapshot add '{}'", snapshot_path.display());
@@ -3890,13 +4017,23 @@ async fn exercise_generators() {
     assert!(roff.contains("mcp-repl"));
     assert!(roff.contains("connect demo"));
     assert!(roff.contains("bench get_downloads"));
+    assert!(roff.contains("surface/v1"));
 
     let mut command = repl_command();
-    command.args(["--demo", "--json", "--exec", "help wait"]);
+    command.args([
+        "--demo",
+        "--json",
+        "--exec",
+        "help wait",
+        "--exec",
+        "help surface",
+        "--exec",
+        "help snapshot",
+    ]);
     let output = run(command, "JSON built-in help", CASE_TIMEOUT).await;
     assert_success(&output, "JSON built-in help");
     let values = json_lines(&output, "JSON built-in help");
-    assert_eq!(values.len(), 1);
+    assert_eq!(values.len(), 3);
     assert_eq!(values[0]["name"], "wait");
     assert!(
         values[0]["details"]
@@ -3904,6 +4041,11 @@ async fn exercise_generators() {
             .is_some_and(|details| !details.is_empty())
     );
     assert_eq!(values[0]["examples"][1], "wait --timeout 30");
+    assert_eq!(values[1]["usage"], "surface [--brief]");
+    assert_eq!(values[1]["examples"][0], "mcp-repl --demo --json surface");
+    let snapshot = values[2]["description"].as_str().unwrap();
+    assert!(snapshot.contains("compatibility contract for `validate`"));
+    assert!(snapshot.contains("`surface` or `describe`"));
 }
 
 /// Explicit connection selectors reserve their positional tail for a second,
@@ -5705,6 +5847,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         exercise_downgraded_protocol(&fixture, &temp).await;
         exercise_protocol_auto(&fixture, &temp).await;
         exercise_schema_contracts(&fixture, &temp).await;
+        exercise_surface(&fixture, &temp).await;
         exercise_imported_stdio_config(&fixture, &temp).await;
         exercise_stdio(&fixture, &temp).await;
         exercise_tool_policy(&fixture, &temp).await;

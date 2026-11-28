@@ -485,6 +485,18 @@ impl ReplCompleter {
         }
 
         match first {
+            "surface" | "builtin"
+                if word.starts_with('-')
+                    && "--brief".starts_with(word)
+                    && (first == "surface"
+                        || head.split_whitespace().nth(1) == Some("surface")) =>
+            {
+                out.push(word_suggestion(
+                    "--brief",
+                    Some("Keep only names, titles, descriptions, and URIs".to_string()),
+                    span,
+                ));
+            }
             "tool" => {
                 let words = head.split_whitespace().count();
                 let naming_tool = words == 1 || (words == 2 && !head.ends_with(' '));
@@ -1376,6 +1388,23 @@ mod tests {
         let description = tools[0].description.as_deref().unwrap_or_default();
         assert!(!description.contains('\u{1b}'), "{description:?}");
         assert!(description.contains('\u{fffd}'), "{description:?}");
+    }
+
+    #[tokio::test]
+    async fn surface_brief_completes_with_or_without_the_builtin_prefix() {
+        let mut completer = ReplCompleter::new(
+            Arc::new(RwLock::new(Surface::default())),
+            Arc::new(Session::disconnected()),
+            Arc::new(RwLock::new(Aliases::default())),
+            tokio::runtime::Handle::current(),
+        );
+
+        for line in ["surface -", "builtin surface -"] {
+            let suggestions = completer.complete_suggestions(line, line.len());
+            assert_eq!(suggestions.len(), 1, "{line}");
+            assert_eq!(suggestions[0].value, "--brief", "{line}");
+            assert_eq!(suggestions[0].span, Span::new(line.len() - 1, line.len()));
+        }
     }
 
     #[test]

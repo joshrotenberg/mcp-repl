@@ -1217,47 +1217,6 @@ async fn refused_batches_leave_no_key_history() {
     client.shutdown().await.unwrap();
 }
 
-#[test]
-fn stamps_order_rfc3339_times_and_reject_other_text() {
-    let base = stamp("2026-07-28T00:00:01Z").unwrap();
-    assert!(stamp("2026-07-28T00:00:01.5Z").unwrap() > base);
-    assert_eq!(stamp("2026-07-28T02:00:01+02:00"), Some(base));
-    assert_eq!(stamp("2026-07-27T23:00:01-01:00"), Some(base));
-    assert!(stamp("2026-07-28T00:00:00.999999999Z").unwrap() < base);
-    assert_eq!(stamp("1970-01-01T00:00:00Z"), Some(0), "epoch");
-    assert!(stamp("2028-02-29T00:00:00Z").is_some(), "leap day");
-    assert!(stamp("2000-02-29T00:00:00Z").is_some(), "400-year leap day");
-    assert!(stamp("2026-07-28T00:00:01.123456789Z").is_some());
-    assert!(stamp("2026-07-28T23:59:59-23:59").is_some());
-    for text in [
-        "",
-        "yesterday",
-        "2026-07-28",
-        "2026-07-28T00:00:01",
-        "2026-13-28T00:00:01Z",
-        "2026-07-28T00:00:01.Z",
-        "2026-07-28T00:00:01+0200",
-        // A leap second carries no ordering evidence.
-        "2016-12-31T23:59:60Z",
-        "2016-12-31T23:59:60.900Z",
-        // More precision than nanoseconds.
-        "2026-07-28T00:00:01.1234567891Z",
-        // Days the month does not have.
-        "2026-04-31T00:00:00Z",
-        "2027-02-29T00:00:00Z",
-        "1900-02-29T00:00:00Z",
-        "2026-07-00T00:00:00Z",
-        // Offsets outside HH 00-23 and MM 00-59, or not two digits each.
-        "2026-07-28T00:00:01+00:99",
-        "2026-07-28T00:00:01+24:00",
-        "2026-07-28T00:00:01+5:000",
-        "2026-07-28T00:00:01+0a:00",
-        "2026-07-28T00:00:01+\u{e9}:00",
-    ] {
-        assert_eq!(stamp(text), None, "{text}");
-    }
-}
-
 /// A full queue gives keyed busy outcomes and keeps the decline already
 /// decided for an unsupported URL. An oversized batch is an error.
 #[tokio::test]

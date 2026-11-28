@@ -42,6 +42,17 @@ mcp-repl --demo --json -e 'echo message="hello world"'
 mcp-repl --demo --json -e 'call echo {"message":"hello world"}'
 ```
 
+For a server you will call repeatedly, dump its surface once with `surface`
+and query the saved definitions with `jq`.
+
+```sh
+mcp-repl --demo --json surface > demo-surface.json
+jq '.tools[] | select(.name == "echo") | .inputSchema.required' demo-surface.json
+```
+
+Check `fetchedAt` and `server.serverInfo.version` when reusing the file.
+The server's surface can change at any time.
+
 When a result may be large, add `--max-output BYTES`. A tool result over
 that size is saved whole to a file (owner-only on unix), and a summary with
 `"mcpRepl":"truncated/v1"` is printed instead, giving `path`, `bytes`,

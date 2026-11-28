@@ -86,6 +86,7 @@ mod session;
 mod style;
 mod subscribe;
 mod surface_subscription;
+mod timestamp;
 mod tool_args;
 mod tool_policy;
 mod untrusted;
@@ -915,6 +916,13 @@ pub(crate) const BUILTINS: Builtins = Builtins(&[
          by the server.",
     },
     Builtin {
+        name: "surface",
+        summary: "export the server and all listings as JSON",
+        usage: "surface [--brief]",
+        detail: "Under --json, export server info, tools, prompts, resources, and \
+         resource templates as one JSON document.",
+    },
+    Builtin {
         name: "find",
         summary: "search the surface by keyword",
         usage: "find [-E] [-m N] [--case-sensitive] \
@@ -931,10 +939,11 @@ pub(crate) const BUILTINS: Builtins = Builtins(&[
     },
     Builtin {
         name: "snapshot",
-        summary: "export a tool or prompt schema contract",
+        summary: "export a compatibility contract for validate",
         usage: "snapshot <name> [path]",
-        detail: "Export a tool or prompt's schema as a versioned contract. Without \
-         a path, print it.",
+        detail: "Export a tool or prompt's schema as a versioned compatibility contract \
+         for `validate`. Without a path, print it. Use `surface` or `describe` to read \
+         full definitions.",
     },
     Builtin {
         name: "validate",
@@ -1174,6 +1183,14 @@ const BUILTIN_GUIDES: &[BuiltinGuide] = &[
             "connect https://example.com/mcp",
             "connect -- ./my-server --stdio",
         ],
+    },
+    BuiltinGuide {
+        name: "surface",
+        details: &[
+            "--brief keeps names, titles, and descriptions, plus resource URIs and URI templates. Tools refused by the tool policy are omitted.",
+            "In surface/v1, fetchedAt is when the four listings were last fetched; server comes from the connection handshake. The server's surface can change at any time.",
+        ],
+        examples: &["mcp-repl --demo --json surface", "surface --brief | .tools"],
     },
     BuiltinGuide {
         name: "find",
@@ -1744,6 +1761,15 @@ impl ConnectionInfo {
             server_info,
             instructions: discovery.instructions,
         }
+    }
+
+    fn server_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": self.protocol_version,
+            "serverInfo": self.server_info,
+            "capabilities": self.capabilities,
+            "instructions": self.instructions,
+        })
     }
 }
 
@@ -2418,8 +2444,8 @@ async fn fetch_surface_once(client: &McpClient) -> (Surface, bool) {
                     // asked for the tools of an unreadable server exits 0
                     // having printed nothing.
                     note_error(ExitStatus::Transport);
-                    at.unavailable.push(what);
                 }
+                at.unavailable.push(what);
                 Vec::new()
             }
         }
@@ -6954,9 +6980,14 @@ async fn handle_line(
             println!("built-ins:");
             println!("  connect <target>                          connect or switch servers");
             println!("  tools | prompts | resources | templates   list the server surface");
+            println!(
+                "  surface [--brief]                         export server info and all listings"
+            );
             println!("  find [flags] <keyword>                    search the surface");
             println!("  describe <name>                           schemas and metadata");
-            println!("  snapshot <name> [path]                    export a schema contract");
+            println!(
+                "  snapshot <name> [path]                    export a compatibility contract for validate"
+            );
             println!("  validate <path> [mode]                    check a schema contract");
             println!("  read <uri> [--out <path>]                 read a resource");
             println!("  subscribe <uri> | unsubscribe <uri>       watch a resource for updates");
@@ -7001,22 +7032,8 @@ async fn handle_line(
         }
         "tools" | "prompts" | "resources" | "templates" => {
             let s = surface.read().unwrap();
-            // Printing an empty list here would state something the REPL does
-            // not know. Say the listing failed instead, and keep the status
-            // non-zero so a pipeline cannot read it as "this server has none".
-            let what = if cmd == "templates" {
-                "resource templates"
-            } else {
-                cmd
-            };
-            if s.is_unavailable(what) {
-                report_error(
-                    ExitStatus::Transport,
-                    &format!(
-                        "the {what} listing is unavailable: it could not be read from this \
-                         server (try `refresh`)"
-                    ),
-                );
+            if let Some(message) = unavailable_listing(&s, cmd) {
+                report_error(ExitStatus::Transport, &message);
                 return false;
             }
             // Tools whose calls the policy denies are left out unless
@@ -7026,18 +7043,7 @@ async fn handle_line(
             let (listed, hidden) =
                 tool_policy::listed_tools(s.tools(), policy.as_deref(), rest.contains(&"--all"));
             if !output.is_plain() || json_output() {
-                let v = match cmd {
-                    "tools" => serde_json::to_value(&listed),
-                    "prompts" => serde_json::to_value(s.prompts()),
-                    "resources" => serde_json::to_value(s.resources()),
-                    _ => serde_json::to_value(s.templates()),
-                }
-                .unwrap_or_default();
-                let v = if rest.contains(&"--brief") {
-                    brief_listing(cmd, v)
-                } else {
-                    v
-                };
+                let v = listing_json(&s, cmd, &listed, rest.contains(&"--brief"));
                 emit_value(v, &output, || unreachable!("plain output handled below"));
                 // The value stays a plain array; the explanation goes to
                 // stderr with the other diagnostics.
@@ -7890,22 +7896,77 @@ async fn handle_line(
                 println!("{}", timing(started.elapsed()));
             }
         }
+        "surface" => {
+            let brief = match rest {
+                [] => false,
+                ["--brief"] => true,
+                _ => {
+                    command_error("usage: surface [--brief]");
+                    return false;
+                }
+            };
+            let info = connection_info(client.as_deref().expect("connected above")).await;
+            let s = surface.read().unwrap();
+            let unavailable: Vec<_> = ["tools", "prompts", "resources", "templates"]
+                .into_iter()
+                .filter_map(|kind| unavailable_listing(&s, kind))
+                .collect();
+            if !unavailable.is_empty() {
+                report_error(ExitStatus::Transport, &unavailable.join(". "));
+                return false;
+            }
+            let Some(info) = info else {
+                report_error(ExitStatus::Transport, "not initialized");
+                return false;
+            };
+            let policy = tool_policy::current();
+            let (listed, hidden) = tool_policy::listed_tools(s.tools(), policy.as_deref(), false);
+            if output.is_plain() && !json_output() {
+                println!(
+                    "{}, {}, {}, {}",
+                    plural(listed.len(), "tool"),
+                    plural(s.prompts().len(), "prompt"),
+                    plural(s.resources().len(), "resource"),
+                    plural(s.templates().len(), "template")
+                );
+                print_hidden_note(hidden, Some("tools --all"));
+                eprintln!("Run with --json, or capture it (s = surface), to get the definitions.");
+                return false;
+            }
+            let Some(fetched_at) = s.fetched_at().and_then(timestamp::format_rfc3339_utc) else {
+                report_error(
+                    ExitStatus::Transport,
+                    "the surface fetch time is unavailable",
+                );
+                return false;
+            };
+            emit_value(
+                serde_json::json!({
+                    "mcpRepl": "surface/v1",
+                    "fetchedAt": fetched_at,
+                    "server": info.server_json(),
+                    "tools": listing_json(&s, "tools", &listed, brief),
+                    "prompts": listing_json(&s, "prompts", &listed, brief),
+                    "resources": listing_json(&s, "resources", &listed, brief),
+                    "templates": listing_json(&s, "templates", &listed, brief),
+                }),
+                &output,
+                || unreachable!("plain output handled above"),
+            );
+            if hidden > 0 {
+                eprintln!("{}", tool_policy::hidden_note(hidden, Some("tools --all")));
+            }
+        }
         "info" => match connection_info(client.as_deref().expect("connected above")).await {
             Some(info) => {
                 if !output.is_plain() || json_output() {
-                    emit_value(
-                        serde_json::json!({
-                            "protocolVersion": info.protocol_version,
-                            "serverInfo": info.server_info,
-                            "capabilities": info.capabilities,
-                            "instructions": info.instructions,
-                            "sampling": sampling::mode().as_str(),
-                            "elicitation": elicit::mode().as_str(),
-                            "toolPolicy": tool_policy::current().map(|p| p.to_json()),
-                        }),
-                        &output,
-                        || unreachable!("plain output handled below"),
-                    );
+                    let mut value = info.server_json();
+                    value["sampling"] = sampling::mode().as_str().into();
+                    value["elicitation"] = elicit::mode().as_str().into();
+                    value["toolPolicy"] = tool_policy::current().map(|p| p.to_json()).into();
+                    emit_value(value, &output, || {
+                        unreachable!("plain output handled below")
+                    });
                     return false;
                 }
                 // Replay the full startup banner, then add capabilities.
@@ -9120,6 +9181,42 @@ async fn run_tool(
     }
 }
 
+/// Describe a failed fetch so an unreadable list never looks empty.
+fn unavailable_listing(surface: &Surface, cmd: &str) -> Option<String> {
+    let what = if cmd == "templates" {
+        "resource templates"
+    } else {
+        cmd
+    };
+    surface.is_unavailable(what).then(|| {
+        format!(
+            "the {what} listing is unavailable: it could not be read from this \
+             server (try `refresh`)"
+        )
+    })
+}
+
+fn listing_json(
+    surface: &Surface,
+    cmd: &str,
+    listed_tools: &[&ToolDefinition],
+    brief: bool,
+) -> serde_json::Value {
+    let listing = match cmd {
+        "tools" => serde_json::to_value(listed_tools),
+        "prompts" => serde_json::to_value(surface.prompts()),
+        "resources" => serde_json::to_value(surface.resources()),
+        "templates" => serde_json::to_value(surface.templates()),
+        _ => unreachable!("unknown listing {cmd}"),
+    }
+    .unwrap_or_default();
+    if brief {
+        brief_listing(cmd, listing)
+    } else {
+        listing
+    }
+}
+
 /// `<list> --brief` as a value: each entry cut to what is needed to choose
 /// one, without schemas. `describe <name>` returns the full definition. The
 /// human listing is already this short, so there the flag changes nothing.
@@ -9167,6 +9264,7 @@ const ROUTABLE_BUILTINS: &[&str] = &[
     "prompts",
     "resources",
     "templates",
+    "surface",
     "describe",
     "read",
     "find",
@@ -10768,6 +10866,82 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn not_initialized_listings_are_marked_unavailable() {
+        // Model a server that sends the handshake and the list requests to
+        // different instances without sharing their session state.
+        struct SplitSession {
+            handshake: ChannelTransport,
+            listings: ChannelTransport,
+        }
+
+        #[async_trait]
+        impl ClientTransport for SplitSession {
+            async fn send(&mut self, message: &str) -> tower_mcp::Result<()> {
+                let request: serde_json::Value = serde_json::from_str(message)?;
+                if request["method"]
+                    .as_str()
+                    .is_some_and(|method| method.ends_with("/list"))
+                {
+                    self.listings.send(message).await
+                } else {
+                    self.handshake.send(message).await
+                }
+            }
+
+            async fn recv(&mut self) -> tower_mcp::Result<Option<String>> {
+                let message = tokio::select! {
+                    message = self.handshake.recv() => message?,
+                    message = self.listings.recv() => message?,
+                };
+                let Some(message) = message else {
+                    return Ok(None);
+                };
+                let mut response: serde_json::Value = serde_json::from_str(&message)?;
+                // Relay the router's rejection in the HTTP transport's
+                // wording, which is what the startup retry recognizes.
+                if response["error"]["code"] == -32600
+                    && response["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.starts_with("Session not initialized"))
+                {
+                    response["error"]["message"] =
+                        "Session not initialized. Send notifications/initialized first.".into();
+                    return Ok(Some(response.to_string()));
+                }
+                Ok(Some(message))
+            }
+
+            fn is_connected(&self) -> bool {
+                self.handshake.is_connected() && self.listings.is_connected()
+            }
+
+            async fn close(&mut self) -> tower_mcp::Result<()> {
+                self.handshake.close().await?;
+                self.listings.close().await
+            }
+        }
+
+        let router = demo_router();
+        let client = client_builder(ProtocolMode::Stable, None)
+            .unwrap()
+            .connect_simple(SplitSession {
+                listings: ChannelTransport::new(router.with_fresh_session()),
+                handshake: ChannelTransport::new(router),
+            })
+            .await
+            .unwrap();
+        establish_connection(&client, ProtocolMode::Stable)
+            .await
+            .unwrap();
+        let (surface, not_initialized) = fetch_surface_once(&client).await;
+
+        assert!(not_initialized);
+        for listing in ["tools", "prompts", "resources", "resource templates"] {
+            assert!(surface.is_unavailable(listing), "{listing}");
+        }
+    }
+
     /// The bundled surface is large enough to require cursors, and the same
     /// bounded collector the REPL uses at startup follows every page.
     #[tokio::test]
@@ -11772,7 +11946,7 @@ world",
     fn only_commands_with_a_value_accept_capture_and_filter() {
         // The set backing the guard: a command that reports rather than
         // returning data must not silently swallow a capture.
-        for routable in ["tools", "describe", "read", "find", "info"] {
+        for routable in ["tools", "surface", "describe", "read", "find", "info"] {
             assert!(
                 ROUTABLE_BUILTINS.contains(&routable),
                 "{routable} returns a documented value"

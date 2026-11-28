@@ -53,7 +53,7 @@ belongs to the generated parser. `--json` after a tool name is a tool flag only
 if the schema declares that property. `tool <name>` and `builtin <name>`
 resolve namespace collisions explicitly. A bare name shared by a tool and a
 built-in is rejected. The generated built-ins are listings (`tools`, `prompts`,
-`resources`, `templates`), `find`, `describe`, `snapshot`, `validate`, `read`,
+`resources`, `templates`, `surface`), `find`, `describe`, `snapshot`, `validate`, `read`,
 `prompt`, and `call`. Use `-e` for other built-ins and stateful or multi-command
 workflows. Combining a generated command with `-e` is a usage error.
 
@@ -492,7 +492,8 @@ task-augmented tool call returns its task-creation result. Surface list commands
 return convenience arrays of their protocol definitions (without pagination
 wrappers). REPL-only commands use documented convenience values or envelopes:
 `find` and `subscriptions` return arrays; `describe` returns
-`{"kind": ..., "definition": ...}`; `snapshot` returns its canonical contract
+`{"kind": ..., "definition": ...}`; `surface` returns a `surface/v1` object;
+`snapshot` returns its canonical contract
 or a file acknowledgement; `validate` returns its compatibility report; and
 `help`, `bench`, `jobs`, aliases, parameter binds, `wire`, `last`, `refresh`,
 `info`, `vars`, `unset`, and `quit` return objects.
@@ -543,6 +544,24 @@ the full definition. On the demo server:
 | `tools --brief` | 1028 |
 | `find -m 5 convert` | 101 |
 | `describe convert` | 779 |
+
+For a server you call repeatedly, export its surface once and query the saved
+definitions with `jq`:
+
+```bash
+mcp-repl --demo --json surface > demo-surface.json
+jq '.tools[] | select(.name == "convert") | .inputSchema.required' demo-surface.json
+```
+
+The document identifies its format as `"mcpRepl": "surface/v1"` and includes
+`server` details (`protocolVersion`,
+`serverInfo`, `capabilities`, and `instructions`) and four arrays named
+`tools`, `prompts`, `resources`, and `templates`. It uses the cached listings
+from the connection, including their pages and tool policy filtering.
+`surface --brief` drops schemas and annotations using the listings' brief
+format. Check the RFC 3339 UTC `fetchedAt` and `server.serverInfo.version`
+when reusing the file. The server's surface can change at any time, even
+if its version stays the same.
 
 ## Bounded tool output
 
@@ -680,9 +699,10 @@ stderr; `tools --all` includes them. `describe` of a denied tool adds a
 
 ## Schema snapshots and compatibility checks
 
-Tool and prompt definitions can be saved as versioned, canonical JSON
-contracts. Snapshots intentionally omit descriptions, icons, annotations, and
-other presentation metadata: a documentation edit should not break a caller.
+`snapshot` exports a tool or prompt's schema as a versioned JSON
+compatibility contract for `validate`. It omits descriptions, icons,
+annotations, and other presentation metadata so documentation edits do
+not break a caller. Read full definitions with `surface` or `describe`.
 
 ```text
 demo> snapshot add add.schema.json
