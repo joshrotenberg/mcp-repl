@@ -553,6 +553,34 @@ def _unknown_task(error, task_id):
     )
 
 
+def _wait_pending(error, task_id, wait_seconds):
+    """Whether a failed ``wait --timeout`` left the task running.
+
+    Current builds send exit status 4 with ``kind: "timeout"``,
+    ``pending: true`` and the task's ``taskId``; all three must agree. Builds
+    up to 0.5.0 sent exit status 4 with ``kind: "transport"`` and only the
+    message, with or without the ``Transport error: `` prefix, so the exact
+    wording is accepted from an envelope of that shape only: a transport
+    envelope that carries ``pending`` or ``taskId`` is not a legacy one.
+    """
+    response = error.response
+    if response["exitStatus"] != 4:
+        return False
+    if response["kind"] == "timeout":
+        return response.get("pending") is True and response.get("taskId") == task_id
+    if response["kind"] != "transport" or "pending" in response or "taskId" in response:
+        return False
+    message = str(error)
+    for text in (
+        "task {} did not settle within {}s (--timeout)",
+        "task {} was still running after {}s (--timeout)",
+    ):
+        text = text.format(task_id, wait_seconds)
+        if message in (text, "Transport error: " + text):
+            return True
+    return False
+
+
 def _tools(reply):
     value = reply.value
     _require(
@@ -840,17 +868,8 @@ class Session:
             def task_error(error):
                 if _unknown_task(error, ref.task_id):
                     self._task = None
-                if wait_seconds is not None and error.response["exitStatus"] == 4:
-                    legacy = "task {} was still running after {}s (--timeout)".format(
-                        ref.task_id, wait_seconds,
-                    )
-                    current = "task {} did not settle within {}s (--timeout)".format(
-                        ref.task_id, wait_seconds,
-                    )
-                    message = str(error)
-                    if any(message in (text, "Transport error: " + text)
-                           for text in (legacy, current)):
-                        raise TaskPending(message, error.request_id, error.response)
+                if wait_seconds is not None and _wait_pending(error, ref.task_id, wait_seconds):
+                    raise TaskPending(str(error), error.request_id, error.response)
 
             return self._request(command, task_reply, timeout=wait_seconds, on_error=task_error)
 

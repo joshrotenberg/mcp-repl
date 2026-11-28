@@ -633,7 +633,47 @@ fn report_error_with_details(
     eprintln!("{line}");
 }
 
+/// What a person can do about a `wait` that ran out of time.
+const WAIT_DEADLINE_HINT: &str = "the task is still running; `wait` on it again or `cancel` it";
+
+/// The `--json` envelope for a `wait` that ran out of time.
+///
+/// The exit status stays 4, as in earlier releases, but `kind` is `timeout`
+/// rather than `transport`: the connection is healthy and the task is still
+/// usable. `pending` and `taskId` let a script recognize it and keep the task
+/// without parsing the message. `answersSent: false` appears only when a
+/// bridge `wait` dropped host answers unsent.
+fn wait_deadline_json(deadline: &jobs::WaitDeadline, message: &str) -> serde_json::Value {
+    let mut value = error_json(ExitStatus::Transport, message);
+    value["kind"] = serde_json::json!("timeout");
+    value["taskId"] = serde_json::json!(deadline.task_id);
+    value["pending"] = serde_json::json!(true);
+    if deadline.answers_unsent {
+        value["answersSent"] = serde_json::json!(false);
+    }
+    value
+}
+
+/// Report a `wait` deadline: the `timeout` envelope under `--json`, the
+/// message and a hint otherwise.
+fn report_wait_deadline(deadline: &jobs::WaitDeadline, message: &str) {
+    note_error(ExitStatus::Transport);
+    if json_output() {
+        print_json(&wait_deadline_json(deadline, message));
+        return;
+    }
+    eprintln!(
+        "{}: {}\n  hint: {WAIT_DEADLINE_HINT}",
+        style::error_prefix(),
+        sanitize(message)
+    );
+}
+
 fn report_mcp_error(error: &tower_mcp::Error) {
+    if let Some((deadline, message)) = jobs::wait_deadline(error) {
+        report_wait_deadline(deadline, message);
+        return;
+    }
     report_error_with_details(
         ExitStatus::from_mcp_error(error),
         &describe_mcp_error(error),
@@ -753,6 +793,11 @@ fn describe_mcp_error(error: &tower_mcp::Error) -> String {
             Some(code) => format!("{} (code {code})", failure.message),
             None => failure.message.to_owned(),
         };
+    }
+    // Without this the framework's `Tool error:` prefix would replace the
+    // `Transport error:` one this error used to carry, and be just as wrong.
+    if let Some((_, message)) = jobs::wait_deadline(error) {
+        return sanitize(message).into_owned();
     }
     let tower_mcp::Error::JsonRpc(rpc) = error else {
         return collapse_repeated_label(&error.to_string()).to_string();
@@ -1441,20 +1486,28 @@ async fn wait_for_one(
 ) -> tower_mcp::Result<TaskObject> {
     tracing::debug!(task_id = ?id, "waiting for task via polling");
     let deadline = host_input::deadline_after(limit);
+    // Set while the wait is recovering from a lost connection, so a deadline
+    // that interrupts the reconnect is reported as the connection failure it
+    // is, not as a task that is merely still running.
+    let recovering = AtomicBool::new(false);
     let wait = async {
         if host_input::enabled() {
             host_input::wait_task(&session.client(), jobs, id, deadline).await
         } else {
-            wait_with_reconnect(session, surface, id).await
+            wait_with_reconnect(session, surface, id, &recovering).await
         }
     };
     let result = match (deadline, limit) {
         (Some(deadline), Some(limit)) => match tokio::time::timeout_at(deadline, wait).await {
             Ok(result) => result,
-            Err(_) => Err(tower_mcp::Error::Transport(format!(
-                "task {id} did not settle within {}s (--timeout)",
-                limit.as_secs()
-            ))),
+            Err(_) if recovering.load(Ordering::SeqCst) => {
+                Err(tower_mcp::Error::Transport(format!(
+                    "the connection was lost while waiting for task {id}, and the reconnect did \
+                     not finish within {}s (--timeout)",
+                    limit.as_secs()
+                )))
+            }
+            Err(_) => Err(crate::jobs::wait_deadline_error(id, limit.as_secs())),
         },
         _ => wait.await,
     };
@@ -1462,10 +1515,16 @@ async fn wait_for_one(
     result
 }
 
+/// Wait for `id`, reconnecting once if the connection is lost.
+///
+/// `recovering` is set from the moment the loss is seen until the
+/// replacement connection is installed. A caller's deadline that fires in
+/// between interrupts a reconnect, not a healthy wait.
 async fn wait_with_reconnect(
     session: &Session,
     surface: &RwLock<Surface>,
     id: &str,
+    recovering: &AtomicBool,
 ) -> tower_mcp::Result<TaskObject> {
     let (client, seen, target) = session.client_snapshot().expect("connected above");
     let can_resume = session.can_reconnect() && uses_final_tasks(&client).await;
@@ -1474,7 +1533,10 @@ async fn wait_with_reconnect(
         result => return result,
     };
     drop(client);
-    if reconnect_for_command(session, surface, seen).await.is_err() {
+    recovering.store(true, Ordering::SeqCst);
+    let reconnected = reconnect_for_command(session, surface, seen).await;
+    recovering.store(false, Ordering::SeqCst);
+    if reconnected.is_err() {
         return Err(error);
     }
     let (client, _, current_target) = session.client_snapshot().expect("reconnected above");
@@ -1557,8 +1619,14 @@ async fn wait_for_all(
             Err(e) if outcomes_in_array => {
                 let status = ExitStatus::from_mcp_error(&e);
                 note_error(status);
-                let mut outcome = error_json(status, &describe_mcp_error(&e));
-                outcome["taskId"] = serde_json::json!(id);
+                let outcome = match jobs::wait_deadline(&e) {
+                    Some((deadline, message)) => wait_deadline_json(deadline, message),
+                    None => {
+                        let mut outcome = error_json(status, &describe_mcp_error(&e));
+                        outcome["taskId"] = serde_json::json!(id);
+                        outcome
+                    }
+                };
                 settled.push(outcome);
             }
             // Keep going: one unreachable task should not hide the outcome of
@@ -11884,6 +11952,45 @@ world",
         assert!(parse_wait_timeout("task", &["t", "--timeout", "5"]).is_err());
     }
 
+    /// #390: the connection is healthy and the task is still usable when
+    /// `wait --timeout` runs out, so neither the text nor the envelope may
+    /// call it a transport failure. Exit status 4 is kept for old scripts.
+    #[test]
+    fn a_wait_deadline_is_a_pending_timeout_not_a_transport_failure() {
+        let error = jobs::wait_deadline_error("abc123", 1);
+        let message = describe_mcp_error(&error);
+        assert_eq!(message, "task abc123 did not settle within 1s (--timeout)");
+        assert_eq!(ExitStatus::from_mcp_error(&error), ExitStatus::Transport);
+
+        let (deadline, raw) = jobs::wait_deadline(&error).unwrap();
+        assert_eq!(
+            wait_deadline_json(deadline, raw),
+            serde_json::json!({
+                "error": "task abc123 did not settle within 1s (--timeout)",
+                "kind": "timeout",
+                "exitStatus": 4,
+                "taskId": "abc123",
+                "pending": true,
+            })
+        );
+
+        // A bridge `wait` that dropped host answers says so in a field.
+        let unsent = jobs::wait_deadline_unsent_error("abc123", "answers were not sent");
+        let (deadline, raw) = jobs::wait_deadline(&unsent).unwrap();
+        let envelope = wait_deadline_json(deadline, raw);
+        assert_eq!(envelope["kind"], "timeout");
+        assert_eq!(envelope["pending"], true);
+        assert_eq!(envelope["taskId"], "abc123");
+        assert_eq!(envelope["answersSent"], false);
+        assert_eq!(describe_mcp_error(&unsent), "answers were not sent");
+
+        // Recognized by type only: the same words from a real transport
+        // failure, or from a server's tool error, stay what they are.
+        let words = "task abc123 did not settle within 1s (--timeout)";
+        assert!(jobs::wait_deadline(&tower_mcp::Error::Transport(words.into())).is_none());
+        assert!(jobs::wait_deadline(&tower_mcp::Error::tool(words)).is_none());
+    }
+
     #[test]
     fn automatic_task_updates_are_interactive_text_only() {
         assert!(automatic_task_updates(false, false));
@@ -12236,9 +12343,14 @@ world",
             let connector = once_connector(scripted_task_client(fresh, replacement).await);
             let session = Session::new(client, Some(connector));
             let surface = RwLock::new(Surface::default());
-            let error = wait_with_reconnect(&session, &surface, "task-1")
+            let recovering = AtomicBool::new(false);
+            let error = wait_with_reconnect(&session, &surface, "task-1", &recovering)
                 .await
                 .unwrap_err();
+            assert!(
+                !recovering.load(Ordering::SeqCst),
+                "a finished reconnect no longer counts as recovering"
+            );
             assert!(
                 is_session_lost(&error),
                 "{initial:?} to {replacement:?}: {error}"
@@ -12392,9 +12504,20 @@ world",
         .await
         .expect("the wait deadline must interrupt the reconnect")
         .unwrap_err();
+        // The deadline cut a reconnect short, with the disconnected client
+        // still installed: that is a connection failure, not a pending task.
         assert!(
-            matches!(error, tower_mcp::Error::Transport(message) if message.contains("did not settle within 1s (--timeout)"))
+            jobs::wait_deadline(&error).is_none(),
+            "an interrupted reconnect is not a pending wait: {error}"
         );
+        assert!(
+            matches!(&error, tower_mcp::Error::Transport(message)
+                if message == "the connection was lost while waiting for task task-1, and the \
+                               reconnect did not finish within 1s (--timeout)"),
+            "{error}"
+        );
+        assert_eq!(ExitStatus::from_mcp_error(&error), ExitStatus::Transport);
+        assert_eq!(ExitStatus::from_mcp_error(&error).label(), "transport");
         assert!(
             fetching.load(Ordering::SeqCst),
             "the replacement reached the surface fetch"

@@ -13,6 +13,64 @@ use crate::untrusted::sanitize;
 
 const MAX_PENDING_NOTIFICATIONS: usize = 128;
 
+/// `wait --timeout` ran out while the task was still running.
+///
+/// The connection is fine and the task can be waited on again or cancelled,
+/// so this must not read as a transport failure. It travels as the source of
+/// a `ToolError`, like the host-input markers, so the reporters recognize it
+/// by type and never by its message.
+#[derive(Debug)]
+pub(crate) struct WaitDeadline {
+    pub(crate) task_id: String,
+    /// With `--host-input-fd`: the host answered, but the deadline passed
+    /// before the answers could be checked against the task, so none were
+    /// sent and it is still waiting for input.
+    pub(crate) answers_unsent: bool,
+}
+
+impl std::fmt::Display for WaitDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task {} is still pending", self.task_id)
+    }
+}
+
+impl std::error::Error for WaitDeadline {}
+
+/// The error `wait` returns when its own deadline passes first.
+pub(crate) fn wait_deadline_error(task_id: &str, limit_secs: u64) -> tower_mcp::Error {
+    wait_deadline_with(
+        task_id,
+        format!("task {task_id} did not settle within {limit_secs}s (--timeout)"),
+        false,
+    )
+}
+
+/// [`wait_deadline_error`] for a bridge `wait` whose host answers were
+/// dropped unsent because the deadline came first; `message` says so.
+pub(crate) fn wait_deadline_unsent_error(task_id: &str, message: &str) -> tower_mcp::Error {
+    wait_deadline_with(task_id, message.to_owned(), true)
+}
+
+fn wait_deadline_with(task_id: &str, message: String, answers_unsent: bool) -> tower_mcp::Error {
+    tower_mcp::Error::Tool(tower_mcp::error::ToolError {
+        tool: None,
+        message,
+        source: Some(Box::new(WaitDeadline {
+            task_id: task_id.to_owned(),
+            answers_unsent,
+        })),
+    })
+}
+
+/// The pending task and the message, when `error` is a `wait` deadline.
+pub(crate) fn wait_deadline(error: &tower_mcp::Error) -> Option<(&WaitDeadline, &str)> {
+    let tower_mcp::Error::Tool(tool) = error else {
+        return None;
+    };
+    let marker = tool.source.as_ref()?.downcast_ref::<WaitDeadline>()?;
+    Some((marker, &tool.message))
+}
+
 /// A task started by this REPL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {

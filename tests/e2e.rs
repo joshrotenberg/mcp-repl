@@ -1632,6 +1632,60 @@ async fn exercise_exec_waits_for_its_own_tasks(fixture: &Path, temp: &TempDir) {
         "a failed task settles as `completed`, so the error needs saying:\n{stdout}"
     );
 
+    // #390: a `wait --timeout` that runs out leaves a healthy connection and
+    // a usable task, so it keeps exit status 4 but must not call itself a
+    // transport failure. The fixture's `task_pending` never settles, so the
+    // deadline always wins; the `cancel` after it shows the task still works.
+    let exit_file = temp.path().join("exec-wait-timeout.exit");
+    let mut command = repl_command();
+    command
+        .args([
+            "--protocol",
+            "2026-07-28",
+            "--no-history",
+            "--color",
+            "never",
+            "--json",
+            "--exec",
+            "task_pending &",
+            "--exec",
+            "builtin wait last --timeout 1",
+            "--exec",
+            "builtin cancel last",
+            "--",
+        ])
+        .arg(fixture)
+        .arg("--session-driver")
+        .env("MCP_REPL_FIXTURE_EXIT_FILE", &exit_file);
+    let pending = run(command, "exec-wait-timeout", CASE_TIMEOUT).await;
+    assert_eq!(
+        wait_for_file(&exit_file, "stdio fixture shutdown").await,
+        "clean",
+        "mcp-repl left its stdio child running"
+    );
+    assert_status(&pending, 4, "exec wait timeout");
+    let values = json_lines(&pending, "exec wait timeout");
+    assert_eq!(values.len(), 3, "{values:?}");
+    let task_id = values[0]["task"]["taskId"]
+        .as_str()
+        .expect("task-creation result names the task");
+    let timeout = &values[1];
+    assert_eq!(timeout["kind"], "timeout", "{timeout}");
+    assert_eq!(timeout["pending"], true, "{timeout}");
+    assert_eq!(timeout["taskId"], task_id, "{timeout}");
+    assert_eq!(timeout["exitStatus"], 4, "{timeout}");
+    assert_eq!(
+        timeout["error"],
+        format!("task {task_id} did not settle within 1s (--timeout)"),
+    );
+    assert!(
+        !String::from_utf8_lossy(&pending.stdout).contains("Transport error"),
+        "{}",
+        String::from_utf8_lossy(&pending.stdout)
+    );
+    assert_eq!(values[2]["taskId"], task_id, "the task is still usable");
+    assert_eq!(values[2]["status"], "cancelled", "{}", values[2]);
+
     // Nothing to wait for is a distinct outcome from a task that failed.
     let empty = run_stdio(
         fixture,

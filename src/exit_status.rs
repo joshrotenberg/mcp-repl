@@ -46,6 +46,11 @@ impl ExitStatus {
         if let Some(failure) = crate::host_input::explicit_failure(error) {
             return failure.status;
         }
+        // Kept at 4 for scripts written against earlier releases; the JSON
+        // envelope's `kind` is what tells it apart from a broken connection.
+        if crate::jobs::wait_deadline(error).is_some() {
+            return Self::Transport;
+        }
         if crate::session::is_reconnectable_http_error(error) {
             return Self::Transport;
         }
