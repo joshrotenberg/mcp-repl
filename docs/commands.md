@@ -59,6 +59,36 @@ Schema-coerced tool calls, `bench`, and `prompt` require every argument to use
 token, an empty key such as `=value`, or malformed object JSON is a local usage
 error; it is never dropped from a request silently.
 
+`prompt` also checks argument names against the prompt's declared
+`arguments` before sending, as the generated `mcp-repl prompt <name> --flag`
+CLI does. A missing required argument, or a name the prompt does not declare,
+is a usage error and nothing is sent. In a one-shot run (`-e` or a generated
+command) that error exits with status 2; the interactive REPL reports it and
+keeps going. An undeclared name gets a suggestion when a declared name is
+within a small edit distance, or when exactly one declared name contains it or
+is contained by it (`crate_name` suggests `name`). With no suggestion, the
+declared names are listed:
+
+```text
+mcp-repl-demo> prompt greet
+error: prompt "greet" is missing required argument "name"
+mcp-repl-demo> prompt greet nme=Ada
+error: prompt "greet" has no argument "nme"; did you mean `name`?
+mcp-repl-demo> prompt greet who=Ada
+error: prompt "greet" has no argument "who"; it takes "name"
+```
+
+With several undeclared names, each suggestion follows its name in the
+message: `has no arguments "nme" (did you mean "name"?), ...`. Under `--json`,
+the error object's `didYouMean` field carries the suggestion when exactly one
+name is undeclared; with several, the suggestions are in `error` only.
+
+The check is skipped, and the arguments sent as typed, when the prompt is
+missing from the cached surface (the surface is stale, or the server leaves it
+out of `prompts/list`) or declares no arguments. An omitted `arguments` field
+and an empty one read the same, and a server may accept arguments it does not
+advertise.
+
 The declared property type decides the value sent to the server. In
 particular, a string stays a string even when its text is also a valid JSON
 literal, so `message=true`, `message=123`, and `message=null` send those exact

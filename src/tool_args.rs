@@ -39,6 +39,131 @@ pub(crate) fn parse_prompt_args(tokens: &[&str]) -> Result<HashMap<String, Strin
     Ok(arguments)
 }
 
+/// Why a prompt call's argument names do not fit the prompt's declaration.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PromptArgsError {
+    pub message: String,
+    /// The suggested declared name when exactly one supplied name is
+    /// undeclared. With several, each suggestion is in `message` instead.
+    pub hint: Option<String>,
+}
+
+/// Check parsed prompt arguments against the prompt's declared `arguments`.
+///
+/// This is the REPL's counterpart of the generated CLI, where clap rejects an
+/// unknown flag and a missing required one before anything is sent. An
+/// undeclared name is reported ahead of a missing required one, because the
+/// usual cause of both is one misspelled name, and the suggestion fixes both.
+///
+/// A prompt that declares no arguments is not checked at all. tower-mcp reads
+/// an omitted `arguments` and `[]` as the same empty list, and the spec does
+/// not say what omission means, so a server may still accept arguments it
+/// never advertised.
+pub(crate) fn check_prompt_args(
+    prompt: &tower_mcp::protocol::PromptDefinition,
+    supplied: &HashMap<String, String>,
+) -> Result<(), PromptArgsError> {
+    let declared: Vec<&str> = prompt
+        .arguments
+        .iter()
+        .map(|argument| argument.name.as_str())
+        .collect();
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let mut unknown: Vec<&str> = supplied
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !declared.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        let suggestions: Vec<Option<String>> = unknown
+            .iter()
+            .map(|key| suggest_argument(key, &declared))
+            .collect();
+        if let ([key], [hint]) = (unknown.as_slice(), suggestions.as_slice()) {
+            let mut message = format!("prompt {:?} has no argument {key:?}", prompt.name);
+            if hint.is_none() {
+                message.push_str(&format!("; it takes {}", quoted_list(&declared)));
+            }
+            return Err(PromptArgsError {
+                message,
+                hint: hint.clone(),
+            });
+        }
+        let listed = unknown
+            .iter()
+            .zip(&suggestions)
+            .map(|(key, hint)| match hint {
+                Some(hint) => format!("{key:?} (did you mean {hint:?}?)"),
+                None => format!("{key:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut message = format!("prompt {:?} has no arguments {listed}", prompt.name);
+        if suggestions.iter().any(Option::is_none) {
+            message.push_str(&format!("; it takes {}", quoted_list(&declared)));
+        }
+        return Err(PromptArgsError {
+            message,
+            hint: None,
+        });
+    }
+    let missing: Vec<&str> = prompt
+        .arguments
+        .iter()
+        .filter(|argument| argument.required && !supplied.contains_key(&argument.name))
+        .map(|argument| argument.name.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(PromptArgsError {
+            message: format!(
+                "prompt {:?} is missing required {} {}",
+                prompt.name,
+                if missing.len() == 1 {
+                    "argument"
+                } else {
+                    "arguments"
+                },
+                quoted_list(&missing)
+            ),
+            hint: None,
+        });
+    }
+    Ok(())
+}
+
+/// The declared argument an undeclared `key` most likely meant.
+///
+/// Edit distance catches a typo (`nme` for `name`). Failing that, a declared
+/// name that contains the key or is contained by it catches a qualified or
+/// shortened spelling (`crate_name` for `name`), but only when exactly one
+/// declared name qualifies; with two, picking one would be a guess.
+fn suggest_argument(key: &str, declared: &[&str]) -> Option<String> {
+    if let Some(close) = crate::find::closest(key, declared.iter().copied()) {
+        return Some(close);
+    }
+    let key = key.to_lowercase();
+    let mut related = declared.iter().filter(|name| {
+        let name = name.to_lowercase();
+        !name.is_empty() && (key.contains(&name) || name.contains(&key))
+    });
+    match (related.next(), related.next()) {
+        (Some(only), None) => Some((*only).to_string()),
+        _ => None,
+    }
+}
+
+/// `"a", "b"`, each name quoted the way the rest of the message quotes names.
+fn quoted_list(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Coerce a `key=value` string according to the tool's input schema.
 fn coerce_arg(schema: &serde_json::Value, key: &str, raw: &str) -> serde_json::Value {
     let ty = schema
@@ -277,5 +402,163 @@ mod tests {
         // from the schema rather than left as text.
         assert_eq!(filled["ratio"], json!(1.5));
         assert!(filled["ratio"].is_number());
+    }
+
+    /// `analyze_crate` from the issue: one required argument, one optional.
+    fn analyze_crate() -> tower_mcp::protocol::PromptDefinition {
+        serde_json::from_value(json!({
+            "name": "analyze_crate",
+            "arguments": [
+                {"name": "name", "required": true},
+                {"name": "focus"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn prompt_args(tokens: &[&str]) -> HashMap<String, String> {
+        parse_prompt_args(tokens).unwrap()
+    }
+
+    #[test]
+    fn declared_prompt_arguments_pass() {
+        let prompt = analyze_crate();
+        assert_eq!(
+            check_prompt_args(&prompt, &prompt_args(&["name=serde"])),
+            Ok(())
+        );
+        assert_eq!(
+            check_prompt_args(&prompt, &prompt_args(&["name=serde", "focus=api"])),
+            Ok(())
+        );
+        // Present but empty is still supplied; the server judges the value.
+        assert_eq!(check_prompt_args(&prompt, &prompt_args(&["name="])), Ok(()));
+    }
+
+    #[test]
+    fn a_missing_required_prompt_argument_is_named() {
+        let error = check_prompt_args(&analyze_crate(), &prompt_args(&["focus=api"])).unwrap_err();
+        assert_eq!(
+            error.message,
+            r#"prompt "analyze_crate" is missing required argument "name""#
+        );
+        assert_eq!(error.hint, None);
+    }
+
+    #[test]
+    fn every_missing_required_prompt_argument_is_named_in_declaration_order() {
+        let prompt: tower_mcp::protocol::PromptDefinition = serde_json::from_value(json!({
+            "name": "compare",
+            "arguments": [
+                {"name": "left", "required": true},
+                {"name": "right", "required": true}
+            ]
+        }))
+        .unwrap();
+        let error = check_prompt_args(&prompt, &HashMap::new()).unwrap_err();
+        assert_eq!(
+            error.message,
+            r#"prompt "compare" is missing required arguments "left", "right""#
+        );
+    }
+
+    #[test]
+    fn an_unknown_prompt_argument_suggests_the_closest_declared_name() {
+        let error = check_prompt_args(&analyze_crate(), &prompt_args(&["nme=serde"])).unwrap_err();
+        assert_eq!(
+            error.message,
+            r#"prompt "analyze_crate" has no argument "nme""#
+        );
+        assert_eq!(error.hint.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn an_unknown_prompt_argument_is_reported_before_the_required_one_it_replaced() {
+        // The issue's case: `crate_name` is not declared and `name` is
+        // missing. Naming the unknown argument is the more useful answer, and
+        // `name` is suggested because `crate_name` contains it.
+        let error =
+            check_prompt_args(&analyze_crate(), &prompt_args(&["crate_name=serde"])).unwrap_err();
+        assert_eq!(
+            error.message,
+            r#"prompt "analyze_crate" has no argument "crate_name""#
+        );
+        assert_eq!(error.hint.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn an_unknown_prompt_argument_with_nothing_close_lists_the_declared_names() {
+        let error = check_prompt_args(&analyze_crate(), &prompt_args(&["zzz=1"])).unwrap_err();
+        assert_eq!(
+            error.message,
+            r#"prompt "analyze_crate" has no argument "zzz"; it takes "name", "focus""#
+        );
+        assert_eq!(error.hint, None);
+    }
+
+    #[test]
+    fn a_containing_or_contained_declared_name_is_suggested_case_insensitively() {
+        let declared = ["crate_name", "crate_version"];
+        // Too far apart for edit distance, but only one name contains it.
+        assert_eq!(
+            suggest_argument("version", &declared).as_deref(),
+            Some("crate_version")
+        );
+        assert_eq!(
+            suggest_argument("Name", &declared).as_deref(),
+            Some("crate_name")
+        );
+        assert_eq!(
+            suggest_argument("Crate_Name", &["name"]).as_deref(),
+            Some("name")
+        );
+        // Both declared names contain `crate`: picking one would be a guess.
+        assert_eq!(suggest_argument("crate", &declared), None);
+        // An empty declared name is contained in every key; it is no answer.
+        assert_eq!(suggest_argument("anything", &["", "other"]), None);
+    }
+
+    #[test]
+    fn several_unknown_prompt_arguments_each_carry_their_own_suggestion() {
+        let error = check_prompt_args(
+            &analyze_crate(),
+            &prompt_args(&["name=serde", "nme=x", "focs=y"]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            r#"prompt "analyze_crate" has no arguments "focs" (did you mean "focus"?), "nme" (did you mean "name"?)"#
+        );
+        // The JSON `didYouMean` field stays a single-unknown answer.
+        assert_eq!(error.hint, None);
+    }
+
+    #[test]
+    fn several_unknown_prompt_arguments_list_the_declared_names_when_one_has_no_suggestion() {
+        let error =
+            check_prompt_args(&analyze_crate(), &prompt_args(&["nme=x", "zzz=y"])).unwrap_err();
+        assert_eq!(
+            error.message,
+            r#"prompt "analyze_crate" has no arguments "nme" (did you mean "name"?), "zzz"; it takes "name", "focus""#
+        );
+        assert_eq!(error.hint, None);
+    }
+
+    #[test]
+    fn a_prompt_that_declares_no_arguments_passes_everything_through() {
+        // tower-mcp reads an omitted `arguments` and `[]` alike, and a server
+        // may accept arguments it never advertised.
+        for definition in [
+            json!({"name": "status"}),
+            json!({"name": "status", "arguments": []}),
+        ] {
+            let prompt: tower_mcp::protocol::PromptDefinition =
+                serde_json::from_value(definition).unwrap();
+            assert_eq!(check_prompt_args(&prompt, &HashMap::new()), Ok(()));
+            assert_eq!(
+                check_prompt_args(&prompt, &prompt_args(&["verbose=true"])),
+                Ok(())
+            );
+        }
     }
 }
