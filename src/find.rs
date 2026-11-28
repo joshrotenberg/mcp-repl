@@ -402,21 +402,33 @@ fn tolerance(word: &str) -> usize {
 /// The nearest command word to `word`, if one is close enough to be worth
 /// printing. Considers built-ins and every tool and prompt name.
 pub fn did_you_mean(surface: &Surface, word: &str) -> Option<String> {
+    closest(
+        word,
+        BUILTINS
+            .iter()
+            .map(|builtin| builtin.name)
+            .chain(surface.tools().iter().map(|t| t.name.as_str()))
+            .chain(surface.prompts().iter().map(|p| p.name.as_str())),
+    )
+}
+
+/// The candidate nearest to `word`, if one is close enough to be worth
+/// printing. [`did_you_mean`] uses it for command words; prompt argument
+/// checking uses it for argument names.
+pub(crate) fn closest<'a>(
+    word: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
     let lowered = word.to_lowercase();
     let max = tolerance(&lowered);
     let typed_len = lowered.chars().count();
-    // Nothing this long is a typo of a command word, and comparing it would
-    // cost length-squared work per candidate.
+    // Nothing this long is a typo of a name, and comparing it would cost
+    // length-squared work per candidate.
     if typed_len > MAX_COMPARE {
         return None;
     }
-    let candidates = BUILTINS
-        .iter()
-        .map(|builtin| builtin.name.to_string())
-        .chain(surface.tools().iter().map(|t| t.name.clone()))
-        .chain(surface.prompts().iter().map(|p| p.name.clone()));
 
-    let mut best: Option<(usize, String)> = None;
+    let mut best: Option<(usize, &str)> = None;
     for candidate in candidates {
         let lowered_candidate = candidate.to_lowercase();
         let candidate_len = lowered_candidate.chars().count();
@@ -432,18 +444,17 @@ pub fn did_you_mean(surface: &Surface, word: &str) -> Option<String> {
         }
         // Ties go to the shorter name, then alphabetically, so the
         // suggestion does not depend on list order.
-        let better = match &best {
+        let better = match best {
             None => true,
             Some((best_distance, best_name)) => {
-                (distance, candidate.len(), &candidate)
-                    < (*best_distance, best_name.len(), best_name)
+                (distance, candidate.len(), candidate) < (best_distance, best_name.len(), best_name)
             }
         };
         if better {
             best = Some((distance, candidate));
         }
     }
-    best.map(|(_, name)| name)
+    best.map(|(_, name)| name.to_string())
 }
 
 #[cfg(test)]

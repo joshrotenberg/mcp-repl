@@ -1251,6 +1251,24 @@ async fn exercise_listing_descriptions(fixture: &Path, temp: &TempDir) {
     assert_eq!(values[4]["found"], values[2]);
 }
 
+/// `last` ran after a refused prompt call: it must show an earlier request,
+/// proving it had something to show, and that request must not be the
+/// refused `prompts/get`.
+fn assert_nothing_sent_after(last: &serde_json::Value, output: &Output, label: &str) {
+    let method = last
+        .pointer("/request/method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{label}: `last` shows no request: {last:#}"));
+    assert_ne!(
+        method, "prompts/get",
+        "{label}: nothing may be sent: {last:#}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("prompts/get"),
+        "{label}: nothing may be sent: {last:#}"
+    );
+}
+
 async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
     let malformed_filter = run_stdio(
         fixture,
@@ -1285,6 +1303,53 @@ async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
             .as_str()
             .is_some_and(|message| message.contains("key=value"))
     );
+
+    // A prompt call is held to the prompt's declared arguments before it is
+    // sent, as the generated CLI is. The `last` that follows shows whether a
+    // `prompts/get` reached the wire: it must not have.
+    let label = "missing required prompt argument";
+    let missing = run_stdio(
+        fixture,
+        temp,
+        label,
+        &["--json", "--exec", "prompt greet", "--exec", "last"],
+    )
+    .await;
+    assert_status(&missing, 2, label);
+    let values = json_lines(&missing, label);
+    assert_eq!(values.len(), 2, "{label}: {values:#?}");
+    assert_eq!(values[0]["kind"], "usage", "{values:#?}");
+    assert_eq!(
+        values[0]["error"],
+        r#"prompt "greet" is missing required argument "name""#
+    );
+    assert_nothing_sent_after(&values[1], &missing, label);
+
+    // `name` is supplied, so only the undeclared `nme` can fail the call.
+    let label = "unknown prompt argument";
+    let unknown = run_stdio(
+        fixture,
+        temp,
+        label,
+        &[
+            "--json",
+            "--exec",
+            "prompt greet name=Ada nme=Ada",
+            "--exec",
+            "last",
+        ],
+    )
+    .await;
+    assert_status(&unknown, 2, label);
+    let values = json_lines(&unknown, label);
+    assert_eq!(values.len(), 2, "{label}: {values:#?}");
+    assert_eq!(values[0]["kind"], "usage", "{values:#?}");
+    assert_eq!(
+        values[0]["error"],
+        r#"prompt "greet" has no argument "nme""#
+    );
+    assert_eq!(values[0]["didYouMean"], "name");
+    assert_nothing_sent_after(&values[1], &unknown, label);
 
     let stable = run_stdio(
         fixture,
