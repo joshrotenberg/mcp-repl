@@ -1170,6 +1170,87 @@ async fn exercise_imported_http_config(http: &HttpFixture, temp: &TempDir) {
     );
 }
 
+async fn exercise_listing_descriptions(fixture: &Path, temp: &TempDir) {
+    let description = "\n  Add two integers  \n\nThe arguments a and b are required.";
+    let query = "find --tools arguments a and b are required";
+    let text = run_stdio(
+        fixture,
+        temp,
+        "listing-descriptions-text",
+        &[
+            "--verbose",
+            "--color",
+            "never",
+            "-e",
+            "tools",
+            "-e",
+            "help",
+            "-e",
+            query,
+            "-e",
+            "describe add",
+        ],
+    )
+    .await;
+    assert_success(&text, "text listing descriptions");
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| {
+                line.trim_start()
+                    .split_once(' ')
+                    .is_some_and(|(name, text)| name == "add" && text.trim() == "Add two integers")
+            })
+            .count(),
+        4,
+        "startup, tools, help, and find should each show one line: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("tool add  {description}")),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("The arguments a and b are required.")
+            .count(),
+        1
+    );
+
+    let json = run_stdio(
+        fixture,
+        temp,
+        "listing-descriptions-json",
+        &[
+            "--json",
+            "-e",
+            "tools",
+            "-e",
+            "tools --brief",
+            "-e",
+            query,
+            "-e",
+            &format!("found = {query}"),
+            "-e",
+            "vars",
+        ],
+    )
+    .await;
+    assert_success(&json, "JSON listing descriptions");
+    let values = json_lines(&json, "JSON listing descriptions");
+    assert_eq!(values.len(), 5);
+    for listing in &values[..4] {
+        let tool = listing
+            .as_array()
+            .expect("listing array")
+            .iter()
+            .find(|tool| tool["name"] == "add")
+            .expect("add in listing");
+        assert_eq!(tool["description"], description);
+    }
+    assert_eq!(values[4]["found"], values[2]);
+}
+
 async fn exercise_stdio(fixture: &Path, temp: &TempDir) {
     let malformed_filter = run_stdio(
         fixture,
@@ -5625,6 +5706,7 @@ async fn published_cli_covers_transports_and_protocol_lifecycles() {
         #[cfg(unix)]
         exercise_stdio_group_cancellation(&fixture, true).await;
         exercise_json_contract(&fixture, &temp).await;
+        exercise_listing_descriptions(&fixture, &temp).await;
         exercise_bounded_output(&fixture, &temp).await;
         exercise_colliding_tool_names(&fixture, &temp).await;
         exercise_exec_waits_for_its_own_tasks(&fixture, &temp).await;
