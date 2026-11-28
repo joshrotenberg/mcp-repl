@@ -7383,6 +7383,9 @@ async fn handle_line(
                     return false;
                 }
             };
+            if !enforce_prompt_arguments(surface, name, &prompt_args) {
+                return false;
+            }
             let started = std::time::Instant::now();
             match with_reconnect(session, surface, |c| {
                 let prompt_args = prompt_args.clone();
@@ -8548,6 +8551,33 @@ fn enforce_prompt_contract(
     report
         .as_ref()
         .is_none_or(|report| render_validation_report(report, false))
+}
+
+/// Hold a prompt call to the prompt's declared `arguments`, as the generated
+/// CLI already does, so a misspelled or missing argument fails here instead of
+/// reaching a server that may substitute a default. A prompt absent from the
+/// surface (stale, or omitted from `prompts/list`), or one that declares no
+/// arguments, is sent unchecked.
+fn enforce_prompt_arguments(
+    surface: &Arc<RwLock<Surface>>,
+    name: &str,
+    arguments: &std::collections::HashMap<String, String>,
+) -> bool {
+    let checked = {
+        let surface = surface.read().unwrap();
+        surface
+            .prompts()
+            .iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| tool_args::check_prompt_args(definition, arguments))
+    };
+    match checked {
+        None | Some(Ok(())) => true,
+        Some(Err(error)) => {
+            report_error_with_hint(ExitStatus::Usage, &error.message, error.hint.as_deref());
+            false
+        }
+    }
 }
 
 fn describe_value(surface: &Surface, name: &str) -> Option<serde_json::Value> {
