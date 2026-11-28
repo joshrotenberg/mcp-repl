@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-11-28
+
+### Bug Fixes
+
+- **prompt:** Check arguments against the prompt's declared arguments (#395)
+- **listing:** Show one line per entry for multi-line descriptions (#396)
+- **wait:** Report a wait timeout as pending, not a transport error (#397)
+
+### Features
+
+- Surface command that dumps the whole server surface as one JSON document (#398)
+
+
+
 ## [0.5.0] - 2026-11-27
 
 ### Bug Fixes
